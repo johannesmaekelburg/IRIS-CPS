@@ -39,7 +39,7 @@ Experimental research prototype. Active development for causal uncertainty propa
 ## Citation
 
 If you use this framework, please cite:
-```bibtex
+```
 @software{causality_uncertainty_inconsistency,
   title = {Causal Inference Framework for Uncertainty-Inconsistency Analysis},
   author = {Technical University of Munich},

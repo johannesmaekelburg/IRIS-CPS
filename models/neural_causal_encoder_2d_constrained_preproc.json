@@ -1,0 +1,42 @@
+{
+  "target_name": "cohens_d",
+  "intervention_types": [
+    "correlate",
+    "shrink",
+    "widen"
+  ],
+  "intervention_to_idx": {
+    "correlate": 0,
+    "shrink": 1,
+    "widen": 2
+  },
+  "numeric_feature_names": [
+    "intervention_strength",
+    "uncertainty_volume_pre",
+    "uncertainty_radius_pre",
+    "num_generators_pre",
+    "uncertainty_correlation_pre",
+    "center_distance_pre",
+    "jaccard_pre"
+  ],
+  "feature_means": [
+    5.082500000000006,
+    539.6,
+    16.2,
+    2.0,
+    0.0,
+    17.0,
+    0.0035732789736212505
+  ],
+  "feature_stds": [
+    11.286400177901225,
+    174.15579233399953,
+    2.712932003250075,
+    1e-08,
+    1e-08,
+    2.9154759574226503,
+    0.0009066265974172375
+  ],
+  "n_intervention_features": 3,
+  "n_numeric_features": 7
+}

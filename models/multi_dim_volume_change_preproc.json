@@ -1,0 +1,49 @@
+{
+  "target_name": "volume_change",
+  "intervention_types": [
+    "break_correspondence",
+    "correlate",
+    "scale_mapping",
+    "shift_target",
+    "shrink",
+    "widen"
+  ],
+  "intervention_to_idx": {
+    "break_correspondence": 0,
+    "correlate": 1,
+    "scale_mapping": 2,
+    "shift_target": 3,
+    "shrink": 4,
+    "widen": 5
+  },
+  "numeric_feature_names": [
+    "intervention_strength",
+    "uncertainty_volume_pre",
+    "uncertainty_radius_pre",
+    "num_generators_pre",
+    "uncertainty_correlation_pre",
+    "center_distance_pre",
+    "jaccard_pre"
+  ],
+  "feature_means": [
+    1.5341176470588243,
+    198.6839999999985,
+    1.7999999999999925,
+    3.0,
+    0.0,
+    46.976286375904614,
+    0.008940905037542753
+  ],
+  "feature_stds": [
+    3.7007273770161944,
+    456.9084381782339,
+    1.0977249300050165,
+    0.8164965909277261,
+    1e-08,
+    142.2996785701738,
+    0.009716529553898451
+  ],
+  "n_intervention_features": 6,
+  "n_numeric_features": 7,
+  "use_dimension_feature": true
+}

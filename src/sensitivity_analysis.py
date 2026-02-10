@@ -122,8 +122,10 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                     
                     # Extract theta from record metadata
                     if 'param_value' in record:
-                        param_name = record.get('intervention', 'parameter')
-                        theta_params[param_name] = record['param_value']
+                        # Use 'param_value' as the parameter name for all interventions
+                        theta_params['param_value'] = record['param_value']
+                        # Also store intervention type for filtering
+                        theta_params['intervention'] = record.get('intervention', 'unknown')
             
             # Option 2: Nested structure (post_state.inconsistency.I_theta)
             elif 'post_state' in record:
@@ -160,6 +162,17 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                 'intervention_type': record.get('intervention', 'unknown'),
                 **theta_params
             }
+            
+            # Add pre_uncertainty metrics (for Sobol analysis)
+            if 'pre_uncertainty' in record and isinstance(record['pre_uncertainty'], dict):
+                pre_unc = record['pre_uncertainty']
+                flat_record['pre_source_volume'] = pre_unc.get('source_volume', np.nan)
+                flat_record['pre_source_radius'] = pre_unc.get('source_radius', np.nan)
+                flat_record['pre_source_n_generators'] = pre_unc.get('source_n_generators', np.nan)
+                flat_record['pre_source_correlation'] = pre_unc.get('source_correlation', np.nan)
+                flat_record['pre_target_volume'] = pre_unc.get('target_volume', np.nan)
+                flat_record['pre_target_radius'] = pre_unc.get('target_radius', np.nan)
+                flat_record['pre_target_n_generators'] = pre_unc.get('target_n_generators', np.nan)
             
             # Add optional metrics
             if 'pre_inconsistency' in record and isinstance(record['pre_inconsistency'], dict):
@@ -202,12 +215,33 @@ def extract_theta_and_I(df: pd.DataFrame,
     # Auto-detect theta columns if not provided
     if theta_columns is None:
         exclude_cols = ['I_theta', 'I_theta_se', 'I_theta_ci95_lower', 'I_theta_ci95_upper',
-                       'intervention_type', 'I_theta_pre', 'delta_I_theta']
-        theta_columns = [col for col in df.columns if col not in exclude_cols]
+                       'intervention_type', 'intervention', 'I_theta_pre', 'delta_I_theta',
+                       'scenario_id', 'repeat_idx', 'run_id', 'mc_num_samples', 'mc_num_consistent']
+        # Include numeric columns that represent uncertainty parameters
+        # Prioritize: param_value, pre_source_volume, pre_source_radius, pre_source_correlation
+        priority_cols = ['param_value', 'pre_source_volume', 'pre_source_radius', 
+                        'pre_source_correlation', 'pre_source_n_generators',
+                        'pre_target_volume', 'pre_target_radius']
+        
+        theta_columns = []
+        for col in priority_cols:
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                # Only include if there's variation (not constant)
+                if df[col].nunique() > 1:
+                    theta_columns.append(col)
+        
+        # Add other numeric columns not excluded
+        for col in df.columns:
+            if col not in exclude_cols and col not in theta_columns and pd.api.types.is_numeric_dtype(df[col]):
+                if df[col].nunique() > 1:  # Only if varies
+                    theta_columns.append(col)
+    
+    if len(theta_columns) == 0:
+        raise ValueError("No numeric theta columns found in data")
     
     # Extract theta matrix
-    theta = df[theta_columns].values
-    I_theta = df['I_theta'].values
+    theta = df[theta_columns].values.astype(float)
+    I_theta = df['I_theta'].values.astype(float)
     
     # Remove rows with NaN
     valid_mask = ~(np.isnan(theta).any(axis=1) | np.isnan(I_theta))
@@ -316,8 +350,11 @@ def compute_local_sensitivity(df: pd.DataFrame,
     
     # Sort by parameter value
     df_sorted = df[[param_name, 'I_theta']].dropna().sort_values(param_name)
-    theta_vals = df_sorted[param_name].values
-    I_vals = df_sorted['I_theta'].values
+    
+    # Remove duplicate theta values by averaging I_theta
+    df_agg = df_sorted.groupby(param_name).agg({'I_theta': 'mean'}).reset_index()
+    theta_vals = df_agg[param_name].values
+    I_vals = df_agg['I_theta'].values
     
     if len(theta_vals) < 2:
         raise ValueError(f"Need at least 2 data points for sensitivity analysis")
@@ -329,13 +366,28 @@ def compute_local_sensitivity(df: pd.DataFrame,
         for i in range(len(theta_vals)):
             if i == 0:
                 # Forward difference
-                dI_dtheta = (I_vals[i+1] - I_vals[i]) / (theta_vals[i+1] - theta_vals[i])
+                delta_theta = theta_vals[i+1] - theta_vals[i]
+                if delta_theta < 1e-10:  # Avoid division by near-zero
+                    dI_dtheta = 0.0
+                else:
+                    dI_dtheta = (I_vals[i+1] - I_vals[i]) / delta_theta
             elif i == len(theta_vals) - 1:
                 # Backward difference
-                dI_dtheta = (I_vals[i] - I_vals[i-1]) / (theta_vals[i] - theta_vals[i-1])
+                delta_theta = theta_vals[i] - theta_vals[i-1]
+                if delta_theta < 1e-10:
+                    dI_dtheta = 0.0
+                else:
+                    dI_dtheta = (I_vals[i] - I_vals[i-1]) / delta_theta
             else:
                 # Central difference
-                dI_dtheta = (I_vals[i+1] - I_vals[i-1]) / (theta_vals[i+1] - theta_vals[i-1])
+                delta_theta = theta_vals[i+1] - theta_vals[i-1]
+                if delta_theta < 1e-10:
+                    dI_dtheta = 0.0
+                else:
+                    dI_dtheta = (I_vals[i+1] - I_vals[i-1]) / delta_theta
+            
+            # Clip extreme values to prevent Inf
+            dI_dtheta = np.clip(dI_dtheta, -1e6, 1e6)
             
             sensitivities.append({
                 'theta': theta_vals[i],
@@ -396,8 +448,13 @@ def compute_robustness_margins(df: pd.DataFrame,
     if param_name not in df.columns:
         raise ValueError(f"Parameter '{param_name}' not found in data")
     
+    # Aggregate data by parameter value (handle duplicates from repeats)
+    df_agg = df[[param_name, 'I_theta']].dropna().groupby(param_name).agg({
+        'I_theta': 'mean'
+    }).reset_index()
+    
     # Sort by parameter
-    df_sorted = df[[param_name, 'I_theta']].dropna().sort_values(param_name)
+    df_sorted = df_agg.sort_values(param_name)
     
     # Interpolate I(θ) as function of parameter
     # Use linear for <=3 points, quadratic for 4-5 points, cubic for >5
@@ -433,28 +490,40 @@ def compute_robustness_margins(df: pd.DataFrame,
     if len(crossings) > 0:
         s_star = crossings[0]  # First crossing
         margin = abs(s_star - 1.0)
+        status = "THRESHOLD_CROSSED"
     else:
-        if I_range[0] > threshold:
+        if I_range.min() > threshold:
+            # System always exceeds threshold (always inconsistent)
             s_star = None
             margin = 0.0
+            status = "ALWAYS_ABOVE_THRESHOLD"
+            print(f"⚠️  WARNING: I(θ) always > {threshold} (min={I_range.min():.4f})")
+            print(f"    System is persistently inconsistent across all parameter values")
         else:
+            # System always below threshold (always safe)
             s_star = param_range[-1]
             margin = abs(s_star - 1.0)
+            status = "ALWAYS_BELOW_THRESHOLD"
     
     print(f"\n=== Robustness Margin for {param_name} ===")
     print(f"Threshold τ = {threshold}")
+    print(f"Status: {status}")
     print(f"Critical value s* = {s_star}")
     print(f"Safety margin = {margin:.3f}")
+    print(f"I(θ) range: [{I_range.min():.4f}, {I_range.max():.4f}]")
     print()
     
     return {
-        'parameter': param_name,
+        'param_name': param_name,
         'threshold': threshold,
         's_star': s_star,
         'margin': margin,
+        'status': status,
+        'I_theta_min': float(I_range.min()),
+        'I_theta_max': float(I_range.max()),
         'crossings': crossings,
-        'param_range': param_range,
-        'I_range': I_range
+        'param_range': param_range.tolist(),
+        'I_range': I_range.tolist()
     }
 
 
@@ -698,9 +767,9 @@ def plot_robustness_margins(margins_dict: Dict[str, Any],
         ax.fill_betweenx([0, 1], 0, margins_dict['s_star'], 
                         alpha=0.2, color='green', label='Safe region')
     
-    ax.set_xlabel(f'{margins_dict["parameter"]}')
+    ax.set_xlabel(f'{margins_dict["param_name"]}')
     ax.set_ylabel('I(θ)')
-    ax.set_title(f'Robustness Margin Analysis\nMargin = {margins_dict["margin"]:.3f}')
+    ax.set_title(f'Robustness Margin Analysis\nStatus: {margins_dict.get("status", "UNKNOWN")}\nMargin = {margins_dict["margin"]:.3f}')
     ax.set_ylim([0, 1])
     ax.grid(alpha=0.3)
     ax.legend()
@@ -800,18 +869,61 @@ def run_full_sensitivity_analysis(data_dir: str,
     
     # 5. Sobol indices (if enough parameters)
     theta, I_theta, theta_columns = extract_theta_and_I(df)
+    print(f"\nExtracted parameters: {theta_columns}")
+    print(f"Theta shape: {theta.shape}")
+    print(f"SALib available: {SALIB_AVAILABLE}")
+    
+    # If only 1 parameter, try to add scenario-level features
+    if theta.shape[1] == 1:
+        print("\n⚠ Only 1 parameter found. Attempting to add scenario-level features...")
+        additional_features = ['pre_source_volume', 'pre_source_radius', 
+                              'pre_target_volume', 'pre_target_radius',
+                              'pre_source_n_generators', 'pre_target_n_generators']
+        
+        added_cols = []
+        for col in additional_features:
+            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                # Check if varies across dataset (even if constant within scenario)
+                if df[col].nunique() > 1:
+                    added_cols.append(col)
+        
+        if added_cols:
+            print(f"  Adding scenario features: {added_cols}")
+            theta_columns_expanded = theta_columns + added_cols
+            theta_expanded = df[theta_columns_expanded].values.astype(float)
+            I_theta_expanded = df['I_theta'].values.astype(float)
+            
+            # Remove NaN
+            valid_mask = ~(np.isnan(theta_expanded).any(axis=1) | np.isnan(I_theta_expanded))
+            theta = theta_expanded[valid_mask]
+            I_theta = I_theta_expanded[valid_mask]
+            theta_columns = theta_columns_expanded
+            
+            print(f"  Expanded θ matrix: {theta.shape}")
+    
     if theta.shape[1] >= 2 and SALIB_AVAILABLE:
         print("\n" + "="*80)
         print("4. SOBOL INDICES (Variance-based)")
         print("="*80)
-        sobol_results = compute_sobol_indices(theta, I_theta, theta_columns, 
-                                             n_samples=1024, calc_second_order=False)
-        plot_sobol_indices(sobol_results,
-                          output_path / 'sobol_indices.png')
-        
-        # Save results
-        with open(output_path / 'sobol_indices.pkl', 'wb') as f:
-            pickle.dump(sobol_results, f)
+        try:
+            sobol_results = compute_sobol_indices(theta, I_theta, theta_columns, 
+                                                 n_samples=1024, calc_second_order=False)
+            plot_sobol_indices(sobol_results,
+                              output_path / 'sobol_indices.png')
+            
+            # Save results
+            with open(output_path / 'sobol_indices.pkl', 'wb') as f:
+                pickle.dump(sobol_results, f)
+            print("✓ Sobol indices computed and saved")
+        except Exception as e:
+            print(f"✗ Warning: Sobol analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+    elif theta.shape[1] < 2:
+        print(f"\n✗ Skipping Sobol indices: Need ≥2 parameters, found {theta.shape[1]}")
+        print("  💡 Tip: Combine multiple scenarios to get parameter variation across scenarios")
+    elif not SALIB_AVAILABLE:
+        print(f"\n✗ Skipping Sobol indices: SALib not installed. Run: pip install SALib")
     
     # 6. Fit surrogate model
     print("\n" + "="*80)
@@ -865,7 +977,7 @@ if __name__ == '__main__':
                        help='Directory containing MATLAB JSON exports')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Directory for output figures and results')
-    parser.add_argument('--param', type=str, default='scale_factor',
+    parser.add_argument('--param', type=str, default='param_value',
                        help='Primary parameter to analyze')
     parser.add_argument('--threshold', type=float, default=0.5,
                        help='Inconsistency threshold for robustness margins')

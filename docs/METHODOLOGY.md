@@ -92,9 +92,17 @@ For each experiment, we measure:
 - Generator correlation coefficient (detects structural dependencies)
 
 **Inconsistency Metrics:**
+- **I_theta (I(θ))**: Global identity causality score ∈ [0, 1]
+  - 0.0 = perfect identity consistency (models agree)
+  - 1.0 = complete inconsistency (models disagree)
+  - Computed with Monte Carlo sampling (300 samples)
+  - Includes confidence intervals (95% CI) and standard error
 - **Jaccard Index**: `|Z_propagated ∩ Z_old| / |Z_propagated ∪ Z_old|`
   - 1.0 = perfect consistency, 0.0 = complete inconsistency
   - Preferred over binary emptiness for graded sensitivity to partial overlaps
+- **Monte Carlo Probability**: `P(consistent) = mc_p_consistent`, `P(inconsistent) = mc_p_inconsistent`
+  - Statistical estimation with 300 samples
+  - Includes standard error and 95% confidence intervals
 - Emptiness: Boolean indicator of intersection failure (hard constraint violation)
 - Center distance: `||center(Z_propagated) - center(Z_old)||` (geometric separation independent of volume)
 - Volume ratio: Relative size of intersection (captures degree of agreement)

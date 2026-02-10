@@ -8,16 +8,27 @@ This project investigates whether and how uncertainty causes inconsistency in co
 
 ## Usage
 
+### MATLAB: Generate CONVIDE Data
 ```matlab
 % Navigate to examples folder
 cd examples
 
-% Generate CONVIDE scenarios with I(θ) metric
+% Generate CONVIDE scenarios with I_theta metric
 generate_convide_examples
-
-% Run sensitivity analysis (Python)
-% python src/sensitivity_analysis.py --data_dir ./data/convide_with_I_theta --output_dir ./figures
 ```
+
+### Python: Sensitivity Analysis
+```bash
+# Analyze 2D data (4 scenarios)
+python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+
+# Analyze 3D data (4 scenarios)
+python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
+```
+
+**Available Datasets:**
+- `convide_with_I_theta/`: 2D scenarios (1-4) with I_theta metrics
+- `convide_balanced/`: 3D scenarios (5-8) with I_theta metrics
 
 ## Requirements
 
@@ -32,21 +43,6 @@ pip install -r requirements.txt
 
 Main packages: `numpy`, `scipy`, `matplotlib`, `pandas`, `seaborn`, `scikit-learn`
 
-## Status
-
-Experimental research prototype. Active development for causal uncertainty propagation analysis in CPS.
-
-## Citation
-
-If you use this framework, please cite:
-```bibtex
-@software{causality_uncertainty_inconsistency,
-  title = {Causal Inference Framework for Uncertainty-Inconsistency Analysis},
-  author = {Technical University of Munich},
-  year = {2026},
-  url = {https://github.com/DE-TUM/CPS-Uncertainty-Propagation-Framework}
-}
-```
 
 ## Documentation
 

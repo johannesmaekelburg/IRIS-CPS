@@ -685,12 +685,23 @@ classdef causal_experiment_engine
             %
             % Outputs JSON-serializable struct
             
-            data = struct();
-            data.n_experiments = length(results);
+            % Handle both formats: cell array or struct with metadata
+            if isstruct(results) && isfield(results, 'experiments')
+                % Struct format with metadata (from generate_convide_examples)
+                data = results;
+                experiments_list = results.experiments;
+            else
+                % Simple cell array format (legacy)
+                data = struct();
+                experiments_list = results;
+            end
+            
+            % Process experiments
+            data.n_experiments = length(experiments_list);
             data.experiments = cell(data.n_experiments, 1);
             
             for i = 1:data.n_experiments
-                exp = results{i};
+                exp = experiments_list{i};
                 data.experiments{i} = struct(...
                     'intervention', exp.intervention.type, ...
                     'param_value', exp.param_value, ...

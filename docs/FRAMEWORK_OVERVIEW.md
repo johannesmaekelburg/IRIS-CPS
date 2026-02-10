@@ -1,7 +1,7 @@
 # Causal Framework for Uncertainty-Inconsistency Analysis
 
-**Last Updated**: January 27, 2026  
-**Status**: Production - Forward Causality Only
+**Last Updated**: February 9, 2026  
+**Status**: Production - Forward Causality with I_theta Metric
 
 ## Research Question
 
@@ -60,9 +60,18 @@ is_inconsistent = isEmptySet(Z_intersection)
 ```
 
 **Inconsistency Metrics**:
-- **Jaccard Index**: `|intersection| / |union|` ∈ [0,1]
+- **I_theta (I(θ))**: Global identity causality score \u2208 [0,1]
+  - 0.0 = perfect identity consistency
+  - 1.0 = complete inconsistency  
+  - Computed via Monte Carlo (300 samples)
+  - Includes 95% confidence intervals and standard error
+- **Jaccard Index**: `|intersection| / |union|` \u2208 [0,1]
   - 1.0 = perfect consistency
   - 0.0 = complete inconsistency
+- **Monte Carlo Probability**: Statistical consistency estimation
+  - `mc_p_consistent`: Probability of consistency
+  - `mc_p_inconsistent`: Probability of inconsistency
+  - Standard error and 95% CI included
 - **Empty Intersection**: Boolean indicator (hard constraint violation)
 - **Center Distance**: `||c_propagated - c_target||`
 - **Volume Ratio**: `vol(intersection) / vol(propagated)`
@@ -75,24 +84,25 @@ is_inconsistent = isEmptySet(Z_intersection)
 
 | Intervention | Operation | Parameter | Effect |
 |-------------|-----------|-----------|--------|
-| `do(widen)` | `G ← scale * G` | scale ∈ [0.2, 20] | Increase uncertainty |
-| `do(shrink)` | `G ← scale * G` | scale ∈ [0.05, 5] | Decrease uncertainty |
-| `do(shift)` | `c ← c + δ` | δ ∈ ℝⁿ | Translate center |
-| `do(rotate)` | `G ← R·G` | R ∈ SO(n) | Reorient uncertainty |
+| `do(widen)` | `G ← scale * G` | scale \u2208 [0.5, 3.0] | Increase uncertainty |
+| `do(shrink)` | `G ← scale * G` | scale \u2208 [0.1, 1.0] | Decrease uncertainty |
 | `do(correlate)` | `G ← [G, g_new]` | g_new = α∑G_i | Add dependencies |
 
 ### Parameter Sweeps
 
-Each intervention uses **20-point parameter sweeps** to capture full causal effect:
+Each intervention uses **20-85 point parameter sweeps** depending on scenario to capture full causal effect:
 
 ```matlab
-% Example: Widen intervention
-scales = logspace(log10(0.2), log10(20), 20);
+% Example: Widen intervention (varies by scenario)
+scales = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, ...];
 for i = 1:length(scales)
     params = struct('scale_factor', scales(i));
     result = causal_experiment_engine.run_intervention(scenario, 'widen', params);
 end
 ```
+
+**Repeats**: 5 per experiment for statistical robustness  
+**Monte Carlo**: 300 samples per I_theta computation
 
 ---
 
@@ -116,6 +126,7 @@ result = causal_experiment_engine.run_intervention(scenario, 'widen', params);
 ### 3. Extract Causal Effects
 
 ```matlab
+delta_I_theta = result.causal_effect.delta_I_theta;
 delta_jaccard = result.causal_effect.delta_jaccard;
 delta_empty = result.causal_effect.delta_empty_intersection;
 delta_volume = result.causal_effect.delta_source_volume;
@@ -124,10 +135,24 @@ delta_volume = result.causal_effect.delta_source_volume;
 ### 4. Analyze Results
 
 ```python
-# Python analysis
-import causal_analysis
-causal_analysis.granger_causality(uncertainty_ts, inconsistency_ts)
-causal_analysis.information_flow(data)
+# Python sensitivity analysis
+import subprocess
+
+# Analyze 2D data
+subprocess.run([
+    'python', 'src/sensitivity_analysis.py',
+    '--data_dir', 'data/convide_with_I_theta',
+    '--output_dir', 'results/sensitivity_2d',
+    '--param', 'param_value'
+])
+
+# Analyze 3D data
+subprocess.run([
+    'python', 'src/sensitivity_analysis.py',
+    '--data_dir', 'data/convide_balanced',
+    '--output_dir', 'results/sensitivity_3d',
+    '--param', 'param_value'
+])
 ```
 
 ---
@@ -215,8 +240,30 @@ post = causal_experiment_engine.measure_state(scenario_modified);
 ### Causal Effect (Delta)
 ```matlab
 delta = compute_delta(pre, post);
-% delta.delta_jaccard, delta.delta_source_volume, etc.
+% delta.delta_I_theta, delta.delta_jaccard, delta.delta_source_volume, etc.
 ```
+
+---
+
+## Current Datasets
+
+**2D Scenarios** (`convide_with_I_theta/`):
+- Scenario 1: CAD Export Drift (Type A)
+- Scenario 2: MBSE Version Mismatch (Type B)
+- Scenario 3: Documentation Sync (Type B)
+- Scenario 4: Control Design Conflict (Type C)
+
+**3D Scenarios** (`convide_balanced/`):
+- Scenario 5: IMU Orientation Estimation
+- Scenario 6: Multi-Sensor Fusion
+- Scenario 7: 3D Robotic Welding
+- Scenario 8: Chemical Reactor Monitoring
+
+**Key Metrics**:
+- I_theta: Identity causality score [0, 1]
+- Jaccard Index: Set-based consistency
+- Monte Carlo: Statistical consistency probability
+- 5 repeats per experiment, 300 MC samples per I_theta
 
 ---
 

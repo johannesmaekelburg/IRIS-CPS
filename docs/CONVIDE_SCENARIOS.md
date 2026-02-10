@@ -1,7 +1,7 @@
 # CONVIDE Scenarios - Engineering Applications
 
-**Last Updated**: January 27, 2026  
-**Status**: Production - 12 Scenarios Implemented
+**Last Updated**: February 9, 2026  
+**Status**: Production - 8 Scenarios Implemented (4 × 2D, 4 × 3D)
 
 ## Overview
 
@@ -33,47 +33,37 @@ scenario.constraint_source = '...';
 
 ## 2D Scenarios (1-4)
 
-### Scenario 1: Robot End-Effector Positioning
-**Context**: 2-DOF planar robot arm with joint angle uncertainty
-```matlab
-% Mapping: Forward kinematics
-F = [L1*cos(θ1) + L2*cos(θ1+θ2), -L1*sin(θ1) - L2*sin(θ1+θ2);
-     L1*sin(θ1) + L2*sin(θ1+θ2),  L1*cos(θ1) + L2*cos(θ1+θ2)]
-```
-**Uncertainty Source**: Joint encoder noise, backlash  
-**Constraint**: Workspace safety boundary (avoid collision zone)  
-**Engineering Goal**: Ensure end-effector stays in safe region despite uncertainty
+### Scenario 1: CAD Export Drift (Type A Causality)
+**Context**: Measurement uncertainty affecting constraint satisfaction
+**Engineering Application**: Design parameter uncertainty propagating through model transformations
+**Uncertainty Source**: CAD export tolerances, numerical precision  
+**Constraint**: Design specifications, safety margins  
+**Engineering Goal**: Ensure exported models remain within specifications
+**Causality Type**: Uncertainty-driven inconsistency
 
-### Scenario 2: Thermal Sensor Calibration
-**Context**: Temperature-pressure sensor with cross-sensitivity
-```matlab
-% Mapping: Coupled sensor response
-F = [α_TT, α_TP;
-     α_PT, α_PP]  % Sensitivity coefficients
-```
-**Uncertainty Source**: Sensor noise, thermal drift  
-**Constraint**: Operating range limits (safety thresholds)  
-**Engineering Goal**: Verify measurements within specification
+### Scenario 2: MBSE Version Mismatch (Type B)
+**Context**: Model-Based Systems Engineering synchronization issues
+**Engineering Application**: Multi-tool integration with version control
+**Uncertainty Source**: Model version drift, tool interoperability  
+**Constraint**: Interface specifications, requirement traceability  
+**Engineering Goal**: Maintain consistency across MBSE toolchains
+**Causality Type**: Structural inconsistency
 
-### Scenario 3: Computer Vision Tracking
-**Context**: Pixel-to-world coordinate transformation
-```matlab
-% Mapping: Homography + lens distortion
-F = intrinsic_matrix * extrinsic_matrix
-```
-**Uncertainty Source**: Pixel quantization, lens distortion  
-**Constraint**: Target detection zone  
-**Engineering Goal**: Maintain tracking lock despite image noise
+### Scenario 3: Documentation Sync (Type B)
+**Context**: Documentation-implementation consistency
+**Engineering Application**: Requirements traceability in development lifecycle
+**Uncertainty Source**: Manual updates, asynchronous changes  
+**Constraint**: Specification compliance, audit requirements  
+**Engineering Goal**: Ensure documentation matches implementation
+**Causality Type**: Structural inconsistency
 
-### Scenario 4: Control Design Conflict
-**Context**: Observer-based state estimation
-```matlab
-% Mapping: Kalman filter prediction step
-F = A_system  % System dynamics matrix
-```
-**Uncertainty Source**: Process noise, model mismatch  
-**Constraint**: State constraints for stability  
-**Engineering Goal**: Ensure estimated state respects physical limits
+### Scenario 4: Control Design Conflict (Type C)
+**Context**: Observer-controller co-design conflicts
+**Engineering Application**: State estimation vs control objectives
+**Uncertainty Source**: Model mismatch, estimation error  
+**Constraint**: Stability margins, performance specifications  
+**Engineering Goal**: Balance estimation accuracy with control robustness
+**Causality Type**: Hybrid uncertainty-structural
 
 ---
 
@@ -172,27 +162,31 @@ F = exp(A*dt) % Discretized system matrix
 
 ## Intervention Testing
 
-Each scenario is tested with **3 interventions × 20 parameter values**:
+Each scenario is tested with **3 interventions × 20-85 parameter values**:
 
 ### 1. Widen (Uncertainty Increase)
 ```matlab
-scales = logspace(log10(0.2), log10(20), 20);
-% Tests: How does increasing uncertainty affect inconsistency?
+% Varies by scenario, typically:
+scales = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, ...];
+% Tests: How does increasing uncertainty affect I_theta and inconsistency?
 ```
 
 ### 2. Shrink (Uncertainty Decrease)  
 ```matlab
-scales = logspace(log10(0.05), log10(5), 20);
+scales = [0.1, 0.2, 0.3, ...];
 % Tests: Does reducing uncertainty improve consistency?
 ```
 
-### 3. Rotate (Uncertainty Reorientation)
+### 3. Correlate (Structural Dependency)
 ```matlab
-angles = linspace(0, 2*pi, 20);
-% Tests: Does uncertainty direction matter for inconsistency?
+correlation_strength = [0.0, 0.1, 0.2, ..., 0.999];
+% Tests: Effect of generator correlation on inconsistency
 ```
 
-**Total Experiments**: 12 scenarios × 3 interventions × 20 points = **720 experiments**
+**Total Experiments**: 8 scenarios × 3 interventions × ~20-85 points = **~600+ experiments**
+
+**Repeats**: 5 repeats per experiment for statistical robustness  
+**Monte Carlo**: 300 samples per I_theta computation
 
 ---
 
@@ -240,38 +234,85 @@ Each scenario includes:
 
 ```
 data/
-├── convide_2d_scenarios/
-│   ├── scenario_2d_1.json    # Robot end-effector
-│   ├── scenario_2d_2.json    # Thermal sensor
-│   ├── scenario_2d_3.json    # Vision tracking
-│   └── scenario_2d_4.json    # Control design
-├── convide_3d_scenarios/
-│   ├── scenario_3d_5.json    # IMU orientation
-│   ├── scenario_3d_6.json    # Multi-sensor fusion
-│   ├── scenario_3d_7.json    # Robotic welding
-│   └── scenario_3d_8.json    # Chemical reactor
-└── convide_4d_scenarios/
-    ├── scenario_4d_9.json    # Quadrotor
-    ├── scenario_4d_10.json   # Power grid
-    ├── scenario_4d_11.json   # Spacecraft
-    └── scenario_4d_12.json   # Hydraulic system
+├── convide_with_I_theta/
+│   ├── results_convide_2d_scenario_1.json    # CAD Export Drift
+│   ├── results_convide_2d_scenario_2.json    # MBSE Version Mismatch
+│   ├── results_convide_2d_scenario_3.json    # Documentation Sync
+│   └── results_convide_2d_scenario_4.json    # Control Design Conflict
+└── convide_balanced/
+    ├── results_convide_3d_scenario_5.json    # IMU orientation (3D)
+    ├── results_convide_3d_scenario_6.json    # Multi-sensor fusion (3D)
+    ├── results_convide_3d_scenario_7.json    # Robotic welding (3D)
+    └── results_convide_3d_scenario_8.json    # Chemical reactor (3D)
+```
+
+### JSON Format
+
+```json
+{
+  "experiments": [
+    {
+      "intervention": "widen",
+      "param_value": 0.5,
+      "pre_uncertainty": {
+        "source_volume": 25,
+        "source_radius": 2.5,
+        "source_center": [100, 50],
+        "source_n_generators": 2,
+        "source_correlation": 0
+      },
+      "post_uncertainty": { ... },
+      "pre_inconsistency": {
+        "I_theta": 0.98,
+        "I_theta_se": 0.008,
+        "I_theta_ci95_lower": 0.957,
+        "I_theta_ci95_upper": 0.991,
+        "jaccard_index": 0.17,
+        "mc_probability": 0.027,
+        "mc_num_samples": 300,
+        "empty_intersection": false
+      },
+      "post_inconsistency": { ... },
+      "causal_effect": {
+        "delta_I_theta": -0.98,
+        "delta_jaccard": -0.17,
+        "delta_volume": -18.75
+      }
+    }
+  ]
+}
 ```
 
 ---
 
 ## Usage Example
 
+### MATLAB: Generate Data
 ```matlab
-% Load scenario
-scenario = jsondecode(fileread('data/convide_2d_scenarios/scenario_2d_1.json'));
+% Generate CONVIDE scenarios
+generate_convide_examples
+```
 
-% Run intervention
-params = struct('scale_factor', 5.0);
-result = causal_experiment_engine.run_intervention(scenario, 'widen', params);
+### Python: Sensitivity Analysis
+```bash
+# Analyze 2D data
+python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
 
-% Extract causal effect
-fprintf('Δ-Jaccard: %.4f\n', result.causal_effect.delta_jaccard);
-fprintf('Δ-Volume: %.4f\n', result.causal_effect.delta_source_volume);
+# Analyze 3D data
+python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
+```
+
+### Load and Inspect Results
+```python
+import json
+
+# Load data
+with open('data/convide_with_I_theta/results_convide_2d_scenario_1.json') as f:
+    data = json.load(f)
+
+# Extract I_theta values
+I_theta_values = [exp['pre_inconsistency']['I_theta'] for exp in data['experiments']]
+print(f'I_theta range: [{min(I_theta_values):.3f}, {max(I_theta_values):.3f}]')
 ```
 
 ---

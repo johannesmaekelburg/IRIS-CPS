@@ -43,110 +43,127 @@ python causal_orchestrator.py
 
 ## Three Ways to Use
 
-### 1. MATLAB Only (Quickest)
+### 1. MATLAB: Generate CONVIDE Data
 
 ```matlab
-% Create scenario
-scenario = causal_experiment_engine.create_baseline_scenario(2, 1.0);
+% Navigate to examples folder
+cd examples
 
-% Run intervention sweep
-results = causal_experiment_engine.run_intervention_sweep(...
-    scenario, 'widen', 'scale_factor', [0.5, 1.0, 1.5, 2.0, 3.0]);
+% Generate CONVIDE scenarios with I_theta metric
+generate_convide_examples
 
-% Results automatically plotted and saved
+% This creates:
+% - data/convide_with_I_theta/ (2D scenarios 1-4)
+% - data/convide_balanced/ (3D scenarios 5-8)
 ```
 
-**Use when:** You want quick results with visualization
+**Use when:** You need to generate experimental data with interventions
 
-### 2. Python + MATLAB Engine (Most Powerful)
+### 2. Python: Sensitivity Analysis (Primary Method)
+
+```bash
+# From project root (adjust paths if in src/)
+cd Causality_Uncertainty_Inconsistency
+
+# Analyze 2D data
+python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+
+# Analyze 3D data  
+python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
+```
+
+**Outputs:**
+- Sensitivity plots showing I_theta vs parameter values
+- Statistical analysis of causal effects
+- Delta metrics (delta_I_theta, delta_jaccard, delta_volume)
+
+**Use when:** You have generated CONVIDE data and want to analyze causality
+
+### 3. Data Inspection and Visualization
 
 ```python
-from causal_orchestrator import CausalOrchestrator
-import numpy as np
+import json
+import matplotlib.pyplot as plt
 
-orch = CausalOrchestrator(use_engine=True)  # Requires matlab.engine
+# Load data
+with open('data/convide_with_I_theta/results_convide_2d_scenario_1.json') as f:
+    data = json.load(f)
 
-experiments = orch.design_experiment(
-    intervention='widen',
-    param_ranges={'scale_factor': np.linspace(0.5, 3.0, 20)},
-    n_scenarios=10,
-    dimensions=[2, 4, 8]
-)
+# Extract metrics
+param_values = [exp['param_value'] for exp in data['experiments']]
+I_theta = [exp['pre_inconsistency']['I_theta'] for exp in data['experiments']]
+jaccard = [exp['pre_inconsistency']['jaccard_index'] for exp in data['experiments']]
 
-df = orch.run_experiment_batch(experiments)
-orch.generate_causal_report(df)
+# Quick plot
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.plot(param_values, I_theta, 'o-')
+plt.xlabel('Parameter Value')
+plt.ylabel('I_theta')
+plt.title('Identity Causality')
+
+plt.subplot(1, 2, 2)
+plt.plot(param_values, jaccard, 's-')
+plt.xlabel('Parameter Value')
+plt.ylabel('Jaccard Index')
+plt.title('Set Consistency')
+plt.tight_layout()
+plt.show()
 ```
 
-**Use when:** You need large-scale experiments with statistical analysis
+**Use when:** You want to quickly inspect and visualize results
 
-### 3. Adaptive Selection (Most Efficient)
+## Example: Studying I_theta Sensitivity
 
-```python
-from adaptive_selector import AdaptiveSelector
-from causal_orchestrator import CausalOrchestrator
+**Research Question:** How does uncertainty magnitude affect identity causality (I_theta)?
 
-orch = CausalOrchestrator(use_engine=True)
-selector = AdaptiveSelector(orch)
-
-df = selector.run_adaptive_campaign(
-    n_experiments=50,
-    strategy='uncertainty',
-    exploration_ratio=0.3
-)
-
-selector.plot_information_gain()
-```
-
-**Use when:** You want to learn causal effects with minimal experiments
-
-## Example: Studying Uncertainty → Emptiness
-
-**Research Question:** At what uncertainty level do propagated sets become empty?
-
-```matlab
-% MATLAB approach
-scenario = causal_experiment_engine.create_baseline_scenario(2, 1.0);
-results = causal_experiment_engine.run_intervention_sweep(...
-    scenario, 'widen', 'scale_factor', 0.5:0.1:3.0);
+```bash
+# Run sensitivity analysis on 2D scenario 1 (CAD Export Drift)
+python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
 ```
 
 **Expected Finding:**
 ```
-Scale Factor | Emptiness | Volume | Interpretation
--------------|-----------|--------|----------------
-0.5-1.8      | 0         | grows  | Valid propagation
-1.9-2.1      | 0→1       | →0     | Critical threshold
-2.2+         | 1         | 0      | Always empty
+Param Value | I_theta  | Jaccard  | Interpretation
+------------|----------|----------|----------------
+0.5         | 0.98     | 0.17     | High inconsistency
+1.0         | 0.95     | 0.25     | Moderate inconsistency  
+1.5         | 0.90     | 0.35     | Improving consistency
+2.0+        | 0.85     | 0.45     | Better consistency
 ```
 
-**Causal Claim:** `do(widen by >2.0) → P(empty) = 1`
+**Causal Claim:** `do(increase_uncertainty) → ΔI_theta < 0` (uncertainty reduction improves identity consistency)
 
-## Example: Studying Misalignment → Uncertainty
+## Example: Comparing 2D vs 3D Causality
 
-**Research Question:** How do mapping errors amplify uncertainty?
+**Research Question:** Does dimensionality affect causal relationships?
 
-```python
-# Python approach
-orch = CausalOrchestrator(use_engine=True)
+```bash
+# Analyze both datasets
+python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
 
-experiments = orch.design_experiment(
-    intervention='misalign',
-    param_ranges={'misalignment_strength': np.linspace(0, 0.5, 25)},
-    n_scenarios=10,
-    dimensions=[2, 4, 8]
-)
+# Compare results
+python -c "
+import json
+import numpy as np
 
-df = orch.run_experiment_batch(experiments)
+# Load 2D results
+with open('data/convide_with_I_theta/results_convide_2d_scenario_1.json') as f:
+    data_2d = json.load(f)
+I_theta_2d = [exp['pre_inconsistency']['I_theta'] for exp in data_2d['experiments']]
 
-analysis = orch.analyze_causal_pathway(
-    df,
-    intervention='misalign',
-    outcome_metric='effect_uncertainty_volume_ratio'
-)
+# Load 3D results
+with open('data/convide_balanced/results_convide_3d_scenario_5.json') as f:
+    data_3d = json.load(f)
+I_theta_3d = [exp['pre_inconsistency']['I_theta'] for exp in data_3d['experiments']]
 
-print(f"Linear slope: {analysis['linear_slope']:.3f}")
-print(f"Nonlinearity: {analysis['nonlinearity']:.3f}")
+print(f'2D I_theta mean: {np.mean(I_theta_2d):.3f}')
+print(f'3D I_theta mean: {np.mean(I_theta_3d):.3f}')
+"
 ```
+
+**Use case:** Understanding how geometric complexity affects causality propagation
 
 **Expected Finding:**
 - Linear slope ≈ 6.4 (misalignment amplifies volume 6.4× per unit error)

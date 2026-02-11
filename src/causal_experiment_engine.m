@@ -251,9 +251,17 @@ classdef causal_experiment_engine
                                 theta_params = scenario.intervention_params;
                             end
                             
+                            % Determine method for I(θ) computation
+                            % Use 'jaccard' if consistency_method is 'jaccard' or contains 'jaccard'
+                            i_theta_method = 'mc';  % default
+                            if contains(lower(options.consistency_method), 'jaccard')
+                                i_theta_method = 'jaccard';
+                            end
+                            
                             % Compute I(θ) = 1 - P(consistent across all models)
                             [I_theta, I_details] = global_inconsistency(all_models, ...
                                 'n_samples', options.mc_samples, ...
+                                'method', i_theta_method, ...
                                 'verbose', false, ...
                                 'theta_params', theta_params);
                             
@@ -702,8 +710,19 @@ classdef causal_experiment_engine
             
             for i = 1:data.n_experiments
                 exp = experiments_list{i};
+                
+                % Handle different field naming conventions
+                % Two-step workflow uses 'intervention_type', original uses 'intervention.type'
+                if isfield(exp, 'intervention') && isstruct(exp.intervention)
+                    intervention_type = exp.intervention.type;
+                elseif isfield(exp, 'intervention_type')
+                    intervention_type = exp.intervention_type;
+                else
+                    intervention_type = 'unknown';
+                end
+                
                 data.experiments{i} = struct(...
-                    'intervention', exp.intervention.type, ...
+                    'intervention', intervention_type, ...
                     'param_value', exp.param_value, ...
                     'pre_uncertainty', causal_experiment_engine.flatten_struct(exp.pre_state.uncertainty), ...
                     'post_uncertainty', causal_experiment_engine.flatten_struct(exp.post_state.uncertainty), ...

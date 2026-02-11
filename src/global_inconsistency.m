@@ -178,19 +178,92 @@ if num_models == 1
     return;
 end
 
-%% Compute P(consistent) using score_mc_probability
+%% Compute P(consistent) using appropriate method
 % This function computes P(realization ∈ ⋂ all models)
 
-if verbose
-    fprintf('  Computing P(consistent) via Monte Carlo...\n');
+switch lower(method)
+    case {'mc', 'monte_carlo'}
+        % Monte Carlo sampling method
+        if verbose
+            fprintf('  Computing P(consistent) via Monte Carlo...\n');
+        end
+        
+        [p_consistent, mc_details] = score_mc_probability(model_list, ...
+            'num_samples', n_samples, ...
+            'seed', seed, ...
+            'verbose', verbose, ...
+            'return_details', true);
+        
+    case 'jaccard'
+        % Jaccard-based method: average pairwise consistency
+        if verbose
+            fprintf('  Computing P(consistent) via Jaccard method...\n');
+        end
+        
+        % For multiple models, compute pairwise Jaccard scores
+        % and aggregate as geometric mean of consistency scores
+        if num_models == 2
+            % Simple case: two models
+            [C, ~, jaccard_details] = score_jaccard(...
+                model_list{1}, model_list{2}, eye(length(model_list{2}.c)), ...
+                zeros(length(model_list{2}.c), 1), ...
+                struct('verbose', verbose, 'return_details', true));
+            
+            p_consistent = C;  % Directional consistency as probability proxy
+            mc_details = struct();
+            mc_details.num_samples = 0;
+            mc_details.num_consistent = round(C * 1000);
+            mc_details.standard_error = 0.0;  % No sampling error for Jaccard
+            mc_details.ci95_lower = C;
+            mc_details.ci95_upper = C;
+            mc_details.intersection_empty = jaccard_details.is_empty;
+            
+        else
+            % Multiple models: compute all pairwise Jaccard scores
+            % and use geometric mean as aggregate consistency
+            if verbose
+                fprintf('    Computing %d pairwise Jaccard scores...\n', ...
+                    nchoosek(num_models, 2));
+            end
+            
+            jaccard_scores = [];
+            for i = 1:(num_models-1)
+                for j = (i+1):num_models
+                    [C, ~, ~] = score_jaccard(...
+                        model_list{i}, model_list{j}, ...
+                        eye(length(model_list{j}.c)), ...
+                        zeros(length(model_list{j}.c), 1), ...
+                        struct('verbose', false));
+                    jaccard_scores(end+1) = C;
+                end
+            end
+            
+            % Geometric mean of pairwise consistency scores
+            p_consistent = geomean(jaccard_scores);
+            
+            mc_details = struct();
+            mc_details.num_samples = 0;
+            mc_details.num_consistent = round(p_consistent * 1000);
+            mc_details.standard_error = 0.0;
+            mc_details.ci95_lower = min(jaccard_scores);
+            mc_details.ci95_upper = max(jaccard_scores);
+            mc_details.intersection_empty = any(jaccard_scores == 0);
+            
+            if verbose
+                fprintf('    Pairwise Jaccard scores: [%s]\n', ...
+                    sprintf('%.3f ', jaccard_scores));
+                fprintf('    Geometric mean: %.3f\n', p_consistent);
+            end
+        end
+        
+    case 'exact'
+        error('global_inconsistency:NotImplemented', ...
+            'Exact computation not yet implemented. Use ''mc'' or ''jaccard''.');
+        
+    otherwise
+        error('global_inconsistency:InvalidMethod', ...
+            'Method must be ''mc'', ''jaccard'', or ''exact''.');
 end
-
-% Call parent's score_mc_probability function
-[p_consistent, mc_details] = score_mc_probability(model_list, ...
-    'num_samples', n_samples, ...
-    'seed', seed, ...
-    'verbose', verbose, ...
-    'return_details', true);
 
 %% Compute I(θ) = 1 - P(consistent)
 I_theta = 1.0 - p_consistent;

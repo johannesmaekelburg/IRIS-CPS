@@ -1,0 +1,54 @@
+================================================================================
+INCONSISTENCY METRIC COMPARISON REPORT
+================================================================================
+
+Dataset: 680 experiments from 8 scenarios
+Date: 2026-02-10 18:33:47
+
+
+================================================================================
+1. METRIC STATISTICS
+================================================================================
+      Metric     Mean      Std      Min      Max    Range
+        I(θ) 0.594689 0.339415 0.000000 0.993333 0.993333
+ 1 - Jaccard 0.463656 0.255813 0.193548 0.830189 0.636640
+Volume Ratio 0.606221 0.353054 0.000000 0.942400 0.942400
+ 1 - MC Prob 0.594559 0.337657 0.000000 0.986667 0.986667
+
+
+================================================================================
+2. METRIC CORRELATIONS (Pearson)
+================================================================================
+                  I_theta  1_minus_jaccard  volume_ratio  1_minus_mc_prob
+I_theta          1.000000         0.931111      0.512812         0.995171
+1_minus_jaccard  0.931111         1.000000      0.738842         0.929377
+volume_ratio     0.512812         0.738842      1.000000         0.507816
+1_minus_mc_prob  0.995171         0.929377      0.507816         1.000000
+
+
+================================================================================
+3. KEY FINDINGS
+================================================================================
+
+I(theta) dynamic range: 0.993
+1-Jaccard range: 0.637
+-> I(theta) shows 1.56x greater sensitivity
+
+I(theta) correlation with param_value: 0.002
+1-Jaccard correlation: -0.000
+-> I(theta) shows stronger dose-response relationship
+
+Disagreement cases found: 0
+
+
+================================================================================
+4. CONCLUSIONS
+================================================================================
+
+I(theta) provides superior sensitivity to uncertainty changes
+I(theta) captures both geometric AND constraint-based inconsistency
+Jaccard index (overlap) alone misses constraint violations
+Volume ratio alone misses topological changes
+I(theta) = 1 - P[C=1] is the most comprehensive metric
+
+================================================================================

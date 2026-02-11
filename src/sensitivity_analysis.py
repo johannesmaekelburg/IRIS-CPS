@@ -38,6 +38,21 @@ import seaborn as sns
 from scipy import stats
 from scipy.interpolate import interp1d
 
+# Import shared utilities
+from analysis_utils import (
+    load_experimental_data,
+    extract_theta_and_I,
+    compute_derived_metrics,
+    save_report,
+    create_report_header,
+    setup_figure,
+    save_figure,
+    ensure_output_dir,
+    print_analysis_header,
+    print_analysis_footer,
+    export_results_to_json
+)
+
 # Machine learning for surrogate models
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -822,16 +837,18 @@ def plot_sobol_indices(sobol_dict: Dict[str, Any],
 
 def run_full_sensitivity_analysis(data_dir: str,
                                   output_dir: str,
-                                  param_name: str = 'scale_factor',
-                                  threshold: float = 0.5):
+                                  param_name: str = 'auto',
+                                  threshold: float = 0.5,
+                                  run_sobol: bool = True):
     """
     Run complete sensitivity analysis pipeline.
     
     Args:
         data_dir: Directory with MATLAB JSON exports
         output_dir: Directory for output figures and results
-        param_name: Primary parameter to analyze
+        param_name: Primary parameter to analyze ('auto' to auto-detect)
         threshold: Inconsistency threshold for robustness margins
+        run_sobol: Whether to compute Sobol indices (requires SALib)
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -842,6 +859,35 @@ def run_full_sensitivity_analysis(data_dir: str,
     
     # 1. Load data
     df = load_experimental_data(data_dir)
+    
+    # Auto-detect parameter name if needed
+    if param_name == 'auto':
+        # Look for common parameter names
+        candidate_params = ['param_value', 'scale_factor', 'uncertainty_scale', 'alpha', 'beta']
+        found_param = None
+        for candidate in candidate_params:
+            if candidate in df.columns and df[candidate].notna().sum() > 0:
+                found_param = candidate
+                break
+        
+        if found_param is None:
+            # Try to find any numeric column that varies
+            for col in df.columns:
+                if col not in ['I_theta', 'I_theta_se', 'jaccard_index', 'mc_probability',
+                              'source_volume', 'target_volume', 'post_I_theta', 'post_jaccard',
+                              'delta_I_theta', 'delta_jaccard']:
+                    if df[col].dtype in [np.float64, np.int64] and df[col].nunique() > 1:
+                        found_param = col
+                        break
+        
+        if found_param is None:
+            raise ValueError("Could not auto-detect parameter. Available columns: " + 
+                           ", ".join(df.columns))
+        
+        param_name = found_param
+        print(f"\n🔍 Auto-detected parameter: '{param_name}'")
+        print(f"   Values: {sorted(df[param_name].unique())}")
+        print()
     
     # 2. Total causal effects
     print("\n" + "="*80)
@@ -901,7 +947,7 @@ def run_full_sensitivity_analysis(data_dir: str,
             
             print(f"  Expanded θ matrix: {theta.shape}")
     
-    if theta.shape[1] >= 2 and SALIB_AVAILABLE:
+    if run_sobol and theta.shape[1] >= 2 and SALIB_AVAILABLE:
         print("\n" + "="*80)
         print("4. SOBOL INDICES (Variance-based)")
         print("="*80)
@@ -919,6 +965,8 @@ def run_full_sensitivity_analysis(data_dir: str,
             print(f"✗ Warning: Sobol analysis failed: {e}")
             import traceback
             traceback.print_exc()
+    elif not run_sobol:
+        print(f"\n⊘ Skipping Sobol indices: Disabled via run_sobol=False")
     elif theta.shape[1] < 2:
         print(f"\n✗ Skipping Sobol indices: Need ≥2 parameters, found {theta.shape[1]}")
         print("  💡 Tip: Combine multiple scenarios to get parameter variation across scenarios")

@@ -55,6 +55,8 @@ Thumbs.db
 
 # Data (large generated files)
 data/**/*.json
+!data/measurements/
+!data/measurements/*.json
 data/**/*.mat
 !data/README.md
 data/test_sensitivity/

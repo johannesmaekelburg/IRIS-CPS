@@ -73,33 +73,60 @@ def load_experimental_data(data_dir: str,
         experiments = data.get('experiments', [])
         
         for exp in experiments:
-            # Basic info
+            # Basic info - handle MATLAB export format
             record = {
                 'scenario': scenario_name,
-                'param_value': exp.get('param_value'),
+                'param_value': exp.get('intervention_value', exp.get('param_value')),
                 'intervention_type': exp.get('intervention_type', 'unknown'),
             }
             
+            # Handle nested state structure (MATLAB export)
+            pre_state = exp.get('pre_state', {})
+            post_state = exp.get('post_state', {})
+            
             # Pre-intervention inconsistency
-            pre_inconsistency = exp.get('pre_inconsistency', {})
-            record['I_theta'] = pre_inconsistency.get('I_theta', np.nan)
-            record['I_theta_se'] = pre_inconsistency.get('I_theta_se', np.nan)
+            pre_inconsistency = exp.get('pre_inconsistency', pre_state.get('inconsistency', {}))
+            
+            # Compute I_theta from MC probability if not available
+            I_theta_pre = pre_inconsistency.get('I_theta')
+            if I_theta_pre is None or np.isnan(I_theta_pre):
+                mc_p_consistent = pre_inconsistency.get('mc_p_consistent_sobol', 
+                                                       pre_inconsistency.get('mc_probability'))
+                if mc_p_consistent is not None:
+                    I_theta_pre = 1.0 - mc_p_consistent
+            
+            record['I_theta'] = I_theta_pre
+            record['I_theta_se'] = pre_inconsistency.get('mc_standard_error_sobol', np.nan)
             record['jaccard_index'] = pre_inconsistency.get('jaccard_index', np.nan)
-            record['mc_probability'] = pre_inconsistency.get('mc_probability', np.nan)
+            record['mc_probability'] = pre_inconsistency.get('mc_p_consistent_sobol', 
+                                                            pre_inconsistency.get('mc_probability', np.nan))
             
             # Pre-intervention uncertainty
-            pre_uncertainty = exp.get('pre_uncertainty', {})
+            pre_uncertainty = exp.get('pre_uncertainty', pre_state.get('uncertainty', {}))
             record['source_volume'] = pre_uncertainty.get('source_volume', np.nan)
             record['target_volume'] = pre_uncertainty.get('target_volume', np.nan)
             
             # Post-intervention inconsistency
-            post_inconsistency = exp.get('post_inconsistency', {})
-            record['post_I_theta'] = post_inconsistency.get('I_theta', np.nan)
+            post_inconsistency = exp.get('post_inconsistency', post_state.get('inconsistency', {}))
+            
+            # Compute post I_theta from MC probability if not available
+            I_theta_post = post_inconsistency.get('I_theta')
+            if I_theta_post is None or np.isnan(I_theta_post):
+                mc_p_consistent_post = post_inconsistency.get('mc_p_consistent_sobol',
+                                                              post_inconsistency.get('mc_probability'))
+                if mc_p_consistent_post is not None:
+                    I_theta_post = 1.0 - mc_p_consistent_post
+            
+            record['post_I_theta'] = I_theta_post
             record['post_jaccard'] = post_inconsistency.get('jaccard_index', np.nan)
             
             # Causal effects
-            causal_effects = exp.get('causal_effects', {})
-            record['delta_I_theta'] = causal_effects.get('delta_I_theta', np.nan)
+            causal_effects = exp.get('causal_effects', exp.get('causal_effect', {}))
+            delta_I = causal_effects.get('delta_I_theta')
+            if delta_I is None and I_theta_post is not None and I_theta_pre is not None:
+                delta_I = I_theta_post - I_theta_pre
+            
+            record['delta_I_theta'] = delta_I
             record['delta_jaccard'] = causal_effects.get('delta_jaccard', np.nan)
             
             # Extract parameter configurations (for sensitivity analysis)

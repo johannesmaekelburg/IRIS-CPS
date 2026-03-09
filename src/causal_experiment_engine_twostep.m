@@ -38,9 +38,10 @@ classdef causal_experiment_engine_twostep
         UNCERTAINTY_INTERVENTIONS = {'widen', 'shrink', 'shift', 'rotate', 'correlate'};
         
         % Consistency scoring methods
-        CONSISTENCY_METHODS = {'jaccard', 'mc_probability', 'both'};
+        CONSISTENCY_METHODS = {'jaccard', 'jaccard_mc', 'mc_probability', 'both'};
         DEFAULT_METHOD = 'both';
         DEFAULT_MC_SAMPLES = 2000;
+        DEFAULT_SAMPLING_METHOD = 'sobol';  % 'random', 'sobol', 'halton', 'lhs'
     end
     
     methods (Static)
@@ -73,6 +74,9 @@ classdef causal_experiment_engine_twostep
             if ~isfield(options, 'verbose')
                 options.verbose = true;
             end
+            if ~isfield(options, 'use_parallel')
+                options.use_parallel = false;
+            end
             
             % Create output directory
             if ~exist(output_dir, 'dir')
@@ -95,76 +99,171 @@ classdef causal_experiment_engine_twostep
             baseline_scenario.source = scenario_def.source;
             baseline_scenario.target = scenario_def.target;
             
-            % Loop over interventions
+            % Flatten experiments for optional parallelization
+            experiments = [];
             for i = 1:length(interventions)
                 int = interventions{i};
-                
-                if options.verbose
-                    fprintf('  Intervention: %s (%d values × %d repeats)\n', ...
-                        int.type, length(int.values), options.n_repeats);
-                end
-                
                 for val_idx = 1:length(int.values)
-                    param_val = int.values(val_idx);
-                    
                     for rep = 1:options.n_repeats
-                        exp_count = exp_count + 1;
+                        exp = struct();
+                        exp.intervention_type = int.type;
+                        exp.param_name = int.param;
+                        exp.param_value = int.values(val_idx);
+                        exp.repeat_idx = rep;
+                        experiments = [experiments; exp];
+                    end
+                end
+            end
+            
+            n_total = length(experiments);
+            if options.verbose
+                fprintf('  Total experiments: %d\n', n_total);
+                if options.use_parallel && ~isempty(gcp('nocreate'))
+                    fprintf('  Parallel mode: ENABLED (parfor will distribute across workers)\n');
+                end
+            end
+            
+            zonotope_data = cell(n_total, 1);
+            
+            % Use parfor if parallel enabled, otherwise regular for
+            if options.use_parallel
+                if options.verbose
+                    fprintf('  Starting parallel zonotope generation at %s...\n', char(datetime('now', 'Format', 'HH:mm:ss')));
+                    tic;
+                    % Setup progress monitoring
+                    progress_queue = parallel.pool.DataQueue;
+                    afterEach(progress_queue, @(~) fprintf('.'));
+                end
+                parfor exp_id = 1:n_total
+                    % Suppress CORA warnings in each worker
+                    warning('off', 'all');
                         
-                        if options.verbose && mod(exp_count, 20) == 0
-                            fprintf('    Progress: %d experiments generated\n', exp_count);
-                        end
-                        
-                        % Apply intervention
-                        params = struct(int.param, param_val);
-                        scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
-                            baseline_scenario, int.type, params);
+                    exp = experiments(exp_id);
+                    
+                    % Apply intervention
+                    params = struct(exp.param_name, exp.param_value);
+                    scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                        baseline_scenario, exp.intervention_type, params);
                         
                         % Propagate modified source
                         F = scenario_modified.mapping.F;
                         f = scenario_modified.mapping.f;
                         Z_propagated = CS_Types.affineMap_cPZ(scenario_modified.source, F, f);
                         
-                        % Store zonotope data
-                        zono_data = struct();
-                        zono_data.exp_id = exp_count;
-                        zono_data.scenario_id = scenario_def.id;
-                        zono_data.scenario_name = scenario_name;
-                        zono_data.scenario_description = scenario_def.name;
-                        zono_data.causality_type = scenario_def.type;
-                        zono_data.intervention_type = int.type;
-                        zono_data.param_name = int.param;
-                        zono_data.param_value = param_val;
-                        zono_data.repeat_idx = rep;
-                        zono_data.timestamp = datetime('now');
+                    % Store zonotope data
+                    zono_data = struct();
+                    zono_data.exp_id = exp_id;
+                    zono_data.scenario_id = scenario_def.id;
+                    zono_data.scenario_name = scenario_name;
+                    zono_data.scenario_description = scenario_def.name;
+                    zono_data.causality_type = scenario_def.type;
+                    zono_data.intervention_type = exp.intervention_type;
+                    zono_data.param_name = exp.param_name;
+                    zono_data.intervention_value = exp.param_value;
+                    zono_data.repeat_idx = exp.repeat_idx;
+                    zono_data.timestamp = datetime('now');
                         
-                        % Store zonotopes
-                        zono_data.Z_source_pre = baseline_scenario.source;
-                        zono_data.Z_target = baseline_scenario.target;
-                        zono_data.Z_source_post = scenario_modified.source;
-                        zono_data.Z_propagated = Z_propagated;
-                        
-                        % Store mapping
-                        zono_data.mapping_F = F;
-                        zono_data.mapping_f = f;
-                        
-                        % Save to file
-                        filename = sprintf('zonotopes_%s_exp%04d.mat', scenario_name, exp_count);
-                        filepath = fullfile(output_dir, filename);
-                        save(filepath, '-struct', 'zono_data');
-                        
-                        % Keep metadata for return
-                        zono_metadata = struct();
-                        zono_metadata.exp_id = exp_count;
-                        zono_metadata.scenario_name = scenario_name;
-                        zono_metadata.intervention_type = int.type;
-                        zono_metadata.param_value = param_val;
-                        zono_metadata.repeat_idx = rep;
-                        zono_metadata.filepath = filepath;
-                        
-                        zonotope_data{end+1} = zono_metadata;
+                    % Store zonotopes
+                    zono_data.Z_source_pre = baseline_scenario.source;
+                    zono_data.Z_target = baseline_scenario.target;
+                    zono_data.Z_source_post = scenario_modified.source;
+                    zono_data.Z_propagated = Z_propagated;
+                    
+                    % Store mapping
+                    zono_data.mapping_F = F;
+                    zono_data.mapping_f = f;
+                    
+                    % Save to file (use -fromstruct for parfor compatibility)
+                    filename = sprintf('zonotopes_%s_exp%04d.mat', scenario_name, exp_id);
+                    filepath = fullfile(output_dir, filename);
+                    save(filepath, '-fromstruct', zono_data);
+                    
+                    % Return metadata
+                    zono_metadata = struct();
+                    zono_metadata.exp_id = exp_id;
+                    zono_metadata.scenario_name = scenario_name;
+                    zono_metadata.intervention_type = exp.intervention_type;
+                    zono_metadata.intervention_value = exp.param_value;
+                    zono_metadata.repeat_idx = exp.repeat_idx;
+                    zono_metadata.filepath = filepath;
+                    
+                    zonotope_data{exp_id} = zono_metadata;
+                    
+                    % Send progress update
+                    if options.verbose
+                        send(progress_queue, exp_id);
                     end
                 end
+                
+                if options.verbose
+                    fprintf('\n');  % New line after dots
+                    elapsed = toc;
+                    fprintf('  ✓ Parallel generation complete! %d files in %.1f min (%.1f files/min)\n', ...
+                        n_total, elapsed/60, n_total/(elapsed/60));
+                end
+            else
+                for exp_id = 1:n_total
+                    % Suppress CORA warnings
+                    warning('off', 'all');
+                    
+                    exp = experiments(exp_id);
+                    
+                    if options.verbose && mod(exp_id, 20) == 0
+                        fprintf('    Progress: %d/%d\n', exp_id, n_total);
+                    end
+                    
+                    % Apply intervention
+                    params = struct(exp.param_name, exp.param_value);
+                    scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                        baseline_scenario, exp.intervention_type, params);
+                    
+                    % Propagate modified source
+                    F = scenario_modified.mapping.F;
+                    f = scenario_modified.mapping.f;
+                    Z_propagated = CS_Types.affineMap_cPZ(scenario_modified.source, F, f);
+                    
+                    % Store zonotope data
+                    zono_data = struct();
+                    zono_data.exp_id = exp_id;
+                    zono_data.scenario_id = scenario_def.id;
+                    zono_data.scenario_name = scenario_name;
+                    zono_data.scenario_description = scenario_def.name;
+                    zono_data.causality_type = scenario_def.type;
+                    zono_data.intervention_type = exp.intervention_type;
+                    zono_data.param_name = exp.param_name;
+                    zono_data.intervention_value = exp.param_value;
+                    zono_data.repeat_idx = exp.repeat_idx;
+                    zono_data.timestamp = datetime('now');
+                    
+                    % Store zonotopes
+                    zono_data.Z_source_pre = baseline_scenario.source;
+                    zono_data.Z_target = baseline_scenario.target;
+                    zono_data.Z_source_post = scenario_modified.source;
+                    zono_data.Z_propagated = Z_propagated;
+                    
+                    % Store mapping
+                    zono_data.mapping_F = F;
+                    zono_data.mapping_f = f;
+                    
+                    % Save to file
+                    filename = sprintf('zonotopes_%s_exp%04d.mat', scenario_name, exp_id);
+                    filepath = fullfile(output_dir, filename);
+                    save(filepath, '-fromstruct', zono_data);
+                    
+                    % Return metadata
+                    zono_metadata = struct();
+                    zono_metadata.exp_id = exp_id;
+                    zono_metadata.scenario_name = scenario_name;
+                    zono_metadata.intervention_type = exp.intervention_type;
+                    zono_metadata.intervention_value = exp.param_value;
+                    zono_metadata.repeat_idx = exp.repeat_idx;
+                    zono_metadata.filepath = filepath;
+                    
+                    zonotope_data{exp_id} = zono_metadata;
+                end
             end
+            
+            exp_count = n_total;
             
             % Save index file
             index_file = fullfile(output_dir, sprintf('index_%s.mat', scenario_name));
@@ -210,8 +309,18 @@ classdef causal_experiment_engine_twostep
             if ~isfield(consistency_options, 'mc_samples')
                 consistency_options.mc_samples = 2000;
             end
+            if ~isfield(consistency_options, 'sampling_method')
+                consistency_options.sampling_method = {'sobol', 'halton'};  % Both QMC methods by default
+            end
+            % Convert single string to cell array for uniform processing
+            if ischar(consistency_options.sampling_method)
+                consistency_options.sampling_method = {consistency_options.sampling_method};
+            end
             if ~isfield(consistency_options, 'verbose')
                 consistency_options.verbose = true;
+            end
+            if ~isfield(consistency_options, 'use_parallel')
+                consistency_options.use_parallel = false;
             end
             
             % Create output directory
@@ -264,21 +373,39 @@ classdef causal_experiment_engine_twostep
                     if contains(lower(consistency_options.method), 'mc') || ...
                        strcmp(lower(consistency_options.method), 'both')
                         fprintf('  MC samples per experiment: %d\n', consistency_options.mc_samples);
+                        if iscell(consistency_options.sampling_method)
+                            fprintf('  Sampling methods: %s\n', strjoin(consistency_options.sampling_method, ', '));
+                        else
+                            fprintf('  Sampling method: %s\n', consistency_options.sampling_method);
+                        end
                     end
                     fprintf('\n');
                 end
                 
-                all_results = {};
+                all_results = cell(1, n_total_exp);
                 scenario_start_time = tic;
                 
-                % Process each zonotope file
-                for exp_idx = 1:n_total_exp
-                    zono_meta = zonotope_index.zonotope_files{exp_idx};
+                % Process each zonotope file with optional parallelization
+                if consistency_options.use_parallel
+                    if consistency_options.verbose
+                        fprintf('  Starting parallel consistency computation at %s...\n', ...
+                            char(datetime('now', 'Format', 'HH:mm:ss')));
+                    end
                     
-                    exp_start_time = tic;
+                    % Setup progress monitoring for parallel execution
+                    if consistency_options.verbose
+                        progress_queue = parallel.pool.DataQueue;
+                        afterEach(progress_queue, @(~) fprintf('.'));
+                    end
                     
-                    % Load zonotope data
-                    zono_data = load(zono_meta.filepath);
+                    parfor exp_idx = 1:n_total_exp
+                        % Suppress CORA warnings in each worker
+                        warning('off', 'all');
+                        
+                        zono_meta = zonotope_index.zonotope_files{exp_idx};
+                        
+                        % Load zonotope data
+                        zono_data = load(zono_meta.filepath);
                     
                     % Measure pre-intervention state
                     pre_scenario = struct();
@@ -298,22 +425,6 @@ classdef causal_experiment_engine_twostep
                     post_state = causal_experiment_engine_twostep.measure_state(...
                         post_scenario, consistency_options);
                     
-                    exp_time = toc(exp_start_time);
-                    
-                    % Progress reporting with time estimates
-                    if consistency_options.verbose
-                        elapsed_total = toc(scenario_start_time);
-                        avg_time_per_exp = elapsed_total / exp_idx;
-                        remaining_exp = n_total_exp - exp_idx;
-                        eta_seconds = remaining_exp * avg_time_per_exp;
-                        
-                        % Print every 5 experiments or every 10 seconds
-                        if mod(exp_idx, 5) == 0 || exp_idx == 1 || exp_idx == n_total_exp
-                            fprintf('  [%d/%d] %.2fs/exp | Elapsed: %.1fs | ETA: %.1fs (%.1f min)\n', ...
-                                exp_idx, n_total_exp, exp_time, elapsed_total, eta_seconds, eta_seconds/60);
-                        end
-                    end
-                    
                     % Compute causal effect
                     causal_effect = causal_experiment_engine_twostep.compute_delta(...
                         pre_state, post_state);
@@ -326,7 +437,7 @@ classdef causal_experiment_engine_twostep
                     result.causality_type = zono_data.causality_type;
                     result.intervention_type = zono_data.intervention_type;
                     result.intervention_direction = 'forward';
-                    result.param_value = zono_data.param_value;
+                    result.intervention_value = zono_data.intervention_value;
                     result.repeat_idx = zono_data.repeat_idx;
                     result.run_id = zono_data.exp_id;
                     
@@ -337,7 +448,92 @@ classdef causal_experiment_engine_twostep
                     result.consistency_method = consistency_options.method;
                     result.measurement_timestamp = datetime('now');
                     
-                    all_results{end+1} = result;
+                    all_results{exp_idx} = result;
+                    
+                    % Send progress update
+                    if consistency_options.verbose
+                        send(progress_queue, exp_idx);
+                    end
+                    end
+                    
+                    if consistency_options.verbose
+                        fprintf('\n');  % New line after dots
+                        elapsed = toc(scenario_start_time);
+                        fprintf('  ✓ Parallel consistency complete! %d experiments in %.1f min (%.1f exp/min)\n', ...
+                            n_total_exp, elapsed/60, n_total_exp/(elapsed/60));
+                    end
+                else
+                    % Sequential processing with progress reporting
+                    for exp_idx = 1:n_total_exp
+                        % Suppress CORA warnings
+                        warning('off', 'all');
+                        
+                        zono_meta = zonotope_index.zonotope_files{exp_idx};
+                        
+                        % Load zonotope data
+                        zono_data = load(zono_meta.filepath);
+                    
+                        exp_start_time = tic;
+                    
+                        % Measure pre-intervention state
+                        pre_scenario = struct();
+                        pre_scenario.source = zono_data.Z_source_pre;
+                        pre_scenario.target = zono_data.Z_target;
+                        pre_scenario.mapping = struct('F', zono_data.mapping_F, 'f', zono_data.mapping_f);
+                        
+                        pre_state = causal_experiment_engine_twostep.measure_state(...
+                            pre_scenario, consistency_options);
+                        
+                        % Measure post-intervention state
+                        post_scenario = struct();
+                        post_scenario.source = zono_data.Z_source_post;
+                        post_scenario.target = zono_data.Z_target;
+                        post_scenario.mapping = struct('F', zono_data.mapping_F, 'f', zono_data.mapping_f);
+                        
+                        post_state = causal_experiment_engine_twostep.measure_state(...
+                            post_scenario, consistency_options);
+                        
+                        exp_time = toc(exp_start_time);
+                        
+                        % Progress reporting with time estimates
+                        if consistency_options.verbose
+                            elapsed_total = toc(scenario_start_time);
+                            avg_time_per_exp = elapsed_total / exp_idx;
+                            remaining_exp = n_total_exp - exp_idx;
+                            eta_seconds = remaining_exp * avg_time_per_exp;
+                            
+                            % Print every 5 experiments or every 10 seconds
+                            if mod(exp_idx, 5) == 0 || exp_idx == 1 || exp_idx == n_total_exp
+                                fprintf('  [%d/%d] %.2fs/exp | Elapsed: %.1fs | ETA: %.1fs (%.1f min)\n', ...
+                                    exp_idx, n_total_exp, exp_time, elapsed_total, eta_seconds, eta_seconds/60);
+                            end
+                        end
+                        
+                        % Compute causal effect
+                        causal_effect = causal_experiment_engine_twostep.compute_delta(...
+                            pre_state, post_state);
+                        
+                        % Build result struct
+                        result = struct();
+                        result.exp_id = zono_data.exp_id;
+                        result.scenario_type = zono_data.scenario_name;
+                        result.scenario_description = zono_data.scenario_description;
+                        result.causality_type = zono_data.causality_type;
+                        result.intervention_type = zono_data.intervention_type;
+                        result.intervention_direction = 'forward';
+                        result.intervention_value = zono_data.intervention_value;
+                        result.repeat_idx = zono_data.repeat_idx;
+                        result.run_id = zono_data.exp_id;
+                        
+                        result.pre_state = pre_state;
+                        result.post_state = post_state;
+                        result.causal_effect = causal_effect;
+                        
+                        result.consistency_method = consistency_options.method;
+                        result.measurement_timestamp = datetime('now');
+                        
+                        all_results{exp_idx} = result;
+                    end
                 end
                 
                 scenario_total_time = toc(scenario_start_time);
@@ -479,7 +675,7 @@ classdef causal_experiment_engine_twostep
                     if isfield(scenario, 'target') && isobject(scenario.target)
                         method = lower(options.method);
                         
-                        % === JACCARD METHOD ===
+                        % === JACCARD METHOD (AABB) ===
                         if strcmp(method, 'jaccard') || strcmp(method, 'both')
                             try
                                 F_identity = eye(size(scenario.target.c, 1));
@@ -512,28 +708,67 @@ classdef causal_experiment_engine_twostep
                             end
                         end
                         
-                        % === MONTE CARLO METHOD ===
+                        % === JACCARD METHOD (MC with QMC support) ===
+                        if strcmp(method, 'jaccard_mc') || strcmp(method, 'both')
+                            sampling_methods = options.sampling_method;
+                            for sm_idx = 1:length(sampling_methods)
+                                samp_method = sampling_methods{sm_idx};
+                                try
+                                    % Create options struct for score_jaccard_mc
+                                    jac_mc_opts = struct();
+                                    jac_mc_opts.num_samples = options.mc_samples;
+                                    jac_mc_opts.sampling_method = samp_method;
+                                    jac_mc_opts.return_details = true;
+                                    jac_mc_opts.verbose = false;
+                                    
+                                    [jac_mc_score, jac_mc_details] = score_jaccard_mc(...
+                                        Z_propagated, scenario.target, jac_mc_opts);
+                                    
+                                    % Save with method-specific field names
+                                    field_suffix = ['_' samp_method];
+                                    state.inconsistency.(['jaccard_mc_index' field_suffix]) = jac_mc_score;
+                                    state.inconsistency.(['jaccard_mc_vol_AB_est' field_suffix]) = jac_mc_details.vol_AB_est;
+                                    state.inconsistency.(['jaccard_mc_vol_union_est' field_suffix]) = jac_mc_details.vol_union_est;
+                                    state.inconsistency.(['jaccard_mc_num_samples' field_suffix]) = jac_mc_details.N;
+                                catch ME
+                                    warning('Jaccard MC scoring failed for %s: %s', samp_method, ME.message);
+                                    state.inconsistency.(['jaccard_mc_index_' samp_method]) = NaN;
+                                end
+                            end
+                        end
+                        
+                        % === MONTE CARLO PROBABILITY METHOD (Multi-set with QMC) ===
                         if strcmp(method, 'mc_probability') || strcmp(method, 'both')
-                            try
-                                [mc_score, mc_details] = score_mc_probability(...
-                                    {Z_propagated, scenario.target}, ...
-                                    'num_samples', options.mc_samples, ...
-                                    'return_details', true, ...
-                                    'verbose', false);
-                                
-                                state.inconsistency.mc_probability = mc_score;
-                                state.inconsistency.mc_p_consistent = mc_details.p_consistent;
-                                state.inconsistency.mc_p_inconsistent = mc_details.p_inconsistent;
-                                state.inconsistency.mc_num_samples = mc_details.num_samples;
-                                state.inconsistency.mc_num_consistent = mc_details.num_consistent;
-                                state.inconsistency.mc_standard_error = mc_details.standard_error;
-                                state.inconsistency.mc_ci95_lower = mc_details.ci95_lower;
-                                state.inconsistency.mc_ci95_upper = mc_details.ci95_upper;
-                            catch ME
-                                warning('Monte Carlo scoring failed: %s', ME.message);
-                                state.inconsistency.mc_probability = NaN;
-                                state.inconsistency.mc_p_consistent = NaN;
-                                state.inconsistency.mc_p_inconsistent = NaN;
+                            sampling_methods = options.sampling_method;
+                            for sm_idx = 1:length(sampling_methods)
+                                samp_method = sampling_methods{sm_idx};
+                                try
+                                    % Create options struct for score_mc_probability
+                                    mc_opts = struct();
+                                    mc_opts.num_samples = options.mc_samples;
+                                    mc_opts.sampling_method = samp_method;
+                                    mc_opts.return_details = true;
+                                    mc_opts.verbose = false;
+                                    
+                                    [mc_score, mc_details] = score_mc_probability(...
+                                        {Z_propagated, scenario.target}, mc_opts);
+                                    
+                                    % Save with method-specific field names
+                                    field_suffix = ['_' samp_method];
+                                    state.inconsistency.(['mc_probability' field_suffix]) = mc_score;
+                                    state.inconsistency.(['mc_p_consistent' field_suffix]) = mc_details.p_consistent;
+                                    state.inconsistency.(['mc_p_inconsistent' field_suffix]) = mc_details.p_inconsistent;
+                                    state.inconsistency.(['mc_num_samples' field_suffix]) = mc_details.num_samples;
+                                    state.inconsistency.(['mc_num_consistent' field_suffix]) = mc_details.num_consistent;
+                                    state.inconsistency.(['mc_standard_error' field_suffix]) = mc_details.standard_error;
+                                    state.inconsistency.(['mc_ci95_lower' field_suffix]) = mc_details.ci95_lower;
+                                    state.inconsistency.(['mc_ci95_upper' field_suffix]) = mc_details.ci95_upper;
+                                catch ME
+                                    warning('Monte Carlo scoring failed for %s: %s', samp_method, ME.message);
+                                    state.inconsistency.(['mc_probability_' samp_method]) = NaN;
+                                    state.inconsistency.(['mc_p_consistent_' samp_method]) = NaN;
+                                    state.inconsistency.(['mc_p_inconsistent_' samp_method]) = NaN;
+                                end
                             end
                         end
                         
@@ -555,7 +790,7 @@ classdef causal_experiment_engine_twostep
                             elseif strcmp(method, 'mc_probability')
                                 i_theta_method = 'mc';
                             else
-                                i_theta_method = 'jaccard';  % Default for 'both'
+                                i_theta_method = 'mc';  % Use MC for 'both' to match mc_probability values
                             end
                             
                             [I_theta, I_details] = global_inconsistency(all_models, ...
@@ -714,9 +949,22 @@ classdef causal_experiment_engine_twostep
                         scenario.source.EC);
                     
                 case 'shift'
-                    % Shift source center
-                    shift_amount = params.shift;
-                    new_center = scenario.source.c + shift_amount;
+                    % Shift source center (relative shift: center * (1 + delta))
+                    if isfield(params, 'center_delta')
+                        shift_fraction = params.center_delta;
+                    elseif isfield(params, 'shift')
+                        shift_fraction = params.shift;
+                    else
+                        shift_fraction = params.delta;
+                    end
+                    % Apply relative shift: new = old * (1 + shift_fraction)
+                    % This ensures consistent percentage shift across all dimensions and scenarios
+                    if isscalar(shift_fraction)
+                        shift_vec = shift_fraction * ones(size(scenario.source.c));
+                    else
+                        shift_vec = shift_fraction;
+                    end
+                    new_center = scenario.source.c .* (1 + shift_vec);
                     scenario_modified.source = conPolyZono(...
                         new_center, ...
                         scenario.source.G, ...

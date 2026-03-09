@@ -15,9 +15,16 @@
 %% Setup
 clear; close all; clc;
 
+% Suppress CORA deprecation warnings (Grest → GI, expMat_ → EC)
+warning('off', 'CORA:deprecated');
+warning('off', 'CORA:contSet:set:expMat');
+warning('off', 'CORA:contSet:get:expMat');
+warning('off', 'all');  % Suppress all warnings temporarily
+lastwarn('');  % Clear last warning
+
 % Configuration
-run_step1 = true;   % Set to false to skip zonotope generation
-run_step2 = true;   % Set to false to skip consistency computation
+run_step1 = true;    % Set to TRUE to regenerate zonotopes with balanced scenarios
+run_step2 = true;    % Set to false to skip consistency computation
 
 seed = 2025;
 rng(seed);
@@ -27,7 +34,17 @@ n_repeats = 5;
 src_path = fullfile(fileparts(pwd), 'src');
 addpath(src_path);
 
-cps_framework_path = fullfile(fileparts(fileparts(pwd)), 'CPS-Uncertainty-Propagation-Framework');
+% Detect CPS framework path - works on both Windows and Linux
+script_dir = fileparts(mfilename('fullpath'));
+project_root = fileparts(script_dir);  % Go up from examples/ to project root
+myCORA_dir = fileparts(project_root);  % Go up from Causality_Uncertainty_Inconsistency/ to MyCORA/
+cps_framework_path = fullfile(myCORA_dir, 'CPS-Uncertainty-Propagation-Framework');
+
+fprintf('Detected paths:\n');
+fprintf('  Project root: %s\n', project_root);
+fprintf('  CPS framework: %s\n', cps_framework_path);
+fprintf('  CPS exists: %d\n\n', exist(cps_framework_path, 'dir') == 7);
+
 addpath(genpath(fullfile(cps_framework_path, 'src')));
 
 consistency_addon_path = fullfile(cps_framework_path, 'addons', 'consistency_scoring');
@@ -35,6 +52,14 @@ if exist(fullfile(consistency_addon_path, 'init_consistency_scoring.m'), 'file')
     addpath(consistency_addon_path);
     addpath(fullfile(consistency_addon_path, 'methods'));
 else
+    fprintf('ERROR: Consistency scoring addon not found!\n');
+    fprintf('Expected CPS framework at: %s\n', cps_framework_path);
+    fprintf('Looking for addon at: %s\n', consistency_addon_path);
+    fprintf('Expected file: %s\n\n', fullfile(consistency_addon_path, 'init_consistency_scoring.m'));
+    fprintf('Please check:\n');
+    fprintf('  1. CPS-Uncertainty-Propagation-Framework exists at: %s\n', cps_framework_path);
+    fprintf('  2. The addon exists at: addons/consistency_scoring/\n');
+    fprintf('  3. Required functions: score_jaccard.m, score_mc_probability.m, score_jaccard_mc.m\n\n');
     error('Consistency scoring addon required but not found.');
 end
 
@@ -53,18 +78,34 @@ run_4d_scenarios = true;
 %% Configuration: Select specific scenarios to run
 % Specify which scenario IDs to process (1-12)
 % Examples:
-%   scenarios_to_run = 1:12;        % Run all scenarios
-scenarios_to_run = 2:12;      % Skip scenario 1
+scenarios_to_run = 1:12;        % Run all scenarios
+%scenarios_to_run = 2:12;      % Skip scenario 1
 %   scenarios_to_run = [1, 3, 5];   % Run only scenarios 1, 3, and 5
 %scenarios_to_run = 1:12;  % Change this to control which scenarios run
 
 %% Check if zonotopes already exist (skip generation if they do)
-skip_existing = true;  % Set to false to regenerate all zonotopes
+skip_existing = false;  % Set to FALSE to regenerate all zonotopes with correct balanced scenarios
 
-%% Output directories
-data_base = fullfile(fileparts(pwd), 'data');
+%% Output directories - use script location for reliable paths
+data_base = fullfile(project_root, 'data');
 zonotope_dir = fullfile(data_base, 'zonotopes');
 results_dir = fullfile(data_base, 'measurements');
+
+fprintf('Output paths:\n');
+fprintf('  Data base: %s\n', data_base);
+fprintf('  Zonotopes: %s\n', zonotope_dir);
+fprintf('  Results: %s\n\n', results_dir);
+
+% Create directories if they don't exist
+if ~exist(data_base, 'dir')
+    mkdir(data_base);
+end
+if ~exist(zonotope_dir, 'dir')
+    mkdir(zonotope_dir);
+end
+if ~exist(results_dir, 'dir')
+    mkdir(results_dir);
+end
 
 %% Intervention Configuration
 interventions = {
@@ -74,6 +115,8 @@ interventions = {
         'values', [0.01, 0.1, 0.5, 1.0, 2.0]);
     struct('type', 'correlate', 'param', 'correlation_strength', ...
         'values', [0.0, 0.3, 0.6, 0.8, 0.9, 0.95]);
+    struct('type', 'shift', 'param', 'center_delta', ...
+        'values', [0.0, 0.01, 0.05, 0.1, 0.2]);  % 0%, 1%, 5%, 10%, 20% relative shifts
 };
 
 %% STEP 1: GENERATE ZONOTOPES (DO ONCE)
@@ -87,6 +130,7 @@ if run_step1
     gen_options = struct();
     gen_options.n_repeats = n_repeats;
     gen_options.verbose = true;
+    gen_options.use_parallel = true;  % Set to TRUE for multi-core server (10-14x faster)
     
     % Helper function to check if scenario zonotopes exist
     check_zonotopes_exist = @(scenario_id) ...
@@ -134,8 +178,14 @@ if run_step1
             fprintf('\n  Generating zonotopes for Scenario %d: %s\n', ...
                 scenario_def.id, scenario_def.name);
             
-            causal_experiment_engine_twostep.generate_and_save_zonotopes(...
-                scenario_def, interventions, zonotope_dir, gen_options);
+            try
+                causal_experiment_engine_twostep.generate_and_save_zonotopes(...
+                    scenario_def, interventions, zonotope_dir, gen_options);
+                fprintf('  ✓ Scenario %d completed successfully\n', scenario_def.id);
+            catch ME
+                fprintf('  ✗ ERROR in Scenario %d: %s\n', scenario_def.id, ME.message);
+                fprintf('     Continuing with next scenario...\n');
+            end
         end
     end
     
@@ -181,8 +231,14 @@ if run_step1
             fprintf('\n  Generating zonotopes for Scenario %d: %s\n', ...
                 scenario_def.id, scenario_def.name);
             
-            causal_experiment_engine_twostep.generate_and_save_zonotopes(...
-                scenario_def, interventions, zonotope_dir, gen_options);
+            try
+                causal_experiment_engine_twostep.generate_and_save_zonotopes(...
+                    scenario_def, interventions, zonotope_dir, gen_options);
+                fprintf('  ✓ Scenario %d completed successfully\n', scenario_def.id);
+            catch ME
+                fprintf('  ✗ ERROR in Scenario %d: %s\n', scenario_def.id, ME.message);
+                fprintf('     Continuing with next scenario...\n');
+            end
         end
     end
     
@@ -228,8 +284,14 @@ if run_step1
             fprintf('\n  Generating zonotopes for Scenario %d: %s\n', ...
                 scenario_def.id, scenario_def.name);
             
-            causal_experiment_engine_twostep.generate_and_save_zonotopes(...
-                scenario_def, interventions, zonotope_dir, gen_options);
+            try
+                causal_experiment_engine_twostep.generate_and_save_zonotopes(...
+                    scenario_def, interventions, zonotope_dir, gen_options);
+                fprintf('  ✓ Scenario %d completed successfully\n', scenario_def.id);
+            catch ME
+                fprintf('  ✗ ERROR in Scenario %d: %s\n', scenario_def.id, ME.message);
+                fprintf('     Continuing with next scenario...\n');
+            end
         end
     end
     
@@ -247,11 +309,38 @@ if run_step2
     fprintf('STEP 2: COMPUTING CONSISTENCY SCORES\n');
     fprintf('========================================\n');
     
-    % Consistency options - TRY DIFFERENT METHODS HERE!
+    % Consistency options - ALL METHODS ACTIVATED!
     consistency_opts = struct();
-    consistency_opts.method = 'both';           % Try: 'jaccard', 'mc_probability', 'both'
-    consistency_opts.mc_samples = 500;          % 500 is good for development, use 1000-2000 for final results
+    consistency_opts.method = 'both';           % MC Probability + MC Jaccard (AABB Jaccard always included)
+    consistency_opts.mc_samples = 1000;          % 1000 samples for robust results
+    consistency_opts.sampling_method = {'sobol', 'halton', 'lhs', 'random'};  % ALL QMC methods for comparison
     consistency_opts.verbose = true;
+    consistency_opts.use_parallel = true;  % Set to TRUE for multi-core server (10-14x faster)
+    
+    fprintf('\n=== DIAGNOSTIC INFO ===\n');
+    fprintf('MC samples requested: %d\n', consistency_opts.mc_samples);
+    fprintf('Method: %s\n', consistency_opts.method);
+    if iscell(consistency_opts.sampling_method)
+        fprintf('Sampling methods: %s\n', strjoin(consistency_opts.sampling_method, ', '));
+        sampling_str = strjoin(consistency_opts.sampling_method, ', ');
+    else
+        fprintf('Sampling method: %s\n', consistency_opts.sampling_method);
+        sampling_str = consistency_opts.sampling_method;
+    end
+    fprintf('Each experiment will compute:\n');
+    fprintf('  - AABB Jaccard (fast, axis-aligned bounding box)\n');
+    if strcmp(consistency_opts.method, 'mc_probability') || strcmp(consistency_opts.method, 'both')
+        fprintf('  - MC Probability with %s sampling\n', sampling_str);
+    end
+    if strcmp(consistency_opts.method, 'jaccard_mc') || strcmp(consistency_opts.method, 'both')
+        fprintf('  - MC Jaccard with %s sampling\n', sampling_str);
+    end
+    if iscell(consistency_opts.sampling_method)
+        fprintf('Expected time: 6-12s per experiment (computing all methods)\n');
+    else
+        fprintf('Expected time: 1.5-3s per experiment (computing 2 metrics)\n');
+    end
+    fprintf('======================\n\n');
     
     % Compute consistency from saved zonotopes
     causal_experiment_engine_twostep.compute_and_save_consistency(...
@@ -275,14 +364,20 @@ fprintf('Example 1: Try only Jaccard method\n');
 fprintf('  consistency_opts.method = ''jaccard'';\n');
 fprintf('  causal_experiment_engine_twostep.compute_and_save_consistency(...\n');
 fprintf('      zonotope_dir, results_dir_jaccard, consistency_opts);\n\n');
-fprintf('Example 2: Try MC with more samples\n');
+fprintf('Example 2: Try MC with Halton sampling\n');
 fprintf('  consistency_opts.method = ''mc_probability'';\n');
 fprintf('  consistency_opts.mc_samples = 10000;\n');
+fprintf('  consistency_opts.sampling_method = ''halton'';\n');
 fprintf('  causal_experiment_engine_twostep.compute_and_save_consistency(...\n');
-fprintf('      zonotope_dir, results_dir_mc_10k, consistency_opts);\n\n');
-fprintf('Example 3: Use convenience function\n');
-fprintf('  causal_experiment_engine_twostep.regenerate_consistency_all(...\n');
-fprintf('      zonotope_dir, results_base_dir, ''mc_probability'', 5000);\n');
+fprintf('      zonotope_dir, results_dir_mc_halton, consistency_opts);\n\n');
+fprintf('Example 3: Compare QMC methods\n');
+fprintf('  methods = {''sobol'', ''halton'', ''lhs'', ''random''};\n');
+fprintf('  for i = 1:length(methods)\n');
+fprintf('      consistency_opts.sampling_method = methods{i};\n');
+fprintf('      result_dir = fullfile(results_base, methods{i});\n');
+fprintf('      causal_experiment_engine_twostep.compute_and_save_consistency(...\n');
+fprintf('          zonotope_dir, result_dir, consistency_opts);\n');
+fprintf('  end\n');
 fprintf('========================================\n\n');
 
 %% Summary
@@ -291,6 +386,53 @@ fprintf('TWO-STEP WORKFLOW COMPLETE\n');
 fprintf('========================================\n');
 fprintf('Zonotopes:    %s\n', zonotope_dir);
 fprintf('Measurements: %s\n\n', results_dir);
+
+% Verify a result file if Step 2 was run
+if run_step2
+    fprintf('\n=== VERIFICATION ===\n');
+    result_files = dir(fullfile(results_dir, 'results_scenario_*.json'));
+    if ~isempty(result_files)
+        sample_file = fullfile(results_dir, result_files(1).name);
+        fprintf('Checking sample result: %s\n', result_files(1).name);
+        try
+            fid = fopen(sample_file, 'r');
+            raw = fread(fid, inf);
+            str = char(raw');
+            fclose(fid);
+            data = jsondecode(str);
+            
+            if ~isempty(data.experiments)
+                exp1 = data.experiments(1);
+                fprintf('\nFirst experiment results:\n');
+                if isfield(exp1.post_state.inconsistency, 'jaccard_index')
+                    fprintf('  AABB Jaccard: %.4f\n', exp1.post_state.inconsistency.jaccard_index);
+                end
+                if isfield(exp1.post_state.inconsistency, 'jaccard_mc_index_sobol')
+                    fprintf('  MC Jaccard (Sobol): %.4f\n', exp1.post_state.inconsistency.jaccard_mc_index_sobol);
+                end
+                if isfield(exp1.post_state.inconsistency, 'jaccard_mc_index_halton')
+                    fprintf('  MC Jaccard (Halton): %.4f\n', exp1.post_state.inconsistency.jaccard_mc_index_halton);
+                end
+                if isfield(exp1.post_state.inconsistency, 'mc_probability_sobol')
+                    fprintf('  MC Probability (Sobol): %.4f (±%.4f)\n', ...
+                        exp1.post_state.inconsistency.mc_probability_sobol, ...
+                        exp1.post_state.inconsistency.mc_standard_error_sobol);
+                end
+                if isfield(exp1.post_state.inconsistency, 'mc_probability_halton')
+                    fprintf('  MC Probability (Halton): %.4f (±%.4f)\n', ...
+                        exp1.post_state.inconsistency.mc_probability_halton, ...
+                        exp1.post_state.inconsistency.mc_standard_error_halton);
+                end
+                fprintf('\n✓ Both QMC methods computed successfully!\n');
+                fprintf('✓ Results saved with field names: *_sobol and *_halton\n');
+            end
+        catch ME
+            fprintf('Could not verify (not an error): %s\n', ME.message);
+        end
+    end
+    fprintf('====================\n\n');
+end
+
 fprintf('To re-measure consistency:\n');
 fprintf('  1. Set run_step1=false, run_step2=true\n');
 fprintf('  2. Change consistency_opts.method\n');

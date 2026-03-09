@@ -63,47 +63,87 @@ def load_data_for_comparison(data_dir: str) -> pd.DataFrame:
         name = json_file.stem
         parts = name.split('_')
         
-        # Extract dimension (2d, 3d, 4d) and scenario_id
-        dim = None
+        # Extract scenario_id from filename
         scenario_id = None
         for i, p in enumerate(parts):
-            if p in ['2d', '3d', '4d']:
-                dim = int(p[0])
             if p == 'scenario' and i + 1 < len(parts):
                 scenario_id = int(parts[i + 1])
         
         with open(json_file, 'r') as f:
             data = json.load(f)
         
-        experiments = data.get('experiments', data)
+        experiments = data.get('experiments', data if isinstance(data, list) else [])
         
         for exp in experiments:
+            # Extract dimension from data structure (length of center array)
+            dim = None
+            pre_state = exp.get('pre_state', {})
+            uncertainty = pre_state.get('uncertainty', {})
+            source_center = uncertainty.get('source_center', [])
+            if source_center:
+                dim = len(source_center)
+            # Extract intervention info from MATLAB export format
+            intervention = exp.get('intervention_type', 'unknown')
+            param_value = exp.get('intervention_value', exp.get('param_value', np.nan))
+            
             record = {
                 'dimension': dim,
                 'scenario_id': scenario_id,
-                'intervention': exp.get('intervention', 'unknown'),
-                'param_value': exp.get('param_value', np.nan),
+                'intervention': intervention,
+                'param_value': param_value,
             }
             
-            post_inc = exp.get('post_inconsistency', {})
-            record['I_theta'] = post_inc.get('I_theta', np.nan)
+            # Extract post-intervention inconsistency
+            post_state = exp.get('post_state', {})
+            post_inc = exp.get('post_inconsistency', post_state.get('inconsistency', {}))
+            
+            # Compute I_theta from MC probability if not directly available
+            I_theta_post = post_inc.get('I_theta')
+            if I_theta_post is None or (isinstance(I_theta_post, float) and np.isnan(I_theta_post)):
+                mc_p_consistent = post_inc.get('mc_p_consistent_sobol', post_inc.get('mc_probability_sobol'))
+                if mc_p_consistent is not None:
+                    I_theta_post = 1.0 - mc_p_consistent
+            
+            record['I_theta'] = I_theta_post
             record['jaccard_index'] = post_inc.get('jaccard_index', np.nan)
             
-            pre_inc = exp.get('pre_inconsistency', {})
-            record['I_theta_pre'] = pre_inc.get('I_theta', np.nan)
+            # Extract pre-intervention inconsistency
+            pre_state = exp.get('pre_state', {})
+            pre_inc = exp.get('pre_inconsistency', pre_state.get('inconsistency', {}))
+            
+            # Compute pre I_theta
+            I_theta_pre = pre_inc.get('I_theta')
+            if I_theta_pre is None or (isinstance(I_theta_pre, float) and np.isnan(I_theta_pre)):
+                mc_p_consistent_pre = pre_inc.get('mc_p_consistent_sobol', pre_inc.get('mc_probability_sobol'))
+                if mc_p_consistent_pre is not None:
+                    I_theta_pre = 1.0 - mc_p_consistent_pre
+            
+            record['I_theta_pre'] = I_theta_pre
             
             if not np.isnan(record['I_theta']) and not np.isnan(record['I_theta_pre']):
                 record['delta_I_theta'] = record['I_theta'] - record['I_theta_pre']
             else:
                 record['delta_I_theta'] = np.nan
             
+            # Classify initial consistency state (threshold at 0.1)
+            if not np.isnan(record['I_theta_pre']):
+                record['initially_consistent'] = record['I_theta_pre'] < 0.1
+            else:
+                record['initially_consistent'] = None
+            
             all_records.append(record)
     
     return pd.DataFrame(all_records)
 
 
-def plot_intervention_comparison(df: pd.DataFrame, output_path: Path):
-    """Create intervention comparison plot (widen vs shrink vs correlate)."""
+def plot_intervention_comparison(df: pd.DataFrame, output_path: Path, subset_name: str = 'all'):
+    """Create intervention comparison plot (widen vs shrink vs correlate).
+    
+    Args:
+        df: DataFrame with experimental results
+        output_path: Directory to save plots
+        subset_name: 'all', 'consistent', or 'inconsistent' for plot subset
+    """
     
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
@@ -128,7 +168,8 @@ def plot_intervention_comparison(df: pd.DataFrame, output_path: Path):
     
     ax1.set_xlabel('Parameter Value', fontsize=12)
     ax1.set_ylabel('Mean I(θ)', fontsize=12)
-    ax1.set_title('Global Inconsistency by Intervention Type', fontsize=14)
+    title_suffix = '' if subset_name == 'all' else f' ({subset_name.capitalize()} Start)'
+    ax1.set_title(f'Global Inconsistency by Intervention Type{title_suffix}', fontsize=14)
     ax1.legend(loc='best')
     ax1.set_ylim(0, 1.05)
     ax1.set_xscale('symlog', linthresh=0.1)
@@ -147,7 +188,7 @@ def plot_intervention_comparison(df: pd.DataFrame, output_path: Path):
             labels.append(intervention.capitalize())
             box_colors.append(colors.get(intervention, '#95a5a6'))
     
-    bp = ax2.boxplot(delta_data, labels=labels, patch_artist=True)
+    bp = ax2.boxplot(delta_data, tick_labels=labels, patch_artist=True)
     for patch, color in zip(bp['boxes'], box_colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
@@ -155,19 +196,27 @@ def plot_intervention_comparison(df: pd.DataFrame, output_path: Path):
     ax2.axhline(y=0, color='black', linestyle='--', alpha=0.5)
     ax2.set_xlabel('Intervention Type', fontsize=12)
     ax2.set_ylabel('ΔI(θ) = I(θ)_post - I(θ)_pre', fontsize=12)
-    ax2.set_title('Change in Inconsistency by Intervention', fontsize=14)
+    title_suffix = '' if subset_name == 'all' else f' ({subset_name.capitalize()} Start)'
+    ax2.set_title(f'Change in Inconsistency by Intervention{title_suffix}', fontsize=14)
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
-    output_file = output_path / 'intervention_comparison.png'
+    suffix = '' if subset_name == 'all' else f'_{subset_name}'
+    output_file = output_path / f'intervention_comparison{suffix}.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"  ✓ Saved: {output_file.name}")
     plt.close()
 
 
-def plot_dimension_comparison(df: pd.DataFrame, output_path: Path):
-    """Create dimension comparison plot (2D vs 3D vs 4D)."""
+def plot_dimension_comparison(df: pd.DataFrame, output_path: Path, subset_name: str = 'all'):
+    """Create dimension comparison plot (2D vs 3D vs 4D).
+    
+    Args:
+        df: DataFrame with experimental results
+        output_path: Directory to save plots
+        subset_name: 'all', 'consistent', or 'inconsistent' for plot subset
+    """
     
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
@@ -195,7 +244,8 @@ def plot_dimension_comparison(df: pd.DataFrame, output_path: Path):
     
     ax1.set_xlabel('Intervention Type', fontsize=12)
     ax1.set_ylabel('Mean I(θ)', fontsize=12)
-    ax1.set_title('I(θ) by Dimension and Intervention', fontsize=14)
+    title_suffix = '' if subset_name == 'all' else f' ({subset_name.capitalize()} Start)'
+    ax1.set_title(f'I(θ) by Dimension and Intervention{title_suffix}', fontsize=14)
     ax1.set_xticks(x)
     ax1.set_xticklabels([i.capitalize() for i in interventions])
     ax1.legend(title='Dimension')
@@ -222,7 +272,8 @@ def plot_dimension_comparison(df: pd.DataFrame, output_path: Path):
     
     ax2.set_xlabel('Dimension', fontsize=12)
     ax2.set_ylabel('Mean I(θ)', fontsize=12)
-    ax2.set_title('I(θ) Trend Across Dimensions', fontsize=14)
+    title_suffix = '' if subset_name == 'all' else f' ({subset_name.capitalize()} Start)'
+    ax2.set_title(f'I(θ) Trend Across Dimensions{title_suffix}', fontsize=14)
     ax2.set_xticks(dimensions)
     ax2.set_xticklabels([f'{int(d)}D' for d in dimensions])
     ax2.legend(loc='best')
@@ -231,7 +282,8 @@ def plot_dimension_comparison(df: pd.DataFrame, output_path: Path):
     
     plt.tight_layout()
     
-    output_file = output_path / 'dimension_comparison.png'
+    suffix = '' if subset_name == 'all' else f'_{subset_name}'
+    output_file = output_path / f'dimension_comparison{suffix}.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"  ✓ Saved: {output_file.name}")
     plt.close()
@@ -246,14 +298,36 @@ def run_comparison_plots(data_dir: str, output_dir: Path):
     dims = sorted(df['dimension'].dropna().unique())
     interventions = sorted(df['intervention'].unique())
     
+    # Count initially consistent vs inconsistent scenarios
+    df_clean = df[df['initially_consistent'].notna()]
+    n_consistent = df_clean['initially_consistent'].sum()
+    n_inconsistent = (~df_clean['initially_consistent']).sum()
+    
     print(f"  Loaded {len(df)} experiments")
     print(f"  Dimensions: {[f'{int(d)}D' for d in dims]}")
     print(f"  Interventions: {interventions}")
+    print(f"  Initially consistent: {n_consistent} experiments")
+    print(f"  Initially inconsistent: {n_inconsistent} experiments")
     print()
     
-    print("Generating plots...")
-    plot_intervention_comparison(df, output_dir)
-    plot_dimension_comparison(df, output_dir)
+    # Generate plots for all scenarios
+    print("Generating plots for all scenarios...")
+    plot_intervention_comparison(df, output_dir, subset_name='all')
+    plot_dimension_comparison(df, output_dir, subset_name='all')
+    
+    # Generate plots for initially consistent scenarios
+    if n_consistent > 0:
+        print("\nGenerating plots for initially consistent scenarios...")
+        df_consistent = df[df['initially_consistent'] == True]
+        plot_intervention_comparison(df_consistent, output_dir, subset_name='consistent')
+        plot_dimension_comparison(df_consistent, output_dir, subset_name='consistent')
+    
+    # Generate plots for initially inconsistent scenarios
+    if n_inconsistent > 0:
+        print("\nGenerating plots for initially inconsistent scenarios...")
+        df_inconsistent = df[df['initially_consistent'] == False]
+        plot_intervention_comparison(df_inconsistent, output_dir, subset_name='inconsistent')
+        plot_dimension_comparison(df_inconsistent, output_dir, subset_name='inconsistent')
 
 
 def run_complete_analysis(data_dir: str,

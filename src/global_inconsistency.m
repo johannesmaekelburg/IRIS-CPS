@@ -188,11 +188,14 @@ switch lower(method)
             fprintf('  Computing P(consistent) via Monte Carlo...\n');
         end
         
-        [p_consistent, mc_details] = score_mc_probability(model_list, ...
-            'num_samples', n_samples, ...
-            'seed', seed, ...
-            'verbose', verbose, ...
-            'return_details', true);
+        % Create options struct for score_mc_probability
+        mc_opts = struct();
+        mc_opts.num_samples = n_samples;
+        mc_opts.seed = seed;
+        mc_opts.verbose = verbose;
+        mc_opts.return_details = true;
+        
+        [p_consistent, mc_details] = score_mc_probability(model_list, mc_opts);
         
     case 'jaccard'
         % Jaccard-based method: average pairwise consistency
@@ -296,7 +299,12 @@ if nargout > 1 || return_details
     details.ci95_upper = 1.0 - mc_details.ci95_lower;
     
     % Additional info
-    details.intersection_empty = mc_details.intersection_empty;
+    if isfield(mc_details, 'intersection_empty')
+        details.intersection_empty = mc_details.intersection_empty;
+    else
+        % Fallback: infer from p_consistent
+        details.intersection_empty = (p_consistent == 0);
+    end
     details.method = method;
     details.computation_time = toc;
     

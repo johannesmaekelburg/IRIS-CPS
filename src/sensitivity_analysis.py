@@ -29,6 +29,7 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from collections import defaultdict
+from datetime import datetime
 import pickle
 
 import numpy as np
@@ -121,26 +122,35 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
             continue
         
         for record in records:
-            # MATLAB export uses flattened structure
-            # Check for I_theta in post_inconsistency (flattened) or nested post_state
+            # MATLAB export uses nested structure with post_state
             I_theta = None
             theta_params = {}
             
             # Option 1: Flattened MATLAB export (post_inconsistency.I_theta)
             if 'post_inconsistency' in record and isinstance(record['post_inconsistency'], dict):
                 post_inc = record['post_inconsistency']
-                if 'I_theta' in post_inc:
-                    I_theta = post_inc['I_theta']
-                    I_theta_se = post_inc.get('I_theta_se', np.nan)
+                I_theta = post_inc.get('I_theta')
+                
+                # Compute from MC probability if I_theta is null
+                if I_theta is None or (isinstance(I_theta, float) and np.isnan(I_theta)):
+                    mc_p_consistent = post_inc.get('mc_p_consistent_sobol', post_inc.get('mc_probability'))
+                    if mc_p_consistent is not None:
+                        I_theta = 1.0 - mc_p_consistent
+                
+                if I_theta is not None:
+                    I_theta_se = post_inc.get('mc_standard_error_sobol', post_inc.get('I_theta_se', np.nan))
                     I_theta_ci95_lower = post_inc.get('I_theta_ci95_lower', np.nan)
                     I_theta_ci95_upper = post_inc.get('I_theta_ci95_upper', np.nan)
                     
                     # Extract theta from record metadata
                     if 'param_value' in record:
-                        # Use 'param_value' as the parameter name for all interventions
-                        theta_params['param_value'] = record['param_value']
+                        # Use 'intervention_value' as the parameter name for all interventions
+                        theta_params['intervention_value'] = record['param_value']
                         # Also store intervention type for filtering
                         theta_params['intervention'] = record.get('intervention', 'unknown')
+                    elif 'intervention_value' in record:
+                        theta_params['intervention_value'] = record['intervention_value']
+                        theta_params['intervention'] = record.get('intervention_type', 'unknown')
             
             # Option 2: Nested structure (post_state.inconsistency.I_theta)
             elif 'post_state' in record:
@@ -149,21 +159,24 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                     continue
                 
                 inconsistency = post_state['inconsistency']
-                if 'I_theta' not in inconsistency:
+                I_theta = inconsistency.get('I_theta')
+                
+                # Compute from MC probability if I_theta is null
+                if I_theta is None or (isinstance(I_theta, float) and np.isnan(I_theta)):
+                    mc_p_consistent = inconsistency.get('mc_p_consistent_sobol', inconsistency.get('mc_probability_sobol'))
+                    if mc_p_consistent is not None:
+                        I_theta = 1.0 - mc_p_consistent
+                
+                if I_theta is None:
                     continue
                 
-                I_theta = inconsistency['I_theta']
-                I_theta_se = inconsistency.get('I_theta_se', np.nan)
+                I_theta_se = inconsistency.get('mc_standard_error_sobol', inconsistency.get('I_theta_se', np.nan))
                 I_theta_ci95_lower = inconsistency.get('I_theta_ci95_lower', np.nan)
                 I_theta_ci95_upper = inconsistency.get('I_theta_ci95_upper', np.nan)
                 
-                # Extract theta parameters
-                if 'theta_params' in inconsistency:
-                    theta_params = inconsistency['theta_params']
-                elif 'intervention' in record:
-                    intervention = record['intervention']
-                    if 'params' in intervention:
-                        theta_params = intervention['params']
+                # Extract intervention info
+                theta_params['intervention_value'] = record.get('intervention_value', record.get('param_value', np.nan))
+                theta_params['intervention'] = record.get('intervention_type', record.get('intervention', 'unknown'))
             
             if I_theta is None:
                 continue
@@ -174,13 +187,13 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                 'I_theta_se': I_theta_se,
                 'I_theta_ci95_lower': I_theta_ci95_lower,
                 'I_theta_ci95_upper': I_theta_ci95_upper,
-                'intervention_type': record.get('intervention', 'unknown'),
+                'intervention_type': record.get('intervention_type', record.get('intervention', 'unknown')),
                 **theta_params
             }
             
             # Add pre_uncertainty metrics (for Sobol analysis)
-            if 'pre_uncertainty' in record and isinstance(record['pre_uncertainty'], dict):
-                pre_unc = record['pre_uncertainty']
+            pre_unc = record.get('pre_uncertainty', record.get('pre_state', {}).get('uncertainty', {}))
+            if pre_unc:
                 flat_record['pre_source_volume'] = pre_unc.get('source_volume', np.nan)
                 flat_record['pre_source_radius'] = pre_unc.get('source_radius', np.nan)
                 flat_record['pre_source_n_generators'] = pre_unc.get('source_n_generators', np.nan)
@@ -189,19 +202,28 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                 flat_record['pre_target_radius'] = pre_unc.get('target_radius', np.nan)
                 flat_record['pre_target_n_generators'] = pre_unc.get('target_n_generators', np.nan)
             
-            # Add optional metrics
+            # Add optional metrics - compute I_theta_pre if needed
+            pre_inc = None
             if 'pre_inconsistency' in record and isinstance(record['pre_inconsistency'], dict):
-                flat_record['I_theta_pre'] = record['pre_inconsistency'].get('I_theta', np.nan)
+                pre_inc = record['pre_inconsistency']
             elif 'pre_state' in record:
                 pre_inc = record['pre_state'].get('inconsistency', {})
-                flat_record['I_theta_pre'] = pre_inc.get('I_theta', np.nan)
             
-            if 'causal_effect' in record:
-                if isinstance(record['causal_effect'], dict):
-                    flat_record['delta_I_theta'] = record['causal_effect'].get('delta_I_theta', np.nan)
-                else:
-                    delta = record['causal_effect'].get('inconsistency', {})
-                    flat_record['delta_I_theta'] = delta.get('delta_I_theta', np.nan)
+            if pre_inc:
+                I_theta_pre = pre_inc.get('I_theta')
+                if I_theta_pre is None or (isinstance(I_theta_pre, float) and np.isnan(I_theta_pre)):
+                    mc_p_consistent_pre = pre_inc.get('mc_p_consistent_sobol', pre_inc.get('mc_probability_sobol'))
+                    if mc_p_consistent_pre is not None:
+                        I_theta_pre = 1.0 - mc_p_consistent_pre
+                flat_record['I_theta_pre'] = I_theta_pre
+            
+            # Compute delta_I_theta if available
+            causal_eff = record.get('causal_effect', record.get('causal_effects', {}))
+            if isinstance(causal_eff, dict):
+                delta_I = causal_eff.get('delta_I_theta')
+                if delta_I is None and 'I_theta_pre' in flat_record and flat_record['I_theta_pre'] is not None:
+                    delta_I = flat_record['I_theta'] - flat_record['I_theta_pre']
+                flat_record['delta_I_theta'] = delta_I if delta_I is not None else np.nan
             
             all_records.append(flat_record)
     
@@ -233,8 +255,8 @@ def extract_theta_and_I(df: pd.DataFrame,
                        'intervention_type', 'intervention', 'I_theta_pre', 'delta_I_theta',
                        'scenario_id', 'repeat_idx', 'run_id', 'mc_num_samples', 'mc_num_consistent']
         # Include numeric columns that represent uncertainty parameters
-        # Prioritize: param_value, pre_source_volume, pre_source_radius, pre_source_correlation
-        priority_cols = ['param_value', 'pre_source_volume', 'pre_source_radius', 
+        # Prioritize: intervention_value, pre_source_volume, pre_source_radius, pre_source_correlation
+        priority_cols = ['intervention_value', 'pre_source_volume', 'pre_source_radius', 
                         'pre_source_correlation', 'pre_source_n_generators',
                         'pre_target_volume', 'pre_target_radius']
         
@@ -725,7 +747,7 @@ def plot_causal_effects(results_df: pd.DataFrame,
     ax.set_xticklabels(labels, rotation=45, ha='right')
     ax.set_xlabel('Intervention: a → b')
     ax.set_ylabel('Causal Effect τ(a,b)')
-    ax.set_title(f'Total Causal Effects on I(θ)\n{results_df["parameter"].iloc[0]}')
+    ax.set_title(f'Total Causal Effects on I(θ)\n{format_parameter_name(results_df["parameter"].iloc[0])}')
     ax.grid(axis='y', alpha=0.3)
     
     plt.tight_layout()
@@ -744,7 +766,7 @@ def plot_local_sensitivity(sens_dict: Dict[str, Any],
     
     # I(θ) vs θ
     ax1.plot(sens_df['theta'], sens_df['I_theta'], 'o-', color='steelblue', label='I(θ)')
-    ax1.set_xlabel(f'{sens_dict["parameter"]}')
+    ax1.set_xlabel(f'{format_parameter_name(sens_dict["parameter"])}')
     ax1.set_ylabel('I(θ)')
     ax1.set_title('Global Inconsistency I(θ)')
     ax1.grid(alpha=0.3)
@@ -753,7 +775,7 @@ def plot_local_sensitivity(sens_dict: Dict[str, Any],
     # ∂I/∂θ vs θ
     ax2.plot(sens_df['theta'], sens_df['dI_dtheta'], 's-', color='coral', label='∂I/∂θ')
     ax2.axhline(0, color='k', linestyle='--', linewidth=0.8)
-    ax2.set_xlabel(f'{sens_dict["parameter"]}')
+    ax2.set_xlabel(f'{format_parameter_name(sens_dict["parameter"])}')
     ax2.set_ylabel('∂I/∂θ')
     ax2.set_title(f'Local Sensitivity (method: {sens_dict["method"]})')
     ax2.grid(alpha=0.3)
@@ -782,7 +804,7 @@ def plot_robustness_margins(margins_dict: Dict[str, Any],
         ax.fill_betweenx([0, 1], 0, margins_dict['s_star'], 
                         alpha=0.2, color='green', label='Safe region')
     
-    ax.set_xlabel(f'{margins_dict["param_name"]}')
+    ax.set_xlabel(f'{format_parameter_name(margins_dict["param_name"])}')
     ax.set_ylabel('I(θ)')
     ax.set_title(f'Robustness Margin Analysis\nStatus: {margins_dict.get("status", "UNKNOWN")}\nMargin = {margins_dict["margin"]:.3f}')
     ax.set_ylim([0, 1])
@@ -796,6 +818,50 @@ def plot_robustness_margins(margins_dict: Dict[str, Any],
     plt.show()
 
 
+def format_parameter_name(param_name: str) -> str:
+    """Format parameter names for better readability in plots."""
+    # Define common replacements with updated naming conventions
+    name_map = {
+        # Intervention parameters
+        'param_value': 'Intervention Magnitude',
+        'intervention_value': 'Intervention Magnitude',
+        'scale_factor': 'Scale Factor',
+        'correlation_strength': 'Correlation Strength',
+        'center_delta': 'Center Shift',
+        
+        # Source uncertainty parameters
+        'pre_source_volume': 'Source Volume (Pre)',
+        'pre_source_radius': 'Source Radius (Pre)',
+        'pre_source_n_generators': 'Source Generators (Pre)',
+        'pre_source_correlation': 'Source Correlation (Pre)',
+        
+        # Target uncertainty parameters
+        'pre_target_volume': 'Target Volume (Pre)',
+        'pre_target_radius': 'Target Radius (Pre)',
+        'pre_target_n_generators': 'Target Generators (Pre)',
+        
+        # Consistency metrics (new naming)
+        'jaccard_C': 'Jaccard C',
+        'jaccard_Csym': 'Jaccard C (Symmetric)',
+        'jaccard_index': 'Jaccard Index',
+        'mc_probability_sobol': 'MC Probability (Sobol)',
+        'mc_probability_halton': 'MC Probability (Halton)',
+        'mc_probability_lhs': 'MC Probability (LHS)',
+        'mc_probability_random': 'MC Probability (Random)',
+        
+        # Other parameters
+        'uncertainty_scale': 'Uncertainty Scale',
+    }
+    
+    # Check if exact match exists
+    if param_name in name_map:
+        return name_map[param_name]
+    
+    # Otherwise, format by replacing underscores and capitalizing
+    formatted = param_name.replace('_', ' ').replace('pre ', '').title()
+    return formatted
+
+
 def plot_sobol_indices(sobol_dict: Dict[str, Any],
                       output_path: Optional[str] = None):
     """Plot Sobol indices"""
@@ -805,21 +871,26 @@ def plot_sobol_indices(sobol_dict: Dict[str, Any],
     S1_conf = [sobol_dict['first_order_conf'][p] for p in param_names]
     ST_conf = [sobol_dict['total_order_conf'][p] for p in param_names]
     
+    # Format parameter names for display
+    param_labels = [format_parameter_name(p) for p in param_names]
+    
     x = np.arange(len(param_names))
     width = 0.35
     
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # Adjust figure size based on number of parameters
+    fig_width = max(10, len(param_names) * 1.5)
+    fig, ax = plt.subplots(figsize=(fig_width, 6))
     
     ax.bar(x - width/2, S1, width, yerr=S1_conf, label='S₁ (First-order)', 
            alpha=0.8, capsize=5, color='steelblue')
     ax.bar(x + width/2, ST, width, yerr=ST_conf, label='Sᵀ (Total-effect)', 
            alpha=0.8, capsize=5, color='coral')
     
-    ax.set_xlabel('Parameter')
-    ax.set_ylabel('Sobol Index')
-    ax.set_title('Variance-based Sensitivity: Sobol Indices')
+    ax.set_xlabel('Parameter', fontsize=12)
+    ax.set_ylabel('Sobol Index', fontsize=12)
+    ax.set_title('Variance-based Sensitivity: Sobol Indices', fontsize=14, fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels(param_names, rotation=45, ha='right')
+    ax.set_xticklabels(param_labels, rotation=45, ha='right', fontsize=10)
     ax.legend()
     ax.grid(axis='y', alpha=0.3)
     ax.set_ylim([0, 1])
@@ -845,16 +916,22 @@ def run_full_sensitivity_analysis(data_dir: str,
     
     Args:
         data_dir: Directory with MATLAB JSON exports
-        output_dir: Directory for output figures and results
+        output_dir: Directory for output figures and results (timestamped subfolder will be created)
         param_name: Primary parameter to analyze ('auto' to auto-detect)
         threshold: Inconsistency threshold for robustness margins
         run_sobol: Whether to compute Sobol indices (requires SALib)
     """
-    output_path = Path(output_dir)
+    # Create timestamped output directory
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir_timestamped = Path(output_dir) / f"sensitivity_analysis_{timestamp}"
+    output_path = output_dir_timestamped
     output_path.mkdir(parents=True, exist_ok=True)
     
     print("="*80)
     print("SENSITIVITY ANALYSIS FOR GLOBAL INCONSISTENCY I(θ)")
+    print("="*80)
+    print(f"Output directory: {output_path}")
+    print(f"Timestamp: {timestamp}")
     print("="*80)
     
     # 1. Load data
@@ -863,7 +940,7 @@ def run_full_sensitivity_analysis(data_dir: str,
     # Auto-detect parameter name if needed
     if param_name == 'auto':
         # Look for common parameter names
-        candidate_params = ['param_value', 'scale_factor', 'uncertainty_scale', 'alpha', 'beta']
+        candidate_params = ['intervention_value', 'scale_factor', 'uncertainty_scale', 'alpha', 'beta']
         found_param = None
         for candidate in candidate_params:
             if candidate in df.columns and df[candidate].notna().sum() > 0:
@@ -1009,7 +1086,18 @@ def run_full_sensitivity_analysis(data_dir: str,
     
     print("\n" + "="*80)
     print("ANALYSIS COMPLETE")
-    print(f"Results saved to: {output_path}")
+    print("="*80)
+    print(f"\nAll results saved to:")
+    print(f"  {output_path.absolute()}")
+    print(f"\nGenerated files:")
+    print(f"  - causal_effects_{param_name}.png")
+    print(f"  - local_sensitivity_{param_name}.png")
+    print(f"  - robustness_margins_{param_name}.png")
+    if run_sobol and theta.shape[1] >= 2 and SALIB_AVAILABLE:
+        print(f"  - sobol_indices.png")
+        print(f"  - sobol_indices.pkl")
+    print(f"  - surrogate_model.pkl")
+    print(f"  - sensitivity_analysis_summary.json")
     print("="*80)
 
 
@@ -1025,7 +1113,7 @@ if __name__ == '__main__':
                        help='Directory containing MATLAB JSON exports')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Directory for output figures and results')
-    parser.add_argument('--param', type=str, default='param_value',
+    parser.add_argument('--param', type=str, default='intervention_value',
                        help='Primary parameter to analyze')
     parser.add_argument('--threshold', type=float, default=0.5,
                        help='Inconsistency threshold for robustness margins')

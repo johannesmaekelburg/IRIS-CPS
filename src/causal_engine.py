@@ -24,13 +24,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from scipy.optimize import linprog
@@ -433,25 +433,15 @@ def evaluate_samples(
     rng = np.random.default_rng(seed)
     seeds = rng.integers(0, 2**31, size=N_total)
 
-    t0 = time.time()
-    for i in range(N_total):
+    pbar = tqdm(range(N_total), desc="Saltelli samples", unit="eval",
+                disable=not verbose)
+    for i in pbar:
         theta = dict(zip(param_names, samples[i]))
         Z_intervened = apply_compound_intervention(scenario.source, theta)
         result = compute_I_theta(scenario, source_override=Z_intervened,
                                  n_samples=mc_samples, seed=int(seeds[i]))
         Y[i] = result["I_theta"]
-
-        if verbose and (i + 1) % max(1, N_total // 20) == 0:
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            eta = (N_total - i - 1) / rate
-            print(f"  [{i+1:>6d}/{N_total}]  I(θ)={Y[i]:.4f}  "
-                  f"({rate:.1f} eval/s, ETA {eta:.0f}s)")
-
-    elapsed = time.time() - t0
-    if verbose:
-        print(f"  Completed {N_total} evaluations in {elapsed:.1f}s "
-              f"({N_total/elapsed:.1f} eval/s)")
+        pbar.set_postfix({"I(θ)": f"{Y[i]:.4f}"}, refresh=False)
     return Y
 
 
@@ -701,6 +691,103 @@ def plot_sweeps(
 
 
 # ---------------------------------------------------------------------------
+# Convergence test
+# ---------------------------------------------------------------------------
+
+def run_convergence_test(
+    scenario: Scenario,
+    seed: int,
+    out_dir: Path,
+    mc_max: int = 5000,
+    n_reps: int = 30,
+    sobol_mc: int = 500,
+):
+    """MC sample-count and Saltelli-N convergence study."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*70}")
+    print("CONVERGENCE TEST")
+    print(f"{'='*70}")
+    print(f"Scenario: {scenario.name}  (dim={scenario.dim})")
+    print(f"{'='*70}\n")
+
+    # --- Part 1: MC convergence of I(θ) ---
+    mc_counts = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+    mc_counts = [c for c in mc_counts if c <= mc_max]
+
+    print(f"Part 1: MC convergence (n_samples up to {mc_max}, {n_reps} reps each)")
+    rng = np.random.default_rng(seed)
+
+    I_all: list[list[float]] = []
+    for n in tqdm(mc_counts, desc="MC counts"):
+        reps = []
+        for _ in range(n_reps):
+            s = int(rng.integers(0, 2**31))
+            result = compute_I_theta(scenario, n_samples=n, seed=s)
+            reps.append(result["I_theta"])
+        I_all.append(reps)
+        print(f"  n={n:>5d}: I(θ) = {np.mean(reps):.4f} ± {np.std(reps):.4f}")
+
+    mc_results = {
+        "n_samples": mc_counts,
+        "I_theta_mean": [float(np.mean(r)) for r in I_all],
+        "I_theta_std": [float(np.std(r)) for r in I_all],
+    }
+
+    # --- Part 2: Sobol convergence ---
+    sobol_conv = None
+    if SALIB_AVAILABLE:
+        N_values = [16, 32, 64, 128, 256, 512]
+        print(f"\nPart 2: Sobol convergence "
+              f"(Saltelli N in {N_values}, mc_samples={sobol_mc})")
+
+        sobol_conv = {
+            "N": N_values, "S1": {}, "ST": {}, "S1_conf": {}, "ST_conf": {},
+        }
+        for N in tqdm(N_values, desc="Saltelli N"):
+            sr = run_sobol_analysis(
+                scenario, N=N, mc_samples=sobol_mc, seed=seed, verbose=False)
+            for name in sr["first_order"]:
+                sobol_conv["S1"].setdefault(name, []).append(
+                    sr["first_order"][name])
+                sobol_conv["ST"].setdefault(name, []).append(
+                    sr["total_order"][name])
+                sobol_conv["S1_conf"].setdefault(name, []).append(
+                    sr["first_order_conf"][name])
+                sobol_conv["ST_conf"].setdefault(name, []).append(
+                    sr["total_order_conf"][name])
+            print(f"  N={N:>4d}: " + "  ".join(
+                f"S1({n})={sr['first_order'][n]:.3f}"
+                for n in sr["first_order"]))
+    else:
+        print("\nSALib not installed — skipping Sobol convergence.")
+
+    # --- Plots ---
+    from zonotope_plots import plot_mc_convergence, plot_sobol_convergence
+
+    plot_mc_convergence(
+        mc_results, scenario.name,
+        output_path=out_dir / "convergence_mc.png",
+    )
+    if sobol_conv is not None:
+        plot_sobol_convergence(
+            sobol_conv, scenario.name,
+            output_path=out_dir / "convergence_sobol.png",
+        )
+    plt.close("all")
+
+    # --- Export ---
+    all_conv = {"mc_convergence": mc_results}
+    if sobol_conv is not None:
+        all_conv["sobol_convergence"] = sobol_conv
+    export_results(all_conv, out_dir / "convergence_results.json")
+
+    print(f"\n{'='*70}")
+    print("CONVERGENCE TEST DONE")
+    print(f"{'='*70}")
+
+
+# ---------------------------------------------------------------------------
 # Main: demo pipeline
 # ---------------------------------------------------------------------------
 
@@ -719,6 +806,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sweep_only", action="store_true",
                         help="Run single-param sweeps only, skip Sobol")
+    parser.add_argument("--convergence_test", action="store_true",
+                        help="Run MC & Sobol convergence study instead of "
+                             "the normal pipeline")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -727,6 +817,10 @@ def main():
 
     scenarios = create_convide_scenarios()
     scenario = scenarios[args.scenario - 1]
+
+    if args.convergence_test:
+        run_convergence_test(scenario, args.seed, out_dir)
+        return
 
     print(f"\n{'='*70}")
     print(f"CAUSAL ENGINE — Python replacement")
@@ -753,6 +847,34 @@ def main():
     print(f"  Baseline I(θ) = {baseline['I_theta']:.4f} "
           f"± {baseline['standard_error']:.4f}\n")
     all_results["baseline"] = baseline
+
+    # --- 2D zonotope visualizations (Figures 1 & 2) ---
+    if scenario.dim == 2:
+        from zonotope_plots import plot_zonotope_consistency, plot_intervention_strip
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print("\nGenerating 2D zonotope visualizations...")
+
+        # Fig 1a: baseline — rectangular source vs target
+        plot_zonotope_consistency(
+            scenario, n_samples=min(1000, args.mc_samples), seed=args.seed,
+            output_path=out_dir / "fig1_zonotope_consistency.png",
+        )
+        # Fig 1b: correlate intervention — hexagonal source zonotope
+        Z_corr = apply_intervention(
+            scenario.source, "correlate", {"correlation_strength": 0.6})
+        plot_zonotope_consistency(
+            scenario, source_override=Z_corr,
+            n_samples=min(1000, args.mc_samples), seed=args.seed,
+            output_path=out_dir / "fig1_zonotope_consistency_correlated.png",
+            title_suffix=r"($\beta=0.6$)",
+        )
+        # Fig 2: widen strip — rectangles growing
+        plot_intervention_strip(
+            scenario, "widen", "scale_factor", [0.5, 1.0, 2.0, 5.0],
+            n_samples=min(500, args.mc_samples), seed=args.seed,
+            output_path=out_dir / "fig2_intervention_strip_widen.png",
+        )
+        plt.close("all")
 
     # --- Single-parameter sweeps ---
     sweeps_config = [
@@ -785,6 +907,34 @@ def main():
                 verbose=True,
             )
             all_results["sobol"] = sobol_results
+
+    # --- 2D heatmap & membership visualizations (Figure 3) ---
+    if scenario.dim == 2:
+        from zonotope_plots import (
+            plot_inconsistency_heatmap, plot_membership_map,
+            plot_inconsistency_slices,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print("\nGenerating parameter-space and membership visualizations...")
+
+        # Fig 3A: I(θ) landscape over scale × shift
+        plot_inconsistency_heatmap(
+            scenario, mc_samples=min(500, args.mc_samples), seed=args.seed,
+            param2_range=(-0.5, 1.5),
+            output_path=out_dir / "fig3a_inconsistency_heatmap.png",
+        )
+        # Fig 3C: slice panels — scale × shift at multiple correlation values
+        plot_inconsistency_slices(
+            scenario, mc_samples=min(500, args.mc_samples), seed=args.seed,
+            param2_range=(-0.5, 1.5),
+            output_path=out_dir / "fig3c_inconsistency_slices.png",
+        )
+        # Fig 3B: physical-space membership (baseline)
+        plot_membership_map(
+            scenario,
+            output_path=out_dir / "fig3b_membership_map.png",
+        )
+        plt.close("all")
 
     # --- Plots ---
     out_dir.mkdir(parents=True, exist_ok=True)

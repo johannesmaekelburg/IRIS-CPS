@@ -468,20 +468,29 @@ def compute_local_sensitivity(df: pd.DataFrame,
 
 def compute_robustness_margins(df: pd.DataFrame,
                                param_name: str,
-                               threshold: float = 0.5) -> Dict[str, Any]:
+                               threshold: float = 0.5,
+                               intervention_type: str = 'scale') -> Dict[str, Any]:
     """
     Compute robustness margin: s*(τ) = sup{s : E[I(θ(s))] ≤ τ}
     
-    How much can we scale parameter before exceeding inconsistency threshold?
+    How much can we change parameter before exceeding inconsistency threshold?
     
     Args:
         df: Experimental data
-        param_name: Parameter to analyze (should be scaling factor)
+        param_name: Parameter to analyze
         threshold: Inconsistency threshold τ
+        intervention_type: Type of intervention ('scale' for widen/shrink, 'shift', 'correlate')
         
     Returns:
         Dict with critical values and safety margins
     """
+    # Determine baseline (no-change value) based on intervention type
+    if intervention_type in ['widen', 'shrink', 'scale']:
+        baseline = 1.0  # 1.0 = no scaling
+    elif intervention_type in ['shift', 'correlate']:
+        baseline = 0.0  # 0.0 = no shift/correlation
+    else:
+        baseline = 0.0  # Default to 0.0 for unknown types
     if param_name not in df.columns:
         raise ValueError(f"Parameter '{param_name}' not found in data")
     
@@ -523,10 +532,10 @@ def compute_robustness_margins(df: pd.DataFrame,
             s_critical = param_range[i] + alpha * (param_range[i+1] - param_range[i])
             crossings.append(s_critical)
     
-    # Robustness margin (assuming baseline s=1.0)
+    # Robustness margin from baseline
     if len(crossings) > 0:
         s_star = crossings[0]  # First crossing
-        margin = abs(s_star - 1.0)
+        margin = abs(s_star - baseline)
         status = "THRESHOLD_CROSSED"
     else:
         if I_range.min() > threshold:
@@ -539,19 +548,23 @@ def compute_robustness_margins(df: pd.DataFrame,
         else:
             # System always below threshold (always safe)
             s_star = param_range[-1]
-            margin = abs(s_star - 1.0)
+            margin = abs(s_star - baseline)
             status = "ALWAYS_BELOW_THRESHOLD"
     
     print(f"\n=== Robustness Margin for {param_name} ===")
+    print(f"Intervention type: {intervention_type}")
+    print(f"Baseline (no-change): {baseline}")
     print(f"Threshold τ = {threshold}")
     print(f"Status: {status}")
     print(f"Critical value s* = {s_star}")
-    print(f"Safety margin = {margin:.3f}")
+    print(f"Safety margin = {margin:.3f} (from baseline)")
     print(f"I(θ) range: [{I_range.min():.4f}, {I_range.max():.4f}]")
     print()
     
     return {
         'param_name': param_name,
+        'intervention_type': intervention_type,
+        'baseline': baseline,
         'threshold': threshold,
         's_star': s_star,
         'margin': margin,
@@ -568,13 +581,160 @@ def compute_robustness_margins(df: pd.DataFrame,
 # 4. Sobol Indices (Variance-based Sensitivity)
 # ============================================================================
 
+def compute_sobol_indices_raw_mc(theta: np.ndarray,
+                                I_theta: np.ndarray,
+                                param_names: List[str],
+                                n_bootstrap: int = 100) -> Dict[str, Any]:
+    """
+    Compute Sobol sensitivity indices using RAW Monte Carlo (Saltelli scheme)
+    directly from experimental data WITHOUT surrogate models.
+    
+    This implements the raw Saltelli formulas:
+    - First-order: S_i ≈ (1/N) Σ f(B) * [f(A_B^(i)) - f(A)] / Var(Y)
+    - Total-order: S_Ti ≈ (1/2N) Σ [f(A) - f(A_B^(i))]² / Var(Y)
+    
+    Args:
+        theta: Parameter matrix (n_samples, n_params) - raw experimental data
+        I_theta: Inconsistency values (n_samples,) - raw model outputs
+        param_names: Names of parameters
+        n_bootstrap: Number of bootstrap samples for confidence intervals
+        
+    Returns:
+        Dict with first-order and total-effect Sobol indices
+    """
+    n_samples, n_params = theta.shape
+    
+    print("\n=== Computing Sobol Indices (Raw MC - Saltelli Scheme) ===")
+    print(f"Using {n_samples} raw experimental samples (NO surrogate model)")
+    print(f"Parameters: {param_names}")
+    
+    # Split data into two independent matrices A and B (Saltelli scheme)
+    n_half = n_samples // 2
+    if n_half < 10:
+        warnings.warn(f"Too few samples ({n_samples}) for reliable Sobol estimation. Need at least 20.")
+    
+    # Random shuffle to decorrelate
+    indices = np.random.permutation(n_samples)
+    theta_shuffled = theta[indices]
+    I_theta_shuffled = I_theta[indices]
+    
+    # Create matrices A and B
+    A = theta_shuffled[:n_half]
+    B = theta_shuffled[n_half:2*n_half]
+    f_A = I_theta_shuffled[:n_half]
+    f_B = I_theta_shuffled[n_half:2*n_half]
+    
+    # Variance of output
+    var_Y = np.var(I_theta)
+    
+    if var_Y < 1e-10:
+        warnings.warn("Output variance is near zero - Sobol indices undefined")
+        return {
+            'first_order': {name: 0.0 for name in param_names},
+            'first_order_conf': {name: 0.0 for name in param_names},
+            'total_order': {name: 0.0 for name in param_names},
+            'total_order_conf': {name: 0.0 for name in param_names},
+            'method': 'raw_mc_saltelli',
+            'warning': 'insufficient_variance'
+        }
+    
+    # For each parameter, create hybrid matrix A_B^(i)
+    S1_estimates = np.zeros(n_params)  # First-order
+    ST_estimates = np.zeros(n_params)  # Total-order
+    
+    for i in range(n_params):
+        # Create A_B^(i): all columns from A except column i which comes from B
+        A_Bi = A.copy()
+        A_Bi[:, i] = B[:, i]
+        
+        # Need to evaluate f(A_B^(i)) - we'll use nearest neighbor from original data
+        f_A_Bi = np.zeros(len(A_Bi))
+        for j, sample in enumerate(A_Bi):
+            # Find nearest sample in original theta
+            distances = np.linalg.norm(theta - sample, axis=1)
+            nearest_idx = np.argmin(distances)
+            f_A_Bi[j] = I_theta[nearest_idx]
+        
+        # First-order index (Eq. 1 from Saltelli paper):
+        # S_i ≈ (1/N) * Σ f(B) * [f(A_B^(i)) - f(A)] / Var(Y)
+        numerator_S1 = np.mean(f_B * (f_A_Bi - f_A))
+        S1_estimates[i] = numerator_S1 / var_Y
+        
+        # Total-order index (Eq. 2 from Saltelli paper):
+        # S_Ti ≈ (1/2N) * Σ [f(A) - f(A_B^(i))]² / Var(Y)
+        numerator_ST = 0.5 * np.mean((f_A - f_A_Bi)**2)
+        ST_estimates[i] = numerator_ST / var_Y
+    
+    # Bootstrap confidence intervals
+    S1_bootstrap = np.zeros((n_bootstrap, n_params))
+    ST_bootstrap = np.zeros((n_bootstrap, n_params))
+    
+    for boot_idx in range(n_bootstrap):
+        # Resample with replacement
+        boot_indices = np.random.choice(n_half, size=n_half, replace=True)
+        A_boot = A[boot_indices]
+        B_boot = B[boot_indices]
+        f_A_boot = f_A[boot_indices]
+        f_B_boot = f_B[boot_indices]
+        
+        for i in range(n_params):
+            A_Bi_boot = A_boot.copy()
+            A_Bi_boot[:, i] = B_boot[:, i]
+            
+            f_A_Bi_boot = np.zeros(len(A_Bi_boot))
+            for j, sample in enumerate(A_Bi_boot):
+                distances = np.linalg.norm(theta - sample, axis=1)
+                nearest_idx = np.argmin(distances)
+                f_A_Bi_boot[j] = I_theta[nearest_idx]
+            
+            numerator_S1 = np.mean(f_B_boot * (f_A_Bi_boot - f_A_boot))
+            S1_bootstrap[boot_idx, i] = numerator_S1 / var_Y
+            
+            numerator_ST = 0.5 * np.mean((f_A_boot - f_A_Bi_boot)**2)
+            ST_bootstrap[boot_idx, i] = numerator_ST / var_Y
+    
+    # Compute confidence intervals
+    S1_conf = np.std(S1_bootstrap, axis=0) * 1.96  # 95% CI
+    ST_conf = np.std(ST_bootstrap, axis=0) * 1.96
+    
+    # Clip negative values (can occur due to sampling variance)
+    S1_estimates = np.clip(S1_estimates, 0, 1)
+    ST_estimates = np.clip(ST_estimates, 0, 1)
+    
+    results = {
+        'first_order': dict(zip(param_names, S1_estimates)),
+        'first_order_conf': dict(zip(param_names, S1_conf)),
+        'total_order': dict(zip(param_names, ST_estimates)),
+        'total_order_conf': dict(zip(param_names, ST_conf)),
+        'method': 'raw_mc_saltelli',
+        'n_samples': n_samples,
+        'n_bootstrap': n_bootstrap
+    }
+    
+    # Print summary
+    print(f"\nFirst-order Sobol indices (main effects):")
+    for name in param_names:
+        S1 = results['first_order'][name]
+        S1_conf = results['first_order_conf'][name]
+        print(f"  {name:20s}: {S1:.4f} ± {S1_conf:.4f}")
+    
+    print(f"\nTotal-effect Sobol indices (with interactions):")
+    for name in param_names:
+        ST = results['total_order'][name]
+        ST_conf = results['total_order_conf'][name]
+        print(f"  {name:20s}: {ST:.4f} ± {ST_conf:.4f}")
+    
+    return results
+
+
 def compute_sobol_indices(theta: np.ndarray,
                          I_theta: np.ndarray,
                          param_names: List[str],
                          n_samples: int = 1024,
-                         calc_second_order: bool = False) -> Dict[str, Any]:
+                         calc_second_order: bool = False,
+                         use_raw_mc: bool = True) -> Dict[str, Any]:
     """
-    Compute Sobol sensitivity indices using SALib.
+    Compute Sobol sensitivity indices.
     
     First-order: S_i = Var_θi(E[I(θ)|θi])/Var(I(θ))
     Total-effect: S_i^T = 1 - Var_θ~i(E[I(θ)|θ~i])/Var(I(θ))
@@ -585,10 +745,16 @@ def compute_sobol_indices(theta: np.ndarray,
         param_names: Names of parameters
         n_samples: Number of samples for Saltelli sampling (if surrogate needed)
         calc_second_order: Compute second-order interactions
+        use_raw_mc: If True, use raw MC Saltelli; if False, use surrogate+SALib
         
     Returns:
         Dict with first-order and total-effect Sobol indices
     """
+    # Prefer raw MC for experimental data
+    if use_raw_mc:
+        return compute_sobol_indices_raw_mc(theta, I_theta, param_names, n_bootstrap=100)
+    
+    # Fallback to surrogate-based SALib method
     if not SALIB_AVAILABLE:
         raise ImportError("SALib is required for Sobol indices. Install with: pip install SALib")
     
@@ -603,7 +769,7 @@ def compute_sobol_indices(theta: np.ndarray,
     
     # Check if we have enough samples for direct analysis
     # SALib needs structured samples, so we'll fit a surrogate and use it
-    print("\n=== Computing Sobol Indices ===")
+    print("\n=== Computing Sobol Indices (Surrogate Method) ===")
     print(f"Fitting surrogate model for Sobol analysis...")
     
     # Fit surrogate (GP or RF)
@@ -624,6 +790,7 @@ def compute_sobol_indices(theta: np.ndarray,
         'first_order_conf': dict(zip(param_names, Si['S1_conf'])),
         'total_order': dict(zip(param_names, Si['ST'])),
         'total_order_conf': dict(zip(param_names, Si['ST_conf'])),
+        'method': 'surrogate_salib'
     }
     
     if calc_second_order:
@@ -798,15 +965,22 @@ def plot_robustness_margins(margins_dict: Dict[str, Any],
     ax.axhline(margins_dict['threshold'], color='red', linestyle='--', 
               linewidth=2, label=f'Threshold τ={margins_dict["threshold"]:.2f}')
     
+    # Show baseline (no-change value)
+    baseline = margins_dict.get('baseline', 1.0)
+    ax.axvline(baseline, color='gray', linestyle=':', linewidth=1.5, 
+              label=f'Baseline={baseline}')
+    
     if margins_dict['s_star'] is not None:
         ax.axvline(margins_dict['s_star'], color='green', linestyle='--',
                   linewidth=2, label=f's*={margins_dict["s_star"]:.3f}')
-        ax.fill_betweenx([0, 1], 0, margins_dict['s_star'], 
+        # Fill safe region between baseline and s_star
+        ax.fill_betweenx([0, 1], baseline, margins_dict['s_star'], 
                         alpha=0.2, color='green', label='Safe region')
     
+    interv_type = margins_dict.get('intervention_type', 'unknown')
     ax.set_xlabel(f'{format_parameter_name(margins_dict["param_name"])}')
     ax.set_ylabel('I(θ)')
-    ax.set_title(f'Robustness Margin Analysis\nStatus: {margins_dict.get("status", "UNKNOWN")}\nMargin = {margins_dict["margin"]:.3f}')
+    ax.set_title(f'Robustness Margin Analysis ({interv_type})\nStatus: {margins_dict.get("status", "UNKNOWN")}\nMargin = {margins_dict["margin"]:.3f} from baseline={baseline}')
     ax.set_ylim([0, 1])
     ax.grid(alpha=0.3)
     ax.legend()
@@ -844,10 +1018,15 @@ def format_parameter_name(param_name: str) -> str:
         'jaccard_C': 'Jaccard C',
         'jaccard_Csym': 'Jaccard C (Symmetric)',
         'jaccard_index': 'Jaccard Index',
-        'mc_probability_sobol': 'MC Probability (Sobol)',
-        'mc_probability_halton': 'MC Probability (Halton)',
-        'mc_probability_lhs': 'MC Probability (LHS)',
-        'mc_probability_random': 'MC Probability (Random)',
+        'mc_probability_sobol': 'MC P(Consistent) - Sobol',
+        'mc_probability_halton': 'MC P(Consistent) - Halton',
+        'mc_probability_lhs': 'MC P(Consistent) - LHS',
+        'mc_probability_random': 'MC P(Consistent) - Random',
+        'mc_p_inconsistent_sobol': 'MC P(Inconsistent) - Sobol',
+        'mc_p_inconsistent_halton': 'MC P(Inconsistent) - Halton',
+        'mc_p_inconsistent_lhs': 'MC P(Inconsistent) - LHS',
+        'mc_p_inconsistent_random': 'MC P(Inconsistent) - Random',
+        'I_theta': 'Global Inconsistency I(θ)',
         
         # Other parameters
         'uncertainty_scale': 'Uncertainty Scale',
@@ -910,7 +1089,8 @@ def run_full_sensitivity_analysis(data_dir: str,
                                   output_dir: str,
                                   param_name: str = 'auto',
                                   threshold: float = 0.5,
-                                  run_sobol: bool = True):
+                                  run_sobol: bool = True,
+                                  split_by_intervention: bool = True):
     """
     Run complete sensitivity analysis pipeline.
     
@@ -920,6 +1100,7 @@ def run_full_sensitivity_analysis(data_dir: str,
         param_name: Primary parameter to analyze ('auto' to auto-detect)
         threshold: Inconsistency threshold for robustness margins
         run_sobol: Whether to compute Sobol indices (requires SALib)
+        split_by_intervention: If True, analyze each intervention type separately
     """
     # Create timestamped output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -932,10 +1113,24 @@ def run_full_sensitivity_analysis(data_dir: str,
     print("="*80)
     print(f"Output directory: {output_path}")
     print(f"Timestamp: {timestamp}")
+    print(f"Split by intervention: {split_by_intervention}")
     print("="*80)
     
     # 1. Load data
     df = load_experimental_data(data_dir)
+    
+    # Check if we need to split by intervention type
+    intervention_types = []
+    if split_by_intervention and 'intervention_type' in df.columns:
+        intervention_types = sorted(df['intervention_type'].dropna().unique())
+        print(f"\n🔍 Detected {len(intervention_types)} intervention types: {intervention_types}")
+    
+    if len(intervention_types) <= 1:
+        # No splitting needed or only one type
+        split_by_intervention = False
+        print("\n→ Analyzing all data together (no intervention split)")
+    else:
+        print(f"\n→ Will analyze each intervention type separately")
     
     # Auto-detect parameter name if needed
     if param_name == 'auto':
@@ -966,138 +1161,128 @@ def run_full_sensitivity_analysis(data_dir: str,
         print(f"   Values: {sorted(df[param_name].unique())}")
         print()
     
-    # 2. Total causal effects
-    print("\n" + "="*80)
-    print("1. TOTAL CAUSAL EFFECTS τ_j(a,b)")
-    print("="*80)
-    causal_effects = compute_causal_effects(df, param_name)
-    plot_causal_effects(causal_effects, 
-                       output_path / f'causal_effects_{param_name}.png')
-    
-    # 3. Local sensitivity
-    print("\n" + "="*80)
-    print("2. LOCAL SENSITIVITY ∂I/∂θ_j")
-    print("="*80)
-    local_sens = compute_local_sensitivity(df, param_name, method='finite_difference')
-    plot_local_sensitivity(local_sens,
-                          output_path / f'local_sensitivity_{param_name}.png')
-    
-    # 4. Robustness margins
-    print("\n" + "="*80)
-    print("3. ROBUSTNESS MARGINS s*(τ)")
-    print("="*80)
-    margins = compute_robustness_margins(df, param_name, threshold=threshold)
-    plot_robustness_margins(margins,
-                           output_path / f'robustness_margins_{param_name}.png')
-    
-    # 5. Sobol indices (if enough parameters)
-    theta, I_theta, theta_columns = extract_theta_and_I(df)
-    print(f"\nExtracted parameters: {theta_columns}")
-    print(f"Theta shape: {theta.shape}")
-    print(f"SALib available: {SALIB_AVAILABLE}")
-    
-    # If only 1 parameter, try to add scenario-level features
-    if theta.shape[1] == 1:
-        print("\n⚠ Only 1 parameter found. Attempting to add scenario-level features...")
-        additional_features = ['pre_source_volume', 'pre_source_radius', 
-                              'pre_target_volume', 'pre_target_radius',
-                              'pre_source_n_generators', 'pre_target_n_generators']
-        
-        added_cols = []
-        for col in additional_features:
-            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-                # Check if varies across dataset (even if constant within scenario)
-                if df[col].nunique() > 1:
-                    added_cols.append(col)
-        
-        if added_cols:
-            print(f"  Adding scenario features: {added_cols}")
-            theta_columns_expanded = theta_columns + added_cols
-            theta_expanded = df[theta_columns_expanded].values.astype(float)
-            I_theta_expanded = df['I_theta'].values.astype(float)
-            
-            # Remove NaN
-            valid_mask = ~(np.isnan(theta_expanded).any(axis=1) | np.isnan(I_theta_expanded))
-            theta = theta_expanded[valid_mask]
-            I_theta = I_theta_expanded[valid_mask]
-            theta_columns = theta_columns_expanded
-            
-            print(f"  Expanded θ matrix: {theta.shape}")
-    
-    if run_sobol and theta.shape[1] >= 2 and SALIB_AVAILABLE:
+    # Function to run analysis on a subset
+    def analyze_subset(df_subset, subset_name, subset_dir):
+        """Run analysis on a data subset (e.g., one intervention type)"""
         print("\n" + "="*80)
-        print("4. SOBOL INDICES (Variance-based)")
+        print(f"ANALYZING: {subset_name}")
+        print(f"N samples: {len(df_subset)}")
         print("="*80)
+        
+        # 2. Total causal effects
+        print("\n" + "-"*80)
+        print("1. TOTAL CAUSAL EFFECTS τ_j(a,b)")
+        print("-"*80)
         try:
-            sobol_results = compute_sobol_indices(theta, I_theta, theta_columns, 
-                                                 n_samples=1024, calc_second_order=False)
-            plot_sobol_indices(sobol_results,
-                              output_path / 'sobol_indices.png')
-            
-            # Save results
-            with open(output_path / 'sobol_indices.pkl', 'wb') as f:
-                pickle.dump(sobol_results, f)
-            print("✓ Sobol indices computed and saved")
+            causal_effects = compute_causal_effects(df_subset, param_name)
+            plot_causal_effects(causal_effects, 
+                              subset_dir / f'causal_effects_{param_name}.png')
         except Exception as e:
-            print(f"✗ Warning: Sobol analysis failed: {e}")
-            import traceback
-            traceback.print_exc()
-    elif not run_sobol:
-        print(f"\n⊘ Skipping Sobol indices: Disabled via run_sobol=False")
-    elif theta.shape[1] < 2:
-        print(f"\n✗ Skipping Sobol indices: Need ≥2 parameters, found {theta.shape[1]}")
-        print("  💡 Tip: Combine multiple scenarios to get parameter variation across scenarios")
-    elif not SALIB_AVAILABLE:
-        print(f"\n✗ Skipping Sobol indices: SALib not installed. Run: pip install SALib")
+            print(f"⚠ Causal effects failed: {e}")
+        
+        # 3. Local sensitivity
+        print("\n" + "-"*80)
+        print("2. LOCAL SENSITIVITY ∂I/∂θ_j")
+        print("-"*80)
+        try:
+            local_sens = compute_local_sensitivity(df_subset, param_name, method='finite_difference')
+            plot_local_sensitivity(local_sens,
+                                 subset_dir / f'local_sensitivity_{param_name}.png')
+        except Exception as e:
+            print(f"⚠ Local sensitivity failed: {e}")
+        
+        # 4. Robustness margins
+        print("\n" + "-"*80)
+        print("3. ROBUSTNESS MARGINS s*(τ)")
+        print("-"*80)
+        try:
+            # Extract intervention type for this subset
+            interv_type = df_subset['intervention_type'].iloc[0] if 'intervention_type' in df_subset.columns else 'scale'
+            margins = compute_robustness_margins(df_subset, param_name, threshold=threshold,
+                                                intervention_type=interv_type)
+            plot_robustness_margins(margins,
+                                  subset_dir / f'robustness_margins_{param_name}.png')
+        except Exception as e:
+            print(f"⚠ Robustness margins failed: {e}")
+        
+        # 5. Sobol indices (if enough parameters)
+        theta, I_theta, theta_columns = extract_theta_and_I(df_subset)
+        print(f"\nExtracted parameters: {theta_columns}")
+        print(f"Theta shape: {theta.shape}")
+        
+        # If only 1 parameter, try to add scenario-level features
+        if theta.shape[1] == 1:
+            print("\n⚠ Only 1 parameter found. Attempting to add scenario-level features...")
+            additional_features = ['pre_source_volume', 'pre_source_radius', 
+                                  'pre_target_volume', 'pre_target_radius',
+                                  'pre_source_n_generators', 'pre_target_n_generators']
+            
+            added_cols = []
+            for col in additional_features:
+                if col in df_subset.columns and pd.api.types.is_numeric_dtype(df_subset[col]):
+                    # Check if varies across dataset
+                    if df_subset[col].nunique() > 1:
+                        added_cols.append(col)
+            
+            if added_cols:
+                print(f"  Adding scenario features: {added_cols}")
+                theta_columns_expanded = theta_columns + added_cols
+                theta_expanded = df_subset[theta_columns_expanded].values.astype(float)
+                theta, I_theta, theta_columns = theta_expanded, I_theta, theta_columns_expanded
+        
+        # Sobol analysis
+        if run_sobol and theta.shape[1] >= 2:
+            print("\n" + "-"*80)
+            print("4. SOBOL SENSITIVITY INDICES (Raw MC - Saltelli)")
+            print("-"*80)
+            try:
+                # Use raw MC instead of surrogate
+                sobol_results = compute_sobol_indices(theta, I_theta, theta_columns, 
+                                                     use_raw_mc=True)
+                plot_sobol_indices(sobol_results, 
+                                 subset_dir / f'sobol_indices.png')
+                
+                # Save results
+                with open(subset_dir / 'sobol_indices.json', 'w') as f:
+                    # Convert to JSON-serializable format
+                    json_results = {k: (v.tolist() if hasattr(v, 'tolist') else v) 
+                                  for k, v in sobol_results.items()}
+                    json.dump(json_results, f, indent=2)
+                
+            except Exception as e:
+                print(f"⚠ Sobol analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+        elif theta.shape[1] < 2:
+            print(f"\n⚠ Skipping Sobol indices: need at least 2 parameters, found {theta.shape[1]}")
+        
+        print(f"\n✓ Analysis complete for {subset_name}")
+        return True
     
-    # 6. Fit surrogate model
+    # Run analysis (split or combined)
+    if split_by_intervention:
+        # Analyze each intervention type separately
+        print("\n" + "="*80)
+        print(f"RUNNING SENSITIVITY ANALYSIS (SPLIT BY INTERVENTION)")
+        print("="*80)
+        for interv_type in intervention_types:
+            df_subset = df[df['intervention_type'] == interv_type].copy()
+            subset_dir = output_path / f'intervention_{interv_type}'
+            subset_dir.mkdir(exist_ok=True)
+            
+            analyze_subset(df_subset, f"Intervention: {interv_type}", subset_dir)
+    else:
+        # Analyze all data together
+        print("\n" + "="*80)
+        print(f"RUNNING SENSITIVITY ANALYSIS (COMBINED)")
+        print("="*80)
+        analyze_subset(df, "All Data", output_path)
+    
     print("\n" + "="*80)
-    print("5. SURROGATE MODEL")
-    print("="*80)
-    surrogate = fit_surrogate_model(theta, I_theta, model_type='gp')
-    
-    # Save surrogate
-    with open(output_path / 'surrogate_model.pkl', 'wb') as f:
-        pickle.dump(surrogate, f)
-    
-    # Save summary
-    summary = {
-        'data_shape': df.shape,
-        'parameters': theta_columns,
-        'I_theta_stats': {
-            'mean': float(I_theta.mean()),
-            'std': float(I_theta.std()),
-            'min': float(I_theta.min()),
-            'max': float(I_theta.max())
-        },
-        'causal_effects': causal_effects.to_dict(orient='records'),
-        'local_sensitivity': {
-            'mean': float(local_sens['mean_sensitivity']),
-            'max': float(local_sens['max_sensitivity'])
-        },
-        'robustness_margins': {
-            's_star': margins['s_star'],
-            'margin': float(margins['margin'])
-        }
-    }
-    
-    with open(output_path / 'sensitivity_analysis_summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    print("\n" + "="*80)
-    print("ANALYSIS COMPLETE")
+    print("FULL SENSITIVITY ANALYSIS COMPLETE")
     print("="*80)
     print(f"\nAll results saved to:")
     print(f"  {output_path.absolute()}")
-    print(f"\nGenerated files:")
-    print(f"  - causal_effects_{param_name}.png")
-    print(f"  - local_sensitivity_{param_name}.png")
-    print(f"  - robustness_margins_{param_name}.png")
-    if run_sobol and theta.shape[1] >= 2 and SALIB_AVAILABLE:
-        print(f"  - sobol_indices.png")
-        print(f"  - sobol_indices.pkl")
-    print(f"  - surrogate_model.pkl")
-    print(f"  - sensitivity_analysis_summary.json")
     print("="*80)
 
 

@@ -87,10 +87,13 @@ def load_experimental_data(data_dir: str,
             # Pre-intervention inconsistency
             pre_inconsistency = exp.get('pre_inconsistency', pre_state.get('inconsistency', {}))
             
-            # Compute I_theta from MC probability if not available
-            I_theta_pre = pre_inconsistency.get('I_theta')
+            # Prefer MFMC-corrected value; fall back to plain MC probability
+            I_theta_pre = pre_inconsistency.get('I_MF_sobol',
+                            pre_inconsistency.get('I_MF_halton',
+                            pre_inconsistency.get('I_MF_random',
+                            pre_inconsistency.get('I_theta'))))
             if I_theta_pre is None or np.isnan(I_theta_pre):
-                mc_p_consistent = pre_inconsistency.get('mc_p_consistent_sobol', 
+                mc_p_consistent = pre_inconsistency.get('mc_p_consistent_sobol',
                                                        pre_inconsistency.get('mc_probability'))
                 if mc_p_consistent is not None:
                     I_theta_pre = 1.0 - mc_p_consistent
@@ -109,8 +112,11 @@ def load_experimental_data(data_dir: str,
             # Post-intervention inconsistency
             post_inconsistency = exp.get('post_inconsistency', post_state.get('inconsistency', {}))
             
-            # Compute post I_theta from MC probability if not available
-            I_theta_post = post_inconsistency.get('I_theta')
+            # Prefer MFMC-corrected value; fall back to plain MC probability
+            I_theta_post = post_inconsistency.get('I_MF_sobol',
+                             post_inconsistency.get('I_MF_halton',
+                             post_inconsistency.get('I_MF_random',
+                             post_inconsistency.get('I_theta'))))
             if I_theta_post is None or np.isnan(I_theta_post):
                 mc_p_consistent_post = post_inconsistency.get('mc_p_consistent_sobol',
                                                               post_inconsistency.get('mc_probability'))

@@ -94,23 +94,56 @@ classdef causal_experiment_engine_twostep
             exp_count = 0;
             
             % Create baseline scenario
+            mapping_strength = 5.0;
+            if isfield(scenario_def, 'mapping_strength') && ~isempty(scenario_def.mapping_strength)
+                mapping_strength = scenario_def.mapping_strength;
+            end
             baseline_scenario = causal_experiment_engine_twostep.create_baseline_scenario(...
-                length(scenario_def.source.c), 5.0);
+                length(scenario_def.source.c), mapping_strength);
             baseline_scenario.source = scenario_def.source;
             baseline_scenario.target = scenario_def.target;
+            % Re-align translation so propagated source center == target center.
+            % Without this, the random F applied to large centers (e.g. 100)
+            % causes O(0.01*100)=1 unit noise in the propagated center, which
+            % swamps the small source-target difference controlled by center_alpha.
+            baseline_scenario.mapping.f = scenario_def.target.c - ...
+                baseline_scenario.mapping.F * scenario_def.source.c;
             
             % Flatten experiments for optional parallelization
             experiments = [];
-            for i = 1:length(interventions)
-                int = interventions{i};
-                for val_idx = 1:length(int.values)
+            
+            % Check if Saltelli mode (struct) or CONVIDE mode (cell array)
+            if isstruct(interventions) && isfield(interventions, 'mode') && strcmp(interventions.mode, 'saltelli')
+                % SALTELLI MODE: Use compound interventions from samples
+                saltelli_samples = interventions.samples;
+                param_names = interventions.params;
+                
+                for sample_idx = 1:height(saltelli_samples)
                     for rep = 1:options.n_repeats
                         exp = struct();
-                        exp.intervention_type = int.type;
-                        exp.param_name = int.param;
-                        exp.param_value = int.values(val_idx);
+                        exp.intervention_type = 'compound';
+                        exp.sample_idx = sample_idx;
                         exp.repeat_idx = rep;
+                        % Extract parameter values from table
+                        for p = 1:length(param_names)
+                            exp.(param_names{p}) = saltelli_samples.(param_names{p})(sample_idx);
+                        end
                         experiments = [experiments; exp];
+                    end
+                end
+            else
+                % CONVIDE MODE: Use discrete interventions
+                for i = 1:length(interventions)
+                    int = interventions{i};
+                    for val_idx = 1:length(int.values)
+                        for rep = 1:options.n_repeats
+                            exp = struct();
+                            exp.intervention_type = int.type;
+                            exp.param_name = int.param;
+                            exp.param_value = int.values(val_idx);
+                            exp.repeat_idx = rep;
+                            experiments = [experiments; exp];
+                        end
                     end
                 end
             end
@@ -127,6 +160,7 @@ classdef causal_experiment_engine_twostep
             
             % Use parfor if parallel enabled, otherwise regular for
             if options.use_parallel
+                progress_queue = [];
                 if options.verbose
                     fprintf('  Starting parallel zonotope generation at %s...\n', char(datetime('now', 'Format', 'HH:mm:ss')));
                     tic;
@@ -140,10 +174,19 @@ classdef causal_experiment_engine_twostep
                         
                     exp = experiments(exp_id);
                     
-                    % Apply intervention
-                    params = struct(exp.param_name, exp.param_value);
-                    scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
-                        baseline_scenario, exp.intervention_type, params);
+                    % Apply intervention (handle both CONVIDE and Saltelli modes)
+                    if strcmp(exp.intervention_type, 'compound')
+                        % SALTELLI MODE: Compound intervention
+                        theta_vector = [exp.scale_factor, exp.center_delta, exp.correlation_strength];
+                        param_names = {'scale_factor', 'center_delta', 'correlation_strength'};
+                        scenario_modified = causal_experiment_engine_twostep.apply_compound_intervention(...
+                            baseline_scenario, theta_vector, param_names);
+                    else
+                        % CONVIDE MODE: Discrete intervention
+                        params = struct(exp.param_name, exp.param_value);
+                        scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                            baseline_scenario, exp.intervention_type, params);
+                    end
                         
                         % Propagate modified source
                         F = scenario_modified.mapping.F;
@@ -158,9 +201,19 @@ classdef causal_experiment_engine_twostep
                     zono_data.scenario_description = scenario_def.name;
                     zono_data.causality_type = scenario_def.type;
                     zono_data.intervention_type = exp.intervention_type;
-                    zono_data.param_name = exp.param_name;
-                    zono_data.intervention_value = exp.param_value;
                     zono_data.repeat_idx = exp.repeat_idx;
+                    
+                    % Store intervention parameters (different for CONVIDE vs Saltelli)
+                    if strcmp(exp.intervention_type, 'compound')
+                        zono_data.scale_factor = exp.scale_factor;
+                        zono_data.center_delta = exp.center_delta;
+                        zono_data.correlation_strength = exp.correlation_strength;
+                        zono_data.sample_idx = exp.sample_idx;
+                    else
+                        zono_data.param_name = exp.param_name;
+                        zono_data.intervention_value = exp.param_value;
+                    end
+                    
                     zono_data.timestamp = datetime('now');
                         
                     % Store zonotopes
@@ -183,8 +236,18 @@ classdef causal_experiment_engine_twostep
                     zono_metadata.exp_id = exp_id;
                     zono_metadata.scenario_name = scenario_name;
                     zono_metadata.intervention_type = exp.intervention_type;
-                    zono_metadata.intervention_value = exp.param_value;
                     zono_metadata.repeat_idx = exp.repeat_idx;
+                    
+                    % Store intervention value (different for CONVIDE vs Saltelli) 
+                    if strcmp(exp.intervention_type, 'compound')
+                        zono_metadata.scale_factor = exp.scale_factor;
+                        zono_metadata.center_delta = exp.center_delta;
+                        zono_metadata.correlation_strength = exp.correlation_strength;
+                        zono_metadata.sample_idx = exp.sample_idx;
+                    else
+                        zono_metadata.intervention_value = exp.param_value;
+                    end
+                    
                     zono_metadata.filepath = filepath;
                     
                     zonotope_data{exp_id} = zono_metadata;
@@ -212,10 +275,19 @@ classdef causal_experiment_engine_twostep
                         fprintf('    Progress: %d/%d\n', exp_id, n_total);
                     end
                     
-                    % Apply intervention
-                    params = struct(exp.param_name, exp.param_value);
-                    scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
-                        baseline_scenario, exp.intervention_type, params);
+                    % Apply intervention (handle both CONVIDE and Saltelli modes)
+                    if strcmp(exp.intervention_type, 'compound')
+                        % SALTELLI MODE: Compound intervention
+                        theta_vector = [exp.scale_factor, exp.center_delta, exp.correlation_strength];
+                        param_names = {'scale_factor', 'center_delta', 'correlation_strength'};
+                        scenario_modified = causal_experiment_engine_twostep.apply_compound_intervention(...
+                            baseline_scenario, theta_vector, param_names);
+                    else
+                        % CONVIDE MODE: Discrete intervention
+                        params = struct(exp.param_name, exp.param_value);
+                        scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                            baseline_scenario, exp.intervention_type, params);
+                    end
                     
                     % Propagate modified source
                     F = scenario_modified.mapping.F;
@@ -230,9 +302,18 @@ classdef causal_experiment_engine_twostep
                     zono_data.scenario_description = scenario_def.name;
                     zono_data.causality_type = scenario_def.type;
                     zono_data.intervention_type = exp.intervention_type;
-                    zono_data.param_name = exp.param_name;
-                    zono_data.intervention_value = exp.param_value;
                     zono_data.repeat_idx = exp.repeat_idx;
+                    
+                    % Store intervention parameters (different for CONVIDE vs Saltelli)
+                    if strcmp(exp.intervention_type, 'compound')
+                        zono_data.scale_factor = exp.scale_factor;
+                        zono_data.center_delta = exp.center_delta;
+                        zono_data.correlation_strength = exp.correlation_strength;
+                        zono_data.sample_idx = exp.sample_idx;
+                    else
+                        zono_data.param_name = exp.param_name;
+                        zono_data.intervention_value = exp.param_value;
+                    end
                     zono_data.timestamp = datetime('now');
                     
                     % Store zonotopes
@@ -255,8 +336,18 @@ classdef causal_experiment_engine_twostep
                     zono_metadata.exp_id = exp_id;
                     zono_metadata.scenario_name = scenario_name;
                     zono_metadata.intervention_type = exp.intervention_type;
-                    zono_metadata.intervention_value = exp.param_value;
                     zono_metadata.repeat_idx = exp.repeat_idx;
+                    
+                    % Store intervention value (different for CONVIDE vs Saltelli)
+                    if strcmp(exp.intervention_type, 'compound')
+                        zono_metadata.scale_factor = exp.scale_factor;
+                        zono_metadata.center_delta = exp.center_delta;
+                        zono_metadata.correlation_strength = exp.correlation_strength;
+                        zono_metadata.sample_idx = exp.sample_idx;
+                    else
+                        zono_metadata.intervention_value = exp.param_value;
+                    end
+                    
                     zono_metadata.filepath = filepath;
                     
                     zonotope_data{exp_id} = zono_metadata;
@@ -296,6 +387,7 @@ classdef causal_experiment_engine_twostep
             %       .mc_samples      - Number of MC samples (default: 2000)
             %       .verbose         - Display progress (default: true)
             %       .scenario_filter - (optional) Only process specific scenario names
+            %       .scenario_ids    - (optional) Numeric scenario IDs to process
             %
             % Outputs:
             %   results - Cell array of result structs
@@ -362,6 +454,12 @@ classdef causal_experiment_engine_twostep
                         continue;
                     end
                 end
+                if isfield(consistency_options, 'scenario_ids') && ...
+                   ~isempty(consistency_options.scenario_ids)
+                    if ~ismember(zonotope_index.scenario_def.id, consistency_options.scenario_ids)
+                        continue;
+                    end
+                end
                 
                 n_total_exp = length(zonotope_index.zonotope_files);
                 
@@ -393,11 +491,12 @@ classdef causal_experiment_engine_twostep
                     end
                     
                     % Setup progress monitoring for parallel execution
+                    progress_queue = [];
                     if consistency_options.verbose
                         progress_queue = parallel.pool.DataQueue;
                         afterEach(progress_queue, @(~) fprintf('.'));
                     end
-                    
+
                     parfor exp_idx = 1:n_total_exp
                         % Suppress CORA warnings in each worker
                         warning('off', 'all');
@@ -437,7 +536,19 @@ classdef causal_experiment_engine_twostep
                     result.causality_type = zono_data.causality_type;
                     result.intervention_type = zono_data.intervention_type;
                     result.intervention_direction = 'forward';
-                    result.intervention_value = zono_data.intervention_value;
+                    
+                    % Store intervention parameters (different for CONVIDE vs Saltelli)
+                    if strcmp(zono_data.intervention_type, 'compound')
+                        result.scale_factor = zono_data.scale_factor;
+                        result.center_delta = zono_data.center_delta;
+                        result.correlation_strength = zono_data.correlation_strength;
+                        if isfield(zono_data, 'sample_idx')
+                            result.sample_idx = zono_data.sample_idx;
+                        end
+                    else
+                        result.intervention_value = zono_data.intervention_value;
+                    end
+                    
                     result.repeat_idx = zono_data.repeat_idx;
                     result.run_id = zono_data.exp_id;
                     
@@ -521,7 +632,19 @@ classdef causal_experiment_engine_twostep
                         result.causality_type = zono_data.causality_type;
                         result.intervention_type = zono_data.intervention_type;
                         result.intervention_direction = 'forward';
-                        result.intervention_value = zono_data.intervention_value;
+                        
+                        % Store intervention parameters (different for CONVIDE vs Saltelli)
+                        if strcmp(zono_data.intervention_type, 'compound')
+                            result.scale_factor = zono_data.scale_factor;
+                            result.center_delta = zono_data.center_delta;
+                            result.correlation_strength = zono_data.correlation_strength;
+                            if isfield(zono_data, 'sample_idx')
+                                result.sample_idx = zono_data.sample_idx;
+                            end
+                        else
+                            result.intervention_value = zono_data.intervention_value;
+                        end
+                        
                         result.repeat_idx = zono_data.repeat_idx;
                         result.run_id = zono_data.exp_id;
                         
@@ -655,6 +778,10 @@ classdef causal_experiment_engine_twostep
             end
             
             % === INCONSISTENCY METRICS ===
+            % NOTE: Dual representation for unified analysis:
+            %   - Raw metrics: jaccard_index, mc_probability (consistency: 0=bad, 1=good)
+            %   - Derived metrics: jaccard_inconsistency, mc_p_inconsistent, I_theta (inconsistency: 0=good, 1=bad)
+            %   - All *_inconsistency and I_theta metrics increase in the same direction for sensitivity analysis
             state.inconsistency = struct();
             
             % Propagate and check for inconsistencies
@@ -680,14 +807,17 @@ classdef causal_experiment_engine_twostep
                             try
                                 F_identity = eye(size(scenario.target.c, 1));
                                 f_identity = zeros(size(scenario.target.c, 1), 1);
-                                
+
+                                t_jaccard = tic;
                                 [C, Csym, details] = score_jaccard(...
                                     Z_propagated, scenario.target, F_identity, f_identity, ...
                                     struct('return_details', true, 'verbose', false));
-                                
+                                state.inconsistency.timing_jaccard_s = toc(t_jaccard);
+
                                 state.inconsistency.jaccard_C = C;
                                 state.inconsistency.jaccard_Csym = Csym;
                                 state.inconsistency.jaccard_index = Csym;
+                                state.inconsistency.jaccard_inconsistency = 1 - Csym;  % Derived: unified direction (0=consistent, 1=inconsistent)
                                 state.inconsistency.empty_intersection = details.is_empty;
                                 state.inconsistency.has_intersection = ~details.is_empty;
                                 state.inconsistency.jaccard_vol_intersection = details.s_int;
@@ -705,6 +835,7 @@ classdef causal_experiment_engine_twostep
                                 state.inconsistency.jaccard_C = NaN;
                                 state.inconsistency.jaccard_Csym = NaN;
                                 state.inconsistency.jaccard_index = NaN;
+                                state.inconsistency.jaccard_inconsistency = NaN;
                             end
                         end
                         
@@ -720,19 +851,23 @@ classdef causal_experiment_engine_twostep
                                     jac_mc_opts.sampling_method = samp_method;
                                     jac_mc_opts.return_details = true;
                                     jac_mc_opts.verbose = false;
-                                    
+
+                                    t_jmc = tic;
                                     [jac_mc_score, jac_mc_details] = score_jaccard_mc(...
                                         Z_propagated, scenario.target, jac_mc_opts);
+                                    state.inconsistency.(['timing_jaccard_mc_' samp_method '_s']) = toc(t_jmc);
                                     
                                     % Save with method-specific field names
                                     field_suffix = ['_' samp_method];
                                     state.inconsistency.(['jaccard_mc_index' field_suffix]) = jac_mc_score;
+                                    state.inconsistency.(['jaccard_mc_inconsistency' field_suffix]) = 1 - jac_mc_score;  % Derived: unified direction
                                     state.inconsistency.(['jaccard_mc_vol_AB_est' field_suffix]) = jac_mc_details.vol_AB_est;
                                     state.inconsistency.(['jaccard_mc_vol_union_est' field_suffix]) = jac_mc_details.vol_union_est;
                                     state.inconsistency.(['jaccard_mc_num_samples' field_suffix]) = jac_mc_details.N;
                                 catch ME
                                     warning('Jaccard MC scoring failed for %s: %s', samp_method, ME.message);
                                     state.inconsistency.(['jaccard_mc_index_' samp_method]) = NaN;
+                                    state.inconsistency.(['jaccard_mc_inconsistency_' samp_method]) = NaN;
                                 end
                             end
                         end
@@ -749,9 +884,11 @@ classdef causal_experiment_engine_twostep
                                     mc_opts.sampling_method = samp_method;
                                     mc_opts.return_details = true;
                                     mc_opts.verbose = false;
-                                    
+
+                                    t_mc = tic;
                                     [mc_score, mc_details] = score_mc_probability(...
                                         {Z_propagated, scenario.target}, mc_opts);
+                                    state.inconsistency.(['timing_mc_' samp_method '_s']) = toc(t_mc);
                                     
                                     % Save with method-specific field names
                                     field_suffix = ['_' samp_method];
@@ -763,6 +900,26 @@ classdef causal_experiment_engine_twostep
                                     state.inconsistency.(['mc_standard_error' field_suffix]) = mc_details.standard_error;
                                     state.inconsistency.(['mc_ci95_lower' field_suffix]) = mc_details.ci95_lower;
                                     state.inconsistency.(['mc_ci95_upper' field_suffix]) = mc_details.ci95_upper;
+                                    % Within-theta MFMC corrected estimate
+                                    if isfield(mc_details, 'I_MF') && ~isnan(mc_details.I_MF)
+                                        state.inconsistency.(['I_MF_' samp_method]) = mc_details.I_MF;
+                                    end
+                                    % Convergence curve: running mean at every 100-sample checkpoint
+                                    if isfield(mc_details, 'consistent_flags') && ~isempty(mc_details.consistent_flags)
+                                        flags_arr = double(mc_details.consistent_flags);
+                                        N_total   = length(flags_arr);
+                                        step      = 100;
+                                        chk_pts   = step:step:N_total;
+                                        if isempty(chk_pts) || chk_pts(end) < N_total
+                                            chk_pts(end+1) = N_total;
+                                        end
+                                        cum_sum = cumsum(flags_arr);
+                                        conv_curve = cum_sum(chk_pts) ./ chk_pts;
+                                        state.inconsistency.(['mc_convergence_' samp_method]) = conv_curve;
+                                        if ~isfield(state.inconsistency, 'mc_convergence_checkpoints')
+                                            state.inconsistency.mc_convergence_checkpoints = chk_pts;
+                                        end
+                                    end
                                 catch ME
                                     warning('Monte Carlo scoring failed for %s: %s', samp_method, ME.message);
                                     state.inconsistency.(['mc_probability_' samp_method]) = NaN;
@@ -793,12 +950,14 @@ classdef causal_experiment_engine_twostep
                                 i_theta_method = 'mc';  % Use MC for 'both' to match mc_probability values
                             end
                             
+                            t_itheta = tic;
                             [I_theta, I_details] = global_inconsistency(all_models, ...
                                 'n_samples', options.mc_samples, ...
                                 'method', i_theta_method, ...
                                 'return_details', true, ...
                                 'verbose', false);
-                            
+                            state.inconsistency.timing_I_theta_s = toc(t_itheta);
+
                             state.inconsistency.I_theta = I_theta;
                             state.inconsistency.I_theta_p_consistent = I_details.p_consistent;
                             state.inconsistency.I_theta_standard_error = I_details.standard_error;
@@ -846,6 +1005,13 @@ classdef causal_experiment_engine_twostep
                     post_state.inconsistency.jaccard_C - pre_state.inconsistency.jaccard_C;
                 delta.inconsistency.delta_jaccard_Csym = ...
                     post_state.inconsistency.jaccard_Csym - pre_state.inconsistency.jaccard_Csym;
+            end
+            
+            % Jaccard inconsistency changes (derived metric)
+            if isfield(pre_state.inconsistency, 'jaccard_inconsistency') && ...
+               isfield(post_state.inconsistency, 'jaccard_inconsistency')
+                delta.inconsistency.delta_jaccard_inconsistency = ...
+                    post_state.inconsistency.jaccard_inconsistency - pre_state.inconsistency.jaccard_inconsistency;
             end
             
             % MC probability changes
@@ -903,12 +1069,9 @@ classdef causal_experiment_engine_twostep
             F = eye(dim) + 0.01 * randn(dim);
             f = 0.1 * randn(dim, 1);
             
-            % Create conPolyZono objects
-            E = eye(dim);
-            A = []; b = []; EC = [];
-            
-            scenario.source = conPolyZono(source_center, G_src, E, A, b, EC);
-            scenario.target = conPolyZono(target_center, G_tgt, E, A, b, EC);
+            % Create conZonotope objects
+            scenario.source = conZonotope(source_center, G_src, [], []);
+            scenario.target = conZonotope(target_center, G_tgt, [], []);
             scenario.mapping = struct('F', F, 'f', f);
         end
         
@@ -925,13 +1088,10 @@ classdef causal_experiment_engine_twostep
                     else
                         factor = params.factor;
                     end
-                    scenario_modified.source = conPolyZono(...
+                    scenario_modified.source = conZonotope(...
                         scenario.source.c, ...
                         factor * scenario.source.G, ...
-                        scenario.source.E, ...
-                        scenario.source.A, ...
-                        scenario.source.b, ...
-                        scenario.source.EC);
+                        [], []);
                     
                 case 'shrink'
                     % Decrease source uncertainty
@@ -940,13 +1100,10 @@ classdef causal_experiment_engine_twostep
                     else
                         factor = params.factor;
                     end
-                    scenario_modified.source = conPolyZono(...
+                    scenario_modified.source = conZonotope(...
                         scenario.source.c, ...
                         factor * scenario.source.G, ...
-                        scenario.source.E, ...
-                        scenario.source.A, ...
-                        scenario.source.b, ...
-                        scenario.source.EC);
+                        [], []);
                     
                 case 'shift'
                     % Shift source center (relative shift: center * (1 + delta))
@@ -965,13 +1122,10 @@ classdef causal_experiment_engine_twostep
                         shift_vec = shift_fraction;
                     end
                     new_center = scenario.source.c .* (1 + shift_vec);
-                    scenario_modified.source = conPolyZono(...
+                    scenario_modified.source = conZonotope(...
                         new_center, ...
                         scenario.source.G, ...
-                        scenario.source.E, ...
-                        scenario.source.A, ...
-                        scenario.source.b, ...
-                        scenario.source.EC);
+                        [], []);
                     
                 case 'rotate'
                     % Rotate generator matrix
@@ -984,13 +1138,10 @@ classdef causal_experiment_engine_twostep
                         R = eye(dim);
                         R(1:2, 1:2) = [cos(angle), -sin(angle); sin(angle), cos(angle)];
                     end
-                    scenario_modified.source = conPolyZono(...
+                    scenario_modified.source = conZonotope(...
                         scenario.source.c, ...
                         R * scenario.source.G, ...
-                        scenario.source.E, ...
-                        scenario.source.A, ...
-                        scenario.source.b, ...
-                        scenario.source.EC);
+                        [], []);
                     
                 case 'correlate'
                     % Introduce correlation in generators
@@ -1007,17 +1158,107 @@ classdef causal_experiment_engine_twostep
                     if n_gen >= 2
                         G_new = G;
                         G_new(:, 2) = G(:, 1) * correlation + G(:, 2) * sqrt(1 - correlation^2);
-                        scenario_modified.source = conPolyZono(...
+                        scenario_modified.source = conZonotope(...
                             scenario.source.c, ...
                             G_new, ...
-                            scenario.source.E, ...
-                            scenario.source.A, ...
-                            scenario.source.b, ...
-                            scenario.source.EC);
+                            [], []);
                     end
                     
                 otherwise
                     error('Unknown intervention type: %s', intervention_type);
+            end
+        end
+        
+        function scenario_modified = apply_compound_intervention(scenario, theta_vector, param_names, options)
+            %APPLY_COMPOUND_INTERVENTION Apply multiple interventions simultaneously
+            %
+            % This function applies multiple intervention parameters at once, which
+            % is required for Saltelli sampling in global sensitivity analysis.
+            %
+            % Inputs:
+            %   scenario      - Baseline scenario struct
+            %   theta_vector  - [1×p] vector of parameter values (e.g., [1.5, 0.1, 0.7])
+            %   param_names   - {1×p} cell array of parameter names
+            %                   Options: 'scale_factor', 'center_delta', 'correlation_strength'
+            %   options       - (optional) struct with:
+            %                   .shift_direction: 'x', 'y', 'radial' (default: 'radial')
+            %                   .verbose: display progress (default: false)
+            %
+            % Outputs:
+            %   scenario_modified - Modified scenario with all interventions applied
+            %
+            % Example:
+            %   theta = [1.5, 0.05, 0.7];  % scale=1.5, shift=0.05, correlation=0.7
+            %   params = {'scale_factor', 'center_delta', 'correlation_strength'};
+            %   scenario_mod = causal_experiment_engine_twostep.apply_compound_intervention(...
+            %       scenario, theta, params);
+            %
+            % Notes:
+            %   - Interventions are applied in order: scale → shift → correlation
+            %   - scale_factor < 1 = shrink, > 1 = widen
+            %   - center_delta is a scalar fraction for relative shift
+            %   - correlation_strength ∈ [0,1]
+            
+            if nargin < 4
+                options = struct();
+            end
+            if ~isfield(options, 'shift_direction')
+                options.shift_direction = 'radial';
+            end
+            if ~isfield(options, 'verbose')
+                options.verbose = false;
+            end
+            
+            % Validate inputs
+            assert(length(theta_vector) == length(param_names), ...
+                'theta_vector length must match param_names length');
+            
+            % Start with baseline scenario
+            scenario_modified = scenario;
+            
+            if options.verbose
+                fprintf('  Compound: ');
+                for i = 1:length(param_names)
+                    fprintf('%s=%.3f ', param_names{i}, theta_vector(i));
+                end
+            end
+            
+            % Apply interventions in order: scale → shift → correlation
+            for i = 1:length(param_names)
+                param_name = param_names{i};
+                param_value = theta_vector(i);
+                
+                switch param_name
+                    case 'scale_factor'
+                        % Scale intervention (widen if >1, shrink if <1)
+                        params.scale_factor = param_value;
+                        if param_value >= 1.0
+                            scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                                scenario_modified, 'widen', params);
+                        else
+                            scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                                scenario_modified, 'shrink', params);
+                        end
+                        
+                    case 'center_delta'
+                        % Shift intervention (relative shift)
+                        params.center_delta = param_value;
+                        scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                            scenario_modified, 'shift', params);
+                        
+                    case 'correlation_strength'
+                        % Correlation intervention
+                        params.correlation_strength = param_value;
+                        scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
+                            scenario_modified, 'correlate', params);
+                        
+                    otherwise
+                        warning('Unknown parameter: %s (skipping)', param_name);
+                end
+            end
+            
+            if options.verbose
+                fprintf('✓\n');
             end
         end
         
@@ -1089,6 +1330,221 @@ classdef causal_experiment_engine_twostep
             fclose(fid);
         end
         
+        function compute_and_save_mfmc(results_dir, options)
+            %COMPUTE_AND_SAVE_MFMC  Step 3: MFMC variance reduction
+            %
+            % Reads each results_scenario_*.json in results_dir, computes the
+            % Multi-Fidelity MC correction per sampling method (alpha per scenario),
+            % and writes the corrected estimates alongside the original data.
+            %
+            % MFMC corrected estimator:
+            %   I_MF_m = I_MC_m + alpha_m * (mu_AABB - I_AABB)
+            %   alpha_m = Cov(I_MC_m, I_AABB) / Var(I_AABB)   [per scenario]
+            %
+            % New fields added to each experiment's post_state.inconsistency:
+            %   I_MF_sobol, I_MF_halton, I_MF_lhs, I_MF_random  (where data exists)
+            %
+            % New top-level block added to each scenario file:
+            %   mfmc_summary  ->  alpha, rho, rho_sq, variance_reduction, mu_AABB
+            %
+            % The original I_MC_* values are preserved unchanged.
+            %
+            % Inputs:
+            %   results_dir - Directory containing results_scenario_*.json files
+            %   options     - (optional) struct:
+            %       .verbose       [true]   Print progress
+            %       .scenario_ids  []       Limit to these IDs (empty = all)
+            %       .write_inplace [true]   Overwrite source JSON; false writes to
+            %                               results_dir/mfmc/ instead
+
+            if nargin < 2, options = struct(); end
+            if ~isfield(options, 'verbose'),       options.verbose       = true;  end
+            if ~isfield(options, 'scenario_ids'),  options.scenario_ids  = [];    end
+            if ~isfield(options, 'write_inplace'), options.write_inplace = true;  end
+
+            SAMPLING_METHODS = {'sobol', 'halton', 'lhs', 'random'};
+
+            json_files = dir(fullfile(results_dir, 'results_scenario_*.json'));
+            if isempty(json_files)
+                warning('compute_and_save_mfmc: no result files found in %s', results_dir);
+                return;
+            end
+
+            if options.verbose
+                fprintf('Step 3: MFMC correction — %d scenario file(s)...\n', length(json_files));
+            end
+
+            for fi = 1:length(json_files)
+                fname = json_files(fi).name;
+                fpath = fullfile(results_dir, fname);
+
+                % Parse scenario ID from filename
+                tok = regexp(fname, 'results_scenario_(\d+)\.json', 'tokens');
+                if isempty(tok), continue; end
+                scenario_id = str2double(tok{1}{1});
+
+                % Filter
+                if ~isempty(options.scenario_ids) && ~ismember(scenario_id, options.scenario_ids)
+                    continue;
+                end
+
+                if options.verbose
+                    fprintf('  scenario_%d ... ', scenario_id);
+                end
+
+                % --- Load ---
+                fid = fopen(fpath, 'r');
+                raw = fread(fid, inf, 'uint8=>char')';
+                fclose(fid);
+                data = jsondecode(raw);
+
+                if ~isfield(data, 'experiments') || isempty(data.experiments)
+                    if options.verbose, fprintf('[SKIP] no experiments\n'); end
+                    continue;
+                end
+
+                exps    = data.experiments;   % struct array or cell array
+                n_exp   = numel(exps);
+                is_cell = iscell(exps);
+
+                % --- Extract I_AABB, I_MC, and jaccard_valid per method ---
+                I_AABB        = NaN(n_exp, 1);
+                jaccard_valid = false(n_exp, 1);  % true only when zonotopes intersect
+                I_MC          = NaN(n_exp, length(SAMPLING_METHODS));
+
+                for i = 1:n_exp
+                    try
+                        if is_cell
+                            inc = exps{i}.post_state.inconsistency;
+                        else
+                            inc = exps(i).post_state.inconsistency;
+                        end
+                        % Only mark as valid when jaccard_index is a real number.
+                        % Non-intersecting experiments (null jaccard) are excluded
+                        % from MFMC estimation — the control-variate assumption
+                        % requires gradation in I_AABB, which is absent when all
+                        % non-intersecting cases are collapsed to 0.
+                        if isfield(inc, 'jaccard_index') && ...
+                           ~isempty(inc.jaccard_index) && ...
+                           isnumeric(inc.jaccard_index) && ...
+                           ~isnan(inc.jaccard_index)
+                            I_AABB(i)        = inc.jaccard_index;
+                            jaccard_valid(i) = true;
+                        end
+                        for m = 1:length(SAMPLING_METHODS)
+                            f = sprintf('mc_probability_%s', SAMPLING_METHODS{m});
+                            if isfield(inc, f) && ~isempty(inc.(f))
+                                I_MC(i, m) = inc.(f);
+                            end
+                        end
+                    catch
+                        % Skip experiments with unexpected structure
+                    end
+                end
+
+                % --- Compute MFMC alpha per sampling method ---
+                % α and μ_AABB are estimated from intersecting experiments only.
+                % The correction is then applied exclusively to those experiments;
+                % non-intersecting experiments receive NaN (field not written).
+                mfmc_summary = struct();
+                mfmc_summary.computed_at = char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss'));
+                I_MF = NaN(n_exp, length(SAMPLING_METHODS));
+
+                for m = 1:length(SAMPLING_METHODS)
+                    mc           = I_MC(:, m);
+                    % Restrict estimation to intersecting experiments
+                    intersecting = jaccard_valid & ~isnan(mc);
+                    if sum(intersecting) < 3, continue; end
+
+                    aabb_v  = I_AABB(intersecting);
+                    mc_v    = mc(intersecting);
+                    mu_aabb = mean(aabb_v);
+
+                    C           = cov([mc_v, aabb_v]);   % 2x2 sample covariance
+                    var_aabb    = C(2, 2);
+                    cov_mc_aabb = C(1, 2);
+
+                    if var_aabb < 1e-12, continue; end   % AABB has no variation
+
+                    alpha = cov_mc_aabb / var_aabb;
+                    rho   = cov_mc_aabb / (std(mc_v) * std(aabb_v) + 1e-12);
+
+                    % Apply correction only to intersecting experiments
+                    I_MF_m               = NaN(n_exp, 1);
+                    I_MF_m(intersecting) = mc(intersecting) + alpha .* (mu_aabb - I_AABB(intersecting));
+                    I_MF_m(intersecting) = max(0.0, min(1.0, I_MF_m(intersecting)));
+                    I_MF(:, m)           = I_MF_m;
+
+                    var_mc             = var(mc_v);
+                    finite_mf          = I_MF_m(~isnan(I_MF_m));
+                    var_mf             = var(finite_mf);
+                    variance_reduction = 1.0 - var_mf / (var_mc + 1e-12);
+
+                    s                    = struct();
+                    s.alpha              = alpha;
+                    s.rho                = rho;
+                    s.rho_sq             = rho^2;
+                    s.variance_reduction = variance_reduction;
+                    s.mu_AABB            = mu_aabb;
+                    s.n_intersecting     = sum(intersecting);
+                    s.n_experiments      = n_exp;
+                    mfmc_summary.(SAMPLING_METHODS{m}) = s;
+                end
+
+                % --- Augment each experiment with I_MF_* fields ---
+                for i = 1:n_exp
+                    for m = 1:length(SAMPLING_METHODS)
+                        if isnan(I_MF(i, m)), continue; end
+                        field = sprintf('I_MF_%s', SAMPLING_METHODS{m});
+                        try
+                            if is_cell
+                                data.experiments{i}.post_state.inconsistency.(field) = I_MF(i, m);
+                            else
+                                data.experiments(i).post_state.inconsistency.(field) = I_MF(i, m);
+                            end
+                        catch
+                            % Skip if field cannot be set
+                        end
+                    end
+                end
+                data.mfmc_summary = mfmc_summary;
+
+                % --- Write ---
+                if options.write_inplace
+                    out_path = fpath;
+                else
+                    mfmc_dir = fullfile(results_dir, 'mfmc');
+                    if ~exist(mfmc_dir, 'dir'), mkdir(mfmc_dir); end
+                    out_path = fullfile(mfmc_dir, fname);
+                end
+
+                json_text = jsonencode(data, 'PrettyPrint', true);
+                wid = fopen(out_path, 'w');
+                if wid == -1
+                    error('compute_and_save_mfmc: cannot write to %s', out_path);
+                end
+                fprintf(wid, '%s', json_text);
+                fclose(wid);
+
+                % Progress line
+                if options.verbose
+                    methods_done = fieldnames(mfmc_summary);
+                    methods_done = methods_done(~strcmp(methods_done, 'computed_at'));
+                    if ~isempty(methods_done)
+                        parts = cellfun(@(m) sprintf('%s:rho=%.3f', m, mfmc_summary.(m).rho), ...
+                            methods_done, 'UniformOutput', false);
+                        fprintf('[%s]\n', strjoin(parts, '  '));
+                    else
+                        fprintf('[no MC data]\n');
+                    end
+                end
+            end
+
+            if options.verbose
+                fprintf('  Done.\n');
+            end
+        end
+
         function json_data = prepare_for_json(data)
             %PREPARE_FOR_JSON Recursively convert data for JSON export
             

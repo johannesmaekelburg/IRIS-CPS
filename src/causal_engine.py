@@ -159,6 +159,87 @@ def contains_points_batch(Z: Zonotope, X: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Alternative scoring methods  (AABB Jaccard, MC Jaccard)
+# ---------------------------------------------------------------------------
+
+def aabb_jaccard(Z1: Zonotope, Z2: Zonotope) -> float:
+    """Axis-Aligned Bounding Box Jaccard index between two zonotopes.
+
+    Over-approximates each zonotope by its interval hull and computes the
+    closed-form Jaccard index of the resulting boxes:
+
+        J_AABB = ∏_j max(0, min(b1_j,b2_j) - max(a1_j,a2_j))
+               / ∏_j (max(b1_j,b2_j) - min(a1_j,a2_j))
+
+    Cost: O(d·γ) — essentially instant.
+    Returns value in [0, 1].  Biased upward (over-estimates overlap, hence
+    under-estimates inconsistency).
+    """
+    lo1, hi1 = Z1.interval_bounds()
+    lo2, hi2 = Z2.interval_bounds()
+
+    # Intersection box
+    inter_lo = np.maximum(lo1, lo2)
+    inter_hi = np.minimum(hi1, hi2)
+    inter_widths = np.maximum(0.0, inter_hi - inter_lo)
+
+    # Union box
+    union_lo = np.minimum(lo1, lo2)
+    union_hi = np.maximum(hi1, hi2)
+    union_widths = union_hi - union_lo
+
+    if np.any(union_widths <= 0):
+        return 0.0
+
+    vol_inter = float(np.prod(inter_widths))
+    vol_union = float(np.prod(union_widths))
+
+    return vol_inter / vol_union if vol_union > 0 else 0.0
+
+
+def mc_jaccard(
+    Z1: Zonotope,
+    Z2: Zonotope,
+    n_samples: int = 2000,
+    seed: Optional[int] = None,
+) -> Dict:
+    """Monte Carlo estimate of the Jaccard index between two zonotopes.
+
+    Samples uniformly from the union bounding box and estimates
+    J(Z1, Z2) = vol(Z1 ∩ Z2) / vol(Z1 ∪ Z2).
+
+    Cost: O(N·d·γ) — each point requires membership LP.
+    """
+    rng = np.random.default_rng(seed)
+
+    lo1, hi1 = Z1.interval_bounds()
+    lo2, hi2 = Z2.interval_bounds()
+    lo = np.minimum(lo1, lo2)
+    hi = np.maximum(hi1, hi2)
+
+    d = len(lo)
+    points = rng.uniform(lo, hi, size=(n_samples, d))
+
+    in_Z1 = contains_points_batch(Z1, points)
+    in_Z2 = contains_points_batch(Z2, points)
+
+    n_inter = int((in_Z1 & in_Z2).sum())
+    n_union = int((in_Z1 | in_Z2).sum())
+
+    jaccard = n_inter / n_union if n_union > 0 else 0.0
+    se = np.sqrt(jaccard * (1 - jaccard) / max(1, n_union))
+
+    return {
+        "jaccard": jaccard,
+        "I_theta": 1.0 - jaccard,
+        "n_samples": n_samples,
+        "n_intersection": n_inter,
+        "n_union": n_union,
+        "standard_error": se,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Interventions  (do-operator on θ)
 # ---------------------------------------------------------------------------
 
@@ -353,6 +434,38 @@ def compute_I_theta(
     return mc_consistency_probability([Z_prop, scenario.target], n_samples, seed)
 
 
+def compute_I_theta_aabb(
+    scenario: Scenario,
+    source_override: Optional[Zonotope] = None,
+) -> Dict:
+    """AABB Jaccard inconsistency: I_AABB(θ) = 1 − J_AABB(Z_prop, Z_target).
+
+    Closed-form, no sampling.  Cost: O(d·γ).
+    """
+    source = source_override if source_override is not None else scenario.source
+    Z_prop = affine_map(source, scenario.F, scenario.f)
+    j = aabb_jaccard(Z_prop, scenario.target)
+    return {
+        "I_theta": 1.0 - j,
+        "jaccard_aabb": j,
+        "standard_error": 0.0,
+        "p_consistent": j,
+        "n_samples": 0,
+    }
+
+
+def compute_I_theta_mc_jaccard(
+    scenario: Scenario,
+    source_override: Optional[Zonotope] = None,
+    n_samples: int = 2000,
+    seed: Optional[int] = None,
+) -> Dict:
+    """MC Jaccard inconsistency: I_Jac(θ) = 1 − J_MC(Z_prop, Z_target)."""
+    source = source_override if source_override is not None else scenario.source
+    Z_prop = affine_map(source, scenario.F, scenario.f)
+    return mc_jaccard(Z_prop, scenario.target, n_samples, seed)
+
+
 # ---------------------------------------------------------------------------
 # Saltelli sampling  +  Sobol analysis
 # ---------------------------------------------------------------------------
@@ -413,6 +526,7 @@ def evaluate_samples(
     mc_samples: int = 2000,
     seed: Optional[int] = None,
     verbose: bool = True,
+    estimator: str = "mc_probability",
 ) -> np.ndarray:
     """Evaluate I(θ) for each row of the Saltelli sample matrix.
 
@@ -423,6 +537,7 @@ def evaluate_samples(
         mc_samples:  MC samples per I(θ) evaluation
         seed:        base seed (incremented per sample for independence)
         verbose:     print progress
+        estimator:   'mc_probability' (default), 'mc_jaccard', or 'aabb_jaccard'
 
     Returns:
         Y: array of shape (N_total,) with I(θ) values
@@ -433,13 +548,25 @@ def evaluate_samples(
     rng = np.random.default_rng(seed)
     seeds = rng.integers(0, 2**31, size=N_total)
 
-    pbar = tqdm(range(N_total), desc="Saltelli samples", unit="eval",
+    desc = f"Saltelli [{estimator}]"
+    pbar = tqdm(range(N_total), desc=desc, unit="eval",
                 disable=not verbose)
     for i in pbar:
         theta = dict(zip(param_names, samples[i]))
         Z_intervened = apply_compound_intervention(scenario.source, theta)
-        result = compute_I_theta(scenario, source_override=Z_intervened,
-                                 n_samples=mc_samples, seed=int(seeds[i]))
+
+        if estimator == "mc_probability":
+            result = compute_I_theta(scenario, source_override=Z_intervened,
+                                     n_samples=mc_samples, seed=int(seeds[i]))
+        elif estimator == "mc_jaccard":
+            result = compute_I_theta_mc_jaccard(
+                scenario, source_override=Z_intervened,
+                n_samples=mc_samples, seed=int(seeds[i]))
+        elif estimator == "aabb_jaccard":
+            result = compute_I_theta_aabb(scenario, source_override=Z_intervened)
+        else:
+            raise ValueError(f"Unknown estimator: {estimator}")
+
         Y[i] = result["I_theta"]
         pbar.set_postfix({"I(θ)": f"{Y[i]:.4f}"}, refresh=False)
     return Y
@@ -454,10 +581,15 @@ def run_sobol_analysis(
     verbose: bool = True,
     param_names: Optional[List[str]] = None,
     param_bounds: Optional[List[List[float]]] = None,
+    estimator: str = "mc_probability",
 ) -> Dict:
     """End-to-end: Saltelli sampling → I(θ) evaluation → Sobol indices.
 
     No surrogate model — evaluates the true I(θ) at every sample point.
+
+    Args:
+        estimator: 'mc_probability' (default), 'mc_jaccard', or 'aabb_jaccard'.
+                   For multi-fidelity, use run_multifidelity_sobol_analysis().
     """
     if not SALIB_AVAILABLE:
         raise ImportError("SALib required. Install: pip install SALib")
@@ -471,6 +603,7 @@ def run_sobol_analysis(
         print(f"SOBOL SENSITIVITY ANALYSIS  (direct, no surrogate)")
         print(f"{'='*70}")
         print(f"Scenario       : {scenario.name}")
+        print(f"Estimator      : {estimator}")
         print(f"Parameters     : {problem['names']}")
         print(f"Bounds         : {problem['bounds']}")
         print(f"Saltelli N     : {N}  →  {n_eval} total evaluations")
@@ -484,7 +617,8 @@ def run_sobol_analysis(
 
     # 2. Evaluate I(θ) at every sample
     Y = evaluate_samples(scenario, samples, problem["names"],
-                         mc_samples=mc_samples, seed=seed, verbose=verbose)
+                         mc_samples=mc_samples, seed=seed, verbose=verbose,
+                         estimator=estimator)
 
     # 3. Sobol decomposition
     Si = sobol_analyzer.analyze(problem, Y, calc_second_order=calc_second_order)
@@ -492,6 +626,7 @@ def run_sobol_analysis(
     results = {
         "problem": problem,
         "N": N,
+        "estimator": estimator,
         "n_evaluations": n_eval,
         "mc_samples_per_eval": mc_samples,
         "Y_mean": float(Y.mean()),
@@ -521,6 +656,815 @@ def run_sobol_analysis(
         print(f"{'='*70}\n")
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Multi-fidelity estimator  (AABB low-fidelity + MC high-fidelity)
+# ---------------------------------------------------------------------------
+
+def evaluate_samples_multifidelity(
+    scenario: Scenario,
+    samples: np.ndarray,
+    param_names: List[str],
+    mc_samples: int = 2000,
+    hf_fraction: float = 0.2,
+    seed: Optional[int] = None,
+    verbose: bool = True,
+    hf_estimator: str = "mc_probability",
+) -> Dict:
+    """Multi-fidelity evaluation: AABB (low-fidelity) + MC (high-fidelity).
+
+    Step 1: Evaluate I_AABB(θ) at ALL sample points — closed-form, free.
+    Step 2: Evaluate I_HF(θ) at a pilot subset (n_HF = hf_fraction * N).
+    Step 3: Fit linear regression  I_HF ~ I_AABB  from pilot pairs,
+            compute correlation ρ and control variate coefficient α*.
+    Step 4: Construct regression-corrected Y at all points for Sobol.
+
+    Control variate estimator for the mean:
+        I_MF = mean(I_HF) + α* · (mean(I_LF_all) − mean(I_LF_subset))
+    with  Var(I_MF) = Var(I_HF) · (1 − ρ²).
+
+    Returns dict with Y_corrected (for Sobol), diagnostics, and pilot data.
+    """
+    N_total = samples.shape[0]
+    rng = np.random.default_rng(seed)
+
+    # --- Step 1: AABB at ALL points (instant) ---
+    if verbose:
+        print(f"  [MF Step 1] Evaluating AABB Jaccard at all {N_total} points...")
+    Y_lf = np.empty(N_total)
+    for i in range(N_total):
+        theta = dict(zip(param_names, samples[i]))
+        Z_int = apply_compound_intervention(scenario.source, theta)
+        Y_lf[i] = compute_I_theta_aabb(scenario, source_override=Z_int)["I_theta"]
+
+    # --- Step 2: HF at pilot subset ---
+    n_hf = max(10, int(hf_fraction * N_total))
+    n_hf = min(n_hf, N_total)
+    hf_idx = np.sort(rng.choice(N_total, size=n_hf, replace=False))
+
+    if verbose:
+        print(f"  [MF Step 2] Evaluating {hf_estimator} at "
+              f"{n_hf}/{N_total} pilot points...")
+
+    hf_seeds = rng.integers(0, 2**31, size=n_hf)
+    Y_hf = np.empty(n_hf)
+
+    pbar = tqdm(range(n_hf), desc="HF pilot", unit="eval", disable=not verbose)
+    for j in pbar:
+        i = hf_idx[j]
+        theta = dict(zip(param_names, samples[i]))
+        Z_int = apply_compound_intervention(scenario.source, theta)
+
+        if hf_estimator == "mc_probability":
+            result = compute_I_theta(scenario, source_override=Z_int,
+                                     n_samples=mc_samples, seed=int(hf_seeds[j]))
+        elif hf_estimator == "mc_jaccard":
+            result = compute_I_theta_mc_jaccard(
+                scenario, source_override=Z_int,
+                n_samples=mc_samples, seed=int(hf_seeds[j]))
+        else:
+            raise ValueError(f"Unknown hf_estimator: {hf_estimator}")
+
+        Y_hf[j] = result["I_theta"]
+        pbar.set_postfix({"I(θ)": f"{Y_hf[j]:.4f}"}, refresh=False)
+
+    # --- Step 3: Correlation + control variate coefficient ---
+    Y_lf_subset = Y_lf[hf_idx]
+
+    if np.std(Y_hf) > 1e-12 and np.std(Y_lf_subset) > 1e-12:
+        rho = float(np.corrcoef(Y_hf, Y_lf_subset)[0, 1])
+    else:
+        rho = 0.0
+
+    cov_hl = np.cov(Y_hf, Y_lf_subset, ddof=1)[0, 1]
+    var_lf = np.var(Y_lf_subset, ddof=1)
+    alpha_star = -cov_hl / var_lf if var_lf > 1e-15 else 0.0
+
+    var_reduction = 1.0 - rho ** 2
+
+    # --- Step 4: Regression-corrected Y for Sobol ---
+    if var_lf > 1e-15:
+        b = cov_hl / var_lf          # regression slope  (I_HF ~ I_LF)
+        a = np.mean(Y_hf) - b * np.mean(Y_lf_subset)  # intercept
+        Y_corrected = a + b * Y_lf
+    else:
+        a, b = float(np.mean(Y_hf)), 0.0
+        Y_corrected = np.full(N_total, np.mean(Y_hf))
+
+    # Control variate estimator for the mean
+    mean_hf = float(np.mean(Y_hf))
+    mean_lf_all = float(np.mean(Y_lf))
+    mean_lf_sub = float(np.mean(Y_lf_subset))
+    I_mf = mean_hf + alpha_star * (mean_lf_all - mean_lf_sub)
+
+    if verbose:
+        print(f"\n  [MF Step 3] Pilot diagnostics:")
+        print(f"    rho(HF, LF)       = {rho:.4f}")
+        print(f"    alpha*            = {alpha_star:.4f}")
+        print(f"    Var reduction     = {var_reduction:.4f}  (1 - rho^2)")
+        if var_reduction > 0.01:
+            print(f"    Effective speedup ~ {1/var_reduction:.1f}x")
+        else:
+            print(f"    Effective speedup ~ 1x (low correlation)")
+        print(f"    I_MF (cv mean)    = {I_mf:.4f}")
+        print(f"    I_HF (pilot mean) = {mean_hf:.4f}")
+        print(f"    I_LF (all mean)   = {mean_lf_all:.4f}")
+        print(f"    Regression: I ~ {a:.4f} + {b:.4f} * I_AABB")
+
+    return {
+        "Y_corrected": Y_corrected,
+        "Y_lf": Y_lf,
+        "Y_hf": Y_hf,
+        "hf_idx": hf_idx,
+        "n_hf": n_hf,
+        "n_lf": N_total,
+        "rho": rho,
+        "alpha_star": alpha_star,
+        "variance_reduction": var_reduction,
+        "I_mf_mean": I_mf,
+        "I_hf_mean": mean_hf,
+        "I_lf_mean": mean_lf_all,
+        "regression_intercept": float(a),
+        "regression_slope": float(b),
+    }
+
+
+def run_multifidelity_sobol_analysis(
+    scenario: Scenario,
+    N: int = 512,
+    mc_samples: int = 2000,
+    hf_fraction: float = 0.2,
+    calc_second_order: bool = False,
+    seed: int = 42,
+    verbose: bool = True,
+    param_names: Optional[List[str]] = None,
+    param_bounds: Optional[List[List[float]]] = None,
+    hf_estimator: str = "mc_probability",
+) -> Dict:
+    """Multi-fidelity Sobol analysis: AABB everywhere + MC at a subset.
+
+    Uses regression-corrected I(θ) values for the Sobol decomposition.
+    Reports correlation ρ, variance reduction factor, and comparison to
+    pure-LF and pure-HF (pilot) Sobol estimates.
+    """
+    if not SALIB_AVAILABLE:
+        raise ImportError("SALib required. Install: pip install SALib")
+
+    problem = make_salib_problem(param_names, param_bounds)
+    p = problem["num_vars"]
+    n_eval = N * (2 * p + 2) if calc_second_order else N * (p + 2)
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"MULTI-FIDELITY SOBOL ANALYSIS")
+        print(f"{'='*70}")
+        print(f"Scenario       : {scenario.name}")
+        print(f"HF estimator   : {hf_estimator}")
+        print(f"HF fraction    : {hf_fraction:.0%}  ({int(hf_fraction * n_eval)}/{n_eval})")
+        print(f"Parameters     : {problem['names']}")
+        print(f"Bounds         : {problem['bounds']}")
+        print(f"Saltelli N     : {N}  ->  {n_eval} total points")
+        print(f"MC samples/eval: {mc_samples}")
+        print(f"{'='*70}\n")
+
+    # 1. Generate Saltelli samples
+    samples = generate_saltelli_samples(problem, N, calc_second_order, seed)
+    assert samples.shape == (n_eval, p)
+
+    # 2. Multi-fidelity evaluation
+    mf = evaluate_samples_multifidelity(
+        scenario, samples, problem["names"],
+        mc_samples=mc_samples, hf_fraction=hf_fraction,
+        seed=seed, verbose=verbose, hf_estimator=hf_estimator,
+    )
+
+    # 3. Sobol on regression-corrected values
+    Y_mf = mf["Y_corrected"]
+    Si_mf = sobol_analyzer.analyze(problem, Y_mf,
+                                   calc_second_order=calc_second_order)
+
+    # 4. Sobol on pure LF for comparison
+    Y_lf = mf["Y_lf"]
+    Si_lf = sobol_analyzer.analyze(problem, Y_lf,
+                                   calc_second_order=calc_second_order)
+
+    results = {
+        "problem": problem,
+        "N": N,
+        "estimator": "multi_fidelity",
+        "hf_estimator": hf_estimator,
+        "n_evaluations": n_eval,
+        "n_hf_evaluations": mf["n_hf"],
+        "mc_samples_per_eval": mc_samples,
+        "hf_fraction": hf_fraction,
+        "rho": mf["rho"],
+        "alpha_star": mf["alpha_star"],
+        "variance_reduction": mf["variance_reduction"],
+        "regression_intercept": mf["regression_intercept"],
+        "regression_slope": mf["regression_slope"],
+        "I_mf_mean": mf["I_mf_mean"],
+        "I_hf_mean": mf["I_hf_mean"],
+        "I_lf_mean": mf["I_lf_mean"],
+        # Multi-fidelity Sobol indices
+        "Y_mean": float(Y_mf.mean()),
+        "Y_std": float(Y_mf.std()),
+        "Y_min": float(Y_mf.min()),
+        "Y_max": float(Y_mf.max()),
+        "first_order": dict(zip(problem["names"], Si_mf["S1"].tolist())),
+        "first_order_conf": dict(zip(problem["names"], Si_mf["S1_conf"].tolist())),
+        "total_order": dict(zip(problem["names"], Si_mf["ST"].tolist())),
+        "total_order_conf": dict(zip(problem["names"], Si_mf["ST_conf"].tolist())),
+        # Pure LF Sobol indices (for comparison)
+        "lf_first_order": dict(zip(problem["names"], Si_lf["S1"].tolist())),
+        "lf_total_order": dict(zip(problem["names"], Si_lf["ST"].tolist())),
+        # Raw arrays (for diagnostics / plotting)
+        "_mf_data": mf,
+    }
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print("MULTI-FIDELITY SOBOL INDICES")
+        print(f"{'='*70}")
+        print(f"Correlation rho          = {mf['rho']:.4f}")
+        print(f"Variance reduction       = {mf['variance_reduction']:.4f}")
+        if mf["variance_reduction"] > 0.01:
+            print(f"Effective speedup        ~ {1/mf['variance_reduction']:.1f}x")
+        print(f"I(theta) corrected: mean={Y_mf.mean():.4f}, std={Y_mf.std():.4f}")
+
+        print(f"\n{'Parameter':<25s} {'S1_MF':>8s} {'S1_LF':>8s}  "
+              f"{'ST_MF':>8s} {'ST_LF':>8s}")
+        print("-" * 70)
+        for name in problem["names"]:
+            s1m = results["first_order"][name]
+            s1l = results["lf_first_order"][name]
+            stm = results["total_order"][name]
+            stl = results["lf_total_order"][name]
+            print(f"{name:<25s} {s1m:>8.4f} {s1l:>8.4f}  "
+                  f"{stm:>8.4f} {stl:>8.4f}")
+        print(f"{'='*70}\n")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Estimator comparison
+# ---------------------------------------------------------------------------
+
+_ESTIMATOR_LABELS = {
+    "mc_probability": r"$I_{\mathrm{MC\;prob}}$",
+    "mc_jaccard": r"$I_{\mathrm{MC\;Jac}}$",
+    "aabb_jaccard": r"$I_{\mathrm{AABB}}$",
+    "multi_fidelity": r"$I_{\mathrm{MF}}$",
+}
+
+_ESTIMATOR_COLORS = {
+    "mc_probability": "#4878CF",
+    "mc_jaccard": "#6ACC65",
+    "aabb_jaccard": "#D65F5F",
+    "multi_fidelity": "#B47CC7",
+}
+
+
+def run_estimator_comparison(
+    scenario: Scenario,
+    N: int = 256,
+    mc_samples: int = 2000,
+    mf_hf_fraction: float = 0.2,
+    calc_second_order: bool = False,
+    seed: int = 42,
+    verbose: bool = True,
+    param_names: Optional[List[str]] = None,
+    param_bounds: Optional[List[List[float]]] = None,
+) -> Dict:
+    """Run all four estimators on the same Saltelli samples and compare.
+
+    Returns dict with per-estimator Y arrays, Sobol indices, pairwise
+    correlations, and timing information.
+    """
+    import time
+
+    if not SALIB_AVAILABLE:
+        raise ImportError("SALib required. Install: pip install SALib")
+
+    problem = make_salib_problem(param_names, param_bounds)
+    p = problem["num_vars"]
+    n_eval = N * (2 * p + 2) if calc_second_order else N * (p + 2)
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print("ESTIMATOR COMPARISON")
+        print(f"{'='*70}")
+        print(f"Scenario       : {scenario.name}  (dim={scenario.dim})")
+        print(f"Saltelli N     : {N}  ->  {n_eval} total points")
+        print(f"MC samples/eval: {mc_samples}")
+        print(f"MF HF fraction : {mf_hf_fraction:.0%}")
+        print(f"{'='*70}\n")
+
+    # Generate samples once — shared across all estimators
+    samples = generate_saltelli_samples(problem, N, calc_second_order, seed)
+    assert samples.shape == (n_eval, p)
+
+    estimators = ["aabb_jaccard", "mc_jaccard", "mc_probability", "multi_fidelity"]
+    Y_all: Dict[str, np.ndarray] = {}
+    sobol_all: Dict[str, Dict] = {}
+    timing: Dict[str, float] = {}
+
+    for est in estimators:
+        if verbose:
+            print(f"\n--- Evaluating: {est} ---")
+
+        t0 = time.perf_counter()
+
+        if est == "multi_fidelity":
+            mf = evaluate_samples_multifidelity(
+                scenario, samples, problem["names"],
+                mc_samples=mc_samples, hf_fraction=mf_hf_fraction,
+                seed=seed, verbose=verbose,
+            )
+            Y_all[est] = mf["Y_corrected"]
+            Y_all["_mf_data"] = mf  # keep for diagnostics
+        else:
+            Y_all[est] = evaluate_samples(
+                scenario, samples, problem["names"],
+                mc_samples=mc_samples, seed=seed, verbose=verbose,
+                estimator=est,
+            )
+
+        timing[est] = time.perf_counter() - t0
+
+        # Sobol on this Y
+        Si = sobol_analyzer.analyze(
+            problem, Y_all[est], calc_second_order=calc_second_order)
+        sobol_all[est] = {
+            "first_order": dict(zip(problem["names"], Si["S1"].tolist())),
+            "first_order_conf": dict(zip(problem["names"], Si["S1_conf"].tolist())),
+            "total_order": dict(zip(problem["names"], Si["ST"].tolist())),
+            "total_order_conf": dict(zip(problem["names"], Si["ST_conf"].tolist())),
+        }
+
+    # --- Pairwise correlations ---
+    est_keys = [e for e in estimators]
+    n_est = len(est_keys)
+    corr_matrix = np.eye(n_est)
+    for i in range(n_est):
+        for j in range(i + 1, n_est):
+            Yi, Yj = Y_all[est_keys[i]], Y_all[est_keys[j]]
+            if np.std(Yi) > 1e-12 and np.std(Yj) > 1e-12:
+                rho = float(np.corrcoef(Yi, Yj)[0, 1])
+            else:
+                rho = 0.0
+            corr_matrix[i, j] = rho
+            corr_matrix[j, i] = rho
+
+    # --- Print summary ---
+    if verbose:
+        print(f"\n{'='*70}")
+        print("ESTIMATOR COMPARISON — RESULTS")
+        print(f"{'='*70}")
+
+        # Timing
+        print(f"\n{'Estimator':<20s} {'Time (s)':>10s} {'Mean I':>8s} {'Std I':>8s}")
+        print("-" * 50)
+        for est in estimators:
+            Y = Y_all[est]
+            print(f"{est:<20s} {timing[est]:>10.1f} {Y.mean():>8.4f} {Y.std():>8.4f}")
+
+        # Correlations
+        print(f"\nPairwise Pearson correlations:")
+        header = f"{'':>20s}" + "".join(f" {e:>14s}" for e in est_keys)
+        print(header)
+        for i, ei in enumerate(est_keys):
+            row = f"{ei:>20s}"
+            for j in range(n_est):
+                row += f" {corr_matrix[i, j]:>14.4f}"
+            print(row)
+
+        # Sobol comparison
+        print(f"\nSobol first-order indices (S1):")
+        header = f"{'Parameter':<25s}" + "".join(
+            f" {e:>14s}" for e in est_keys)
+        print(header)
+        print("-" * (25 + 15 * n_est))
+        for name in problem["names"]:
+            row = f"{name:<25s}"
+            for est in est_keys:
+                row += f" {sobol_all[est]['first_order'][name]:>14.4f}"
+            print(row)
+
+        print(f"\nSobol total-effect indices (ST):")
+        print(header)
+        print("-" * (25 + 15 * n_est))
+        for name in problem["names"]:
+            row = f"{name:<25s}"
+            for est in est_keys:
+                row += f" {sobol_all[est]['total_order'][name]:>14.4f}"
+            print(row)
+
+        print(f"{'='*70}\n")
+
+    return {
+        "problem": problem,
+        "N": N,
+        "n_evaluations": n_eval,
+        "mc_samples_per_eval": mc_samples,
+        "estimators": estimators,
+        "Y": {k: v for k, v in Y_all.items() if k != "_mf_data"},
+        "_mf_data": Y_all.get("_mf_data"),
+        "sobol": sobol_all,
+        "correlations": corr_matrix,
+        "timing": timing,
+    }
+
+
+def plot_estimator_comparison(
+    comp: Dict,
+    scenario_name: str = "",
+    output_path: Optional[str | Path] = None,
+    figsize: Tuple[float, float] = (16, 12),
+) -> plt.Figure:
+    """Five-panel comparison plot for all estimators.
+
+    Row 1: Pairwise scatter (MC prob vs each other), correlation heatmap.
+    Row 2: Sobol S1 grouped bar chart, Sobol ST grouped bar chart.
+    """
+    estimators = comp["estimators"]
+    Y = comp["Y"]
+    sobol = comp["sobol"]
+    corr = comp["correlations"]
+    problem = comp["problem"]
+    names = problem["names"]
+    n_est = len(estimators)
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1])
+
+    # --- Row 1, left & center: pairwise scatters vs mc_probability ---
+    ref = "mc_probability"
+    others = [e for e in estimators if e != ref]
+    for col_idx, est in enumerate(others[:3]):
+        ax = fig.add_subplot(gs[0, col_idx])
+        Yr = Y[ref]
+        Ye = Y[est]
+        ax.scatter(Yr, Ye, s=8, alpha=0.4,
+                   color=_ESTIMATOR_COLORS[est], edgecolors="none")
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.3, linewidth=0.8)
+
+        # Compute rho
+        ri = estimators.index(ref)
+        ei = estimators.index(est)
+        rho = corr[ri, ei]
+        ax.set_xlabel(_ESTIMATOR_LABELS[ref], fontsize=11)
+        ax.set_ylabel(_ESTIMATOR_LABELS[est], fontsize=11)
+        ax.set_title(r"$\rho$ = " + f"{rho:.4f}", fontsize=12,
+                     fontweight="bold")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(alpha=0.25)
+
+    # --- Row 2, left: S1 grouped bar ---
+    ax_s1 = fig.add_subplot(gs[1, 0:2])
+    x = np.arange(len(names))
+    total_w = 0.75
+    w = total_w / n_est
+    for k, est in enumerate(estimators):
+        vals = [sobol[est]["first_order"][n] for n in names]
+        confs = [sobol[est]["first_order_conf"][n] for n in names]
+        offset = -total_w / 2 + w * (k + 0.5)
+        ax_s1.bar(x + offset, vals, w, yerr=confs, capsize=2,
+                  color=_ESTIMATOR_COLORS[est], edgecolor="white",
+                  linewidth=0.5, label=_ESTIMATOR_LABELS[est], zorder=3)
+    ax_s1.set_xticks(x)
+    ax_s1.set_xticklabels([PARAM_LABELS.get(n, n) for n in names], fontsize=10)
+    ax_s1.set_ylabel("Sobol Index", fontsize=11)
+    ax_s1.set_title(r"First-order $S_i$", fontsize=12, fontweight="bold")
+    ax_s1.legend(fontsize=8, ncol=n_est, loc="upper right")
+    ax_s1.grid(axis="y", alpha=0.25)
+    ax_s1.set_axisbelow(True)
+
+    # --- Row 2, right: ST grouped bar ---
+    ax_st = fig.add_subplot(gs[1, 2])
+    for k, est in enumerate(estimators):
+        vals = [sobol[est]["total_order"][n] for n in names]
+        confs = [sobol[est]["total_order_conf"][n] for n in names]
+        offset = -total_w / 2 + w * (k + 0.5)
+        ax_st.bar(x + offset, vals, w, yerr=confs, capsize=2,
+                  color=_ESTIMATOR_COLORS[est], edgecolor="white",
+                  linewidth=0.5, label=_ESTIMATOR_LABELS[est], zorder=3)
+    ax_st.set_xticks(x)
+    ax_st.set_xticklabels([PARAM_LABELS.get(n, n) for n in names], fontsize=10)
+    ax_st.set_ylabel("Sobol Index", fontsize=11)
+    ax_st.set_title(r"Total-effect $S_i^T$", fontsize=12, fontweight="bold")
+    ax_st.grid(axis="y", alpha=0.25)
+    ax_st.set_axisbelow(True)
+
+    title = "Estimator Comparison"
+    if scenario_name:
+        title += f" — {scenario_name}"
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+
+    if output_path:
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        print(f"Saved plot: {output_path}")
+
+    return fig
+
+
+def run_estimator_convergence(
+    scenario: Scenario,
+    seed: int = 42,
+    mc_max: int = 5000,
+    n_reps: int = 20,
+    mf_hf_fraction: float = 0.2,
+    mf_pilot_n: int = 40,
+    verbose: bool = True,
+) -> Dict:
+    """MC convergence study across all four estimators.
+
+    For each MC sample count N, evaluates mc_probability, mc_jaccard,
+    aabb_jaccard (constant), and multi_fidelity.
+
+    The multi-fidelity convergence works as follows: at each MC count N,
+    run a small pilot of mf_pilot_n evaluations — AABB on all, HF (mc_prob
+    with N inner samples) on a fraction — fit the regression, then report
+    the control-variate corrected mean.  This shows how the MF estimator's
+    accuracy improves as the inner MC count grows.
+    """
+    mc_counts = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+    mc_counts = [c for c in mc_counts if c <= mc_max]
+
+    estimators = ["mc_probability", "mc_jaccard", "aabb_jaccard", "multi_fidelity"]
+    results: Dict[str, Dict] = {
+        est: {"n_samples": mc_counts, "I_theta_mean": [], "I_theta_std": []}
+        for est in estimators
+    }
+
+    rng = np.random.default_rng(seed)
+
+    # AABB is deterministic — evaluate once
+    aabb_val = compute_I_theta_aabb(scenario)["I_theta"]
+    results["aabb_jaccard"]["I_theta_mean"] = [aabb_val] * len(mc_counts)
+    results["aabb_jaccard"]["I_theta_std"] = [0.0] * len(mc_counts)
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print("ESTIMATOR CONVERGENCE TEST")
+        print(f"{'='*70}")
+        print(f"Scenario: {scenario.name}  (dim={scenario.dim})")
+        print(f"MC counts: {mc_counts},  reps: {n_reps}")
+        print(f"MF pilot size: {mf_pilot_n},  HF fraction: {mf_hf_fraction:.0%}")
+        print(f"AABB (constant): I = {aabb_val:.4f}")
+        print(f"{'='*70}\n")
+
+    # --- mc_probability and mc_jaccard ---
+    for est in ["mc_probability", "mc_jaccard"]:
+        if verbose:
+            print(f"--- {est} ---")
+        for n in tqdm(mc_counts, desc=est, disable=not verbose):
+            reps = []
+            for _ in range(n_reps):
+                s = int(rng.integers(0, 2**31))
+                if est == "mc_probability":
+                    r = compute_I_theta(scenario, n_samples=n, seed=s)
+                else:
+                    r = compute_I_theta_mc_jaccard(scenario, n_samples=n, seed=s)
+                reps.append(r["I_theta"])
+            results[est]["I_theta_mean"].append(float(np.mean(reps)))
+            results[est]["I_theta_std"].append(float(np.std(reps)))
+            if verbose:
+                print(f"  n={n:>5d}: I = {np.mean(reps):.4f} +/- {np.std(reps):.4f}")
+
+    # --- multi_fidelity ---
+    # The MF convergence evaluates at the SAME nominal scenario as the other
+    # estimators.  For each MC count N we repeat n_reps times:
+    #   1. Draw mf_pilot_n small perturbations around the nominal θ₀
+    #      (to build a local AABB↔HF correlation).
+    #   2. Evaluate AABB on all pilot points (instant).
+    #   3. Evaluate MC probability with N inner samples on a subset.
+    #   4. Fit control variate, predict I(θ₀) via the regression.
+    #
+    # The key insight: θ₀ itself is always included in the pilot so the
+    # MF estimate targets I(θ₀) — the same quantity as the other curves.
+    if verbose:
+        print(f"--- multi_fidelity ---")
+
+    problem = make_salib_problem()
+    bounds = np.array(problem["bounds"])
+    param_names = problem["names"]
+
+    # Nominal θ₀: identity (no intervention)
+    theta_0 = {p: PARAM_BASELINES[p] for p in param_names}
+    theta_0_arr = np.array([theta_0[p] for p in param_names])
+
+    # AABB at the nominal point (constant across reps)
+    I_aabb_0 = aabb_val  # already computed above
+
+    for n_mc in tqdm(mc_counts, desc="multi_fidelity", disable=not verbose):
+        mf_reps = []
+        for _ in range(n_reps):
+            # Build a small pilot around θ₀ (random perturbations)
+            pilot_thetas = rng.uniform(
+                bounds[:, 0], bounds[:, 1],
+                size=(mf_pilot_n - 1, len(param_names)))
+            # Ensure θ₀ is always included (first row)
+            pilot_thetas = np.vstack([theta_0_arr, pilot_thetas])
+
+            # AABB on all pilot configs
+            Y_lf = np.empty(mf_pilot_n)
+            Y_lf[0] = I_aabb_0
+            for k in range(1, mf_pilot_n):
+                theta = dict(zip(param_names, pilot_thetas[k]))
+                Z_int = apply_compound_intervention(scenario.source, theta)
+                Y_lf[k] = compute_I_theta_aabb(
+                    scenario, source_override=Z_int)["I_theta"]
+
+            # HF on a subset — always include index 0 (θ₀)
+            n_hf = max(5, int(mf_hf_fraction * mf_pilot_n))
+            other_idx = rng.choice(
+                np.arange(1, mf_pilot_n), size=n_hf - 1, replace=False)
+            hf_idx = np.concatenate([[0], other_idx])
+            Y_hf = np.empty(len(hf_idx))
+            for j, idx in enumerate(hf_idx):
+                theta = dict(zip(param_names, pilot_thetas[idx]))
+                Z_int = apply_compound_intervention(scenario.source, theta)
+                r = compute_I_theta(
+                    scenario, source_override=Z_int,
+                    n_samples=n_mc, seed=int(rng.integers(0, 2**31)))
+                Y_hf[j] = r["I_theta"]
+
+            # Fit regression I_HF = a + b * I_AABB from pilot pairs
+            Y_lf_sub = Y_lf[hf_idx]
+            var_lf = np.var(Y_lf_sub, ddof=1)
+            if var_lf > 1e-15:
+                cov_hl = np.cov(Y_hf, Y_lf_sub, ddof=1)[0, 1]
+                b = cov_hl / var_lf
+                a = np.mean(Y_hf) - b * np.mean(Y_lf_sub)
+                # Predict I(θ₀) from AABB value at θ₀
+                I_mf = a + b * I_aabb_0
+            else:
+                I_mf = float(np.mean(Y_hf))
+            mf_reps.append(float(I_mf))
+
+        results["multi_fidelity"]["I_theta_mean"].append(
+            float(np.mean(mf_reps)))
+        results["multi_fidelity"]["I_theta_std"].append(
+            float(np.std(mf_reps)))
+        if verbose:
+            print(f"  n={n_mc:>5d}: I_MF = {np.mean(mf_reps):.4f} "
+                  f"+/- {np.std(mf_reps):.4f}")
+
+    return results
+
+
+def plot_estimator_convergence(
+    conv: Dict,
+    scenario_name: str = "",
+    output_path: Optional[str | Path] = None,
+    figsize: Tuple[float, float] = (9, 5.5),
+) -> plt.Figure:
+    """Overlay MC convergence curves for all estimators on a single plot."""
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+
+    for est in ["mc_probability", "mc_jaccard", "aabb_jaccard", "multi_fidelity"]:
+        if est not in conv:
+            continue
+        data = conv[est]
+        ns = np.array(data["n_samples"])
+        means = np.array(data["I_theta_mean"])
+        stds = np.array(data["I_theta_std"])
+        color = _ESTIMATOR_COLORS[est]
+        label = _ESTIMATOR_LABELS[est]
+
+        if est == "aabb_jaccard":
+            ax.axhline(means[0], color=color, linewidth=2, linestyle="--",
+                       label=f"{label} = {means[0]:.4f}", zorder=2)
+        else:
+            ax.fill_between(ns, means - stds, means + stds,
+                            alpha=0.15, color=color)
+            ax.plot(ns, means, "o-", color=color, markersize=5,
+                    linewidth=1.5, label=label, zorder=3)
+
+    ax.set_xscale("log")
+    ax.set_xlabel("MC samples per evaluation", fontsize=12)
+    ax.set_ylabel(r"$I(\theta)$", fontsize=12)
+    title = "Estimator Convergence"
+    if scenario_name:
+        title += f" — {scenario_name}"
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+
+    if output_path:
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        print(f"Saved plot: {output_path}")
+    return fig
+
+
+def plot_estimator_landscape(
+    scenario: Scenario,
+    param1: str = "scale_factor",
+    param1_range: Tuple[float, float] = (0.3, 4.0),
+    param2: str = "center_delta",
+    param2_range: Tuple[float, float] = (0.0, 0.3),
+    grid_n: int = 25,
+    mc_samples: int = 500,
+    mf_hf_fraction: float = 0.2,
+    seed: int = 42,
+    output_path: Optional[str | Path] = None,
+) -> plt.Figure:
+    """Side-by-side I(theta) heatmaps — one panel per estimator.
+
+    MC probability | MC Jaccard | AABB Jaccard | Multi-fidelity
+    Uses the fast 2D polygon path for mc_probability to keep runtime sane.
+    The MF panel uses AABB on the full grid + regression calibrated from a
+    pilot subset of HF evaluations.
+    """
+    from zonotope_plots import _compute_I_theta_2d
+
+    if scenario.dim != 2:
+        print("Landscape comparison only supported for 2D scenarios — skipping.")
+        return None
+
+    v1 = np.linspace(*param1_range, grid_n)
+    v2 = np.linspace(*param2_range, grid_n)
+    V1, V2 = np.meshgrid(v1, v2)
+
+    rng = np.random.default_rng(seed)
+
+    estimators = ["mc_probability", "mc_jaccard", "aabb_jaccard"]
+    grids: Dict[str, np.ndarray] = {}
+
+    for est in estimators:
+        I_grid = np.empty_like(V1)
+        desc = f"Landscape [{est}]"
+        total = grid_n * grid_n
+        pbar = tqdm(total=total, desc=desc, unit="pt")
+        for i in range(grid_n):
+            for j in range(grid_n):
+                theta = {param1: V1[i, j], param2: V2[i, j]}
+                if est == "mc_probability":
+                    # Use fast 2D polygon containment
+                    I_grid[i, j] = _compute_I_theta_2d(
+                        scenario, theta, mc_samples, rng)
+                elif est == "mc_jaccard":
+                    Z_mod = apply_compound_intervention(scenario.source, theta)
+                    r = compute_I_theta_mc_jaccard(
+                        scenario, source_override=Z_mod,
+                        n_samples=mc_samples,
+                        seed=int(rng.integers(0, 2**31)))
+                    I_grid[i, j] = r["I_theta"]
+                else:  # aabb_jaccard
+                    Z_mod = apply_compound_intervention(scenario.source, theta)
+                    I_grid[i, j] = compute_I_theta_aabb(
+                        scenario, source_override=Z_mod)["I_theta"]
+                pbar.update(1)
+        pbar.close()
+        grids[est] = I_grid
+
+    # --- Multi-fidelity panel: AABB everywhere + pilot HF + regression ---
+    estimators.append("multi_fidelity")
+    aabb_flat = grids["aabb_jaccard"].ravel()
+    hf_flat = grids["mc_probability"].ravel()  # reuse existing HF grid
+    n_total = len(aabb_flat)
+    n_pilot = max(20, int(mf_hf_fraction * n_total))
+    pilot_idx = rng.choice(n_total, size=n_pilot, replace=False)
+    # Fit linear regression: I_HF ~ a + b * I_AABB on pilot subset
+    x_pilot = aabb_flat[pilot_idx]
+    y_pilot = hf_flat[pilot_idx]
+    b_hat, a_hat = np.polyfit(x_pilot, y_pilot, 1)
+    mf_flat = a_hat + b_hat * aabb_flat
+    grids["multi_fidelity"] = mf_flat.reshape(V1.shape)
+    print(f"  MF landscape: pilot {n_pilot}/{n_total} pts, "
+          f"regression I_HF = {a_hat:.4f} + {b_hat:.4f} * I_AABB")
+
+    # Shared colour scale
+    vmin = min(g.min() for g in grids.values())
+    vmax = max(g.max() for g in grids.values())
+
+    n_est = len(estimators)
+    fig, axes = plt.subplots(
+        1, n_est, figsize=(4.8 * n_est + 1.5, 4.5), constrained_layout=True)
+
+    for ax, est in zip(axes, estimators):
+        I_grid = grids[est]
+        cf = ax.contourf(V1, V2, I_grid, levels=20, cmap="RdYlGn_r",
+                         vmin=vmin, vmax=vmax)
+        ax.contour(V1, V2, I_grid, levels=8, colors="k",
+                   linewidths=0.35, alpha=0.4)
+        ax.set_xlabel(PARAM_LABELS.get(param1, param1), fontsize=10)
+        if ax is axes[0]:
+            ax.set_ylabel(PARAM_LABELS.get(param2, param2), fontsize=10)
+        ax.set_title(_ESTIMATOR_LABELS[est], fontsize=12, fontweight="bold")
+
+    fig.colorbar(cf, ax=axes.tolist(), label=r"$I(\theta)$", shrink=0.85)
+    fig.suptitle(f"Consistency Landscape Comparison — {scenario.name}",
+                 fontsize=13, fontweight="bold")
+
+    if output_path:
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        print(f"Saved plot: {output_path}")
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +1581,120 @@ def plot_sobol_indices(
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
                     f"{v:.3f}", ha="center", va="bottom", fontsize=8.5,
                     fontweight="medium")
+
+    if output_path:
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+        print(f"Saved plot: {output_path}")
+
+    return fig
+
+
+def plot_multifidelity_diagnostics(
+    mf_results: Dict,
+    scenario_name: str = "",
+    output_path: Optional[str | Path] = None,
+    figsize: Tuple[float, float] = (14, 10),
+) -> plt.Figure:
+    """Four-panel diagnostic plot for the multi-fidelity estimator.
+
+    Panel A: HF vs LF scatter with regression line (pilot data).
+    Panel B: Sobol index comparison (MF vs pure-LF).
+    Panel C: Residual distribution of HF - predicted.
+    Panel D: Corrected I(θ) histogram vs LF histogram.
+    """
+    mf = mf_results.get("_mf_data", mf_results)
+    Y_hf = mf["Y_hf"]
+    Y_lf_sub = mf["Y_lf"][mf["hf_idx"]]
+    Y_lf_all = mf["Y_lf"]
+    Y_corr = mf_results.get("Y_corrected", mf.get("Y_corrected"))
+    rho = mf_results.get("rho", mf.get("rho", 0.0))
+    a = mf_results.get("regression_intercept", mf.get("regression_intercept", 0.0))
+    b = mf_results.get("regression_slope", mf.get("regression_slope", 0.0))
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+
+    # --- Panel A: HF vs LF scatter ---
+    ax = axes[0, 0]
+    ax.scatter(Y_lf_sub, Y_hf, s=20, alpha=0.6, edgecolors="k", linewidth=0.3,
+               color="#4878CF", zorder=3)
+    lf_range = np.linspace(Y_lf_sub.min(), Y_lf_sub.max(), 100)
+    ax.plot(lf_range, a + b * lf_range, "r-", linewidth=2,
+            label=f"y = {a:.3f} + {b:.3f}x", zorder=4)
+    ax.plot([0, 1], [0, 1], "k--", alpha=0.3, linewidth=0.8)
+    ax.set_xlabel(r"$I_{\mathrm{AABB}}(\theta)$  (low-fidelity)", fontsize=11)
+    ax.set_ylabel(r"$I_{\mathrm{MC}}(\theta)$  (high-fidelity)", fontsize=11)
+    ax.set_title(f"Pilot Correlation  "
+                 r"$\rho$" + f" = {rho:.4f}", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+
+    # --- Panel B: Sobol comparison ---
+    ax = axes[0, 1]
+    if "first_order" in mf_results and "lf_first_order" in mf_results:
+        names = list(mf_results["first_order"].keys())
+        labels = [PARAM_LABELS.get(n, n) for n in names]
+        S1_mf = [mf_results["first_order"][n] for n in names]
+        S1_lf = [mf_results["lf_first_order"][n] for n in names]
+        ST_mf = [mf_results["total_order"][n] for n in names]
+        ST_lf = [mf_results["lf_total_order"][n] for n in names]
+
+        x = np.arange(len(names))
+        w = 0.2
+        ax.bar(x - 1.5 * w, S1_mf, w, label=r"$S_i$ MF", color="#4878CF",
+               edgecolor="white", linewidth=0.6)
+        ax.bar(x - 0.5 * w, S1_lf, w, label=r"$S_i$ LF", color="#4878CF",
+               alpha=0.4, edgecolor="white", linewidth=0.6)
+        ax.bar(x + 0.5 * w, ST_mf, w, label=r"$S_i^T$ MF", color="#D65F5F",
+               edgecolor="white", linewidth=0.6)
+        ax.bar(x + 1.5 * w, ST_lf, w, label=r"$S_i^T$ LF", color="#D65F5F",
+               alpha=0.4, edgecolor="white", linewidth=0.6)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=10)
+        ax.set_ylabel("Sobol Index", fontsize=11)
+        ax.legend(fontsize=8, ncol=2)
+    ax.set_title("Sobol: Multi-Fidelity vs Pure LF", fontsize=12, fontweight="bold")
+    ax.grid(axis="y", alpha=0.25)
+
+    # --- Panel C: Residual distribution ---
+    ax = axes[1, 0]
+    predicted = a + b * Y_lf_sub
+    residuals = Y_hf - predicted
+    ax.hist(residuals, bins=25, color="#6ACC65", edgecolor="white", alpha=0.8)
+    ax.axvline(0, color="k", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Residual  (HF - predicted)", fontsize=11)
+    ax.set_ylabel("Count", fontsize=11)
+    ax.set_title(f"Regression Residuals  "
+                 f"(RMSE = {np.sqrt(np.mean(residuals**2)):.4f})",
+                 fontsize=12, fontweight="bold")
+    ax.grid(alpha=0.25)
+
+    # --- Panel D: Distribution comparison ---
+    ax = axes[1, 1]
+    bins = np.linspace(min(Y_lf_all.min(), Y_corr.min()),
+                       max(Y_lf_all.max(), Y_corr.max()), 40)
+    ax.hist(Y_lf_all, bins=bins, alpha=0.5, color="#4878CF",
+            label="AABB (LF)", edgecolor="white")
+    ax.hist(Y_corr, bins=bins, alpha=0.5, color="#D65F5F",
+            label="Corrected (MF)", edgecolor="white")
+    ax.axvline(mf_results.get("I_hf_mean", mf.get("I_hf_mean", 0)),
+               color="green", linewidth=2, linestyle="--",
+               label=f"HF pilot mean = "
+                     f"{mf_results.get('I_hf_mean', mf.get('I_hf_mean', 0)):.3f}")
+    ax.set_xlabel(r"$I(\theta)$", fontsize=11)
+    ax.set_ylabel("Count", fontsize=11)
+    ax.set_title("I(theta) Distribution: LF vs Corrected",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+
+    title = "Multi-Fidelity Estimator Diagnostics"
+    if scenario_name:
+        title += f"\n{scenario_name}"
+    vr = mf_results.get("variance_reduction", mf.get("variance_reduction", 0))
+    title += (f"   |   "
+              r"$\rho$" + f" = {rho:.3f},  "
+              f"Var reduction = {vr:.3f}")
+    fig.suptitle(title, fontsize=13, fontweight="bold")
 
     if output_path:
         fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -809,6 +1867,14 @@ def main():
     parser.add_argument("--convergence_test", action="store_true",
                         help="Run MC & Sobol convergence study instead of "
                              "the normal pipeline")
+    parser.add_argument("--estimator", type=str, default="mc_probability",
+                        choices=["mc_probability", "mc_jaccard",
+                                 "aabb_jaccard", "multi_fidelity", "compare"],
+                        help="Scoring method for I(theta), or 'compare' to "
+                             "run all estimators side-by-side (default: mc_probability)")
+    parser.add_argument("--mf_hf_fraction", type=float, default=0.2,
+                        help="Fraction of Saltelli points evaluated with HF "
+                             "estimator in multi-fidelity mode (default: 0.2)")
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -829,6 +1895,9 @@ def main():
     print(f"Source center   : {scenario.source.c}")
     print(f"Target center   : {scenario.target.c}")
     print(f"MC samples/eval : {args.mc_samples}")
+    print(f"Estimator       : {args.estimator}")
+    if args.estimator == "multi_fidelity":
+        print(f"HF fraction     : {args.mf_hf_fraction:.0%}")
     print(f"Seed            : {args.seed}")
     print(f"Output          : {out_dir}")
     print(f"{'='*70}\n")
@@ -844,9 +1913,12 @@ def main():
     # --- Baseline I(θ) ---
     print("Computing baseline I(θ)...")
     baseline = compute_I_theta(scenario, n_samples=args.mc_samples, seed=args.seed)
-    print(f"  Baseline I(θ) = {baseline['I_theta']:.4f} "
-          f"± {baseline['standard_error']:.4f}\n")
+    baseline_aabb = compute_I_theta_aabb(scenario)
+    print(f"  Baseline I_MC(θ)   = {baseline['I_theta']:.4f} "
+          f"± {baseline['standard_error']:.4f}")
+    print(f"  Baseline I_AABB(θ) = {baseline_aabb['I_theta']:.4f}\n")
     all_results["baseline"] = baseline
+    all_results["baseline_aabb"] = baseline_aabb
 
     # --- 2D zonotope visualizations (Figures 1 & 2) ---
     if scenario.dim == 2:
@@ -895,9 +1967,55 @@ def main():
 
     # --- Sobol analysis ---
     sobol_results = None
+    mf_results = None
+    comp_results = None
     if not args.sweep_only:
         if not SALIB_AVAILABLE:
             print("\nSALib not installed — skipping Sobol analysis.")
+        elif args.estimator == "compare":
+            comp_results = run_estimator_comparison(
+                scenario,
+                N=args.saltelli_N,
+                mc_samples=args.mc_samples,
+                mf_hf_fraction=args.mf_hf_fraction,
+                seed=args.seed,
+                verbose=True,
+            )
+            # Use mc_probability Sobol as the primary result
+            sobol_results = comp_results["sobol"]["mc_probability"]
+            all_results["sobol"] = sobol_results
+            all_results["estimator_comparison"] = {
+                "estimators": comp_results["estimators"],
+                "correlations": comp_results["correlations"].tolist(),
+                "timing": comp_results["timing"],
+                "sobol": comp_results["sobol"],
+            }
+        elif args.estimator == "multi_fidelity":
+            mf_results = run_multifidelity_sobol_analysis(
+                scenario,
+                N=args.saltelli_N,
+                mc_samples=args.mc_samples,
+                hf_fraction=args.mf_hf_fraction,
+                seed=args.seed,
+                verbose=True,
+            )
+            # MF results have the same Sobol keys, reuse for plotting
+            sobol_results = mf_results
+            all_results["sobol"] = {
+                k: v for k, v in mf_results.items() if k != "_mf_data"
+            }
+            all_results["multifidelity"] = {
+                "rho": mf_results["rho"],
+                "alpha_star": mf_results["alpha_star"],
+                "variance_reduction": mf_results["variance_reduction"],
+                "regression_intercept": mf_results["regression_intercept"],
+                "regression_slope": mf_results["regression_slope"],
+                "I_mf_mean": mf_results["I_mf_mean"],
+                "I_hf_mean": mf_results["I_hf_mean"],
+                "I_lf_mean": mf_results["I_lf_mean"],
+                "n_hf_evaluations": mf_results["n_hf_evaluations"],
+                "hf_fraction": mf_results["hf_fraction"],
+            }
         else:
             sobol_results = run_sobol_analysis(
                 scenario,
@@ -905,6 +2023,7 @@ def main():
                 mc_samples=args.mc_samples,
                 seed=args.seed,
                 verbose=True,
+                estimator=args.estimator,
             )
             all_results["sobol"] = sobol_results
 
@@ -945,6 +2064,42 @@ def main():
     if sobol_results is not None:
         plot_sobol_indices(sobol_results, scenario_name=scenario.name,
                            output_path=out_dir / "sobol_indices.png")
+
+    if mf_results is not None:
+        plot_multifidelity_diagnostics(
+            mf_results, scenario_name=scenario.name,
+            output_path=out_dir / "multifidelity_diagnostics.png",
+        )
+
+    if comp_results is not None:
+        plot_estimator_comparison(
+            comp_results, scenario_name=scenario.name,
+            output_path=out_dir / "estimator_comparison.png",
+        )
+
+        # Convergence curves
+        print("\nRunning estimator convergence study...")
+        conv = run_estimator_convergence(
+            scenario, seed=args.seed, mc_max=2000, n_reps=20, verbose=True)
+        plot_estimator_convergence(
+            conv, scenario_name=scenario.name,
+            output_path=out_dir / "estimator_convergence.png",
+        )
+        all_results["estimator_convergence"] = {
+            est: {k: v for k, v in d.items()}
+            for est, d in conv.items()
+        }
+
+        # Side-by-side consistency landscape (2D only)
+        if scenario.dim == 2:
+            print("\nGenerating side-by-side consistency landscapes...")
+            plot_estimator_landscape(
+                scenario,
+                mc_samples=min(500, args.mc_samples),
+                mf_hf_fraction=args.mf_hf_fraction,
+                seed=args.seed,
+                output_path=out_dir / "estimator_landscape.png",
+            )
 
     plt.close("all")
 

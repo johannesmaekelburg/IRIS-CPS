@@ -311,6 +311,8 @@ def compute_causal_effects(df: pd.DataFrame,
     Returns:
         DataFrame with causal effects for all pairs (a, b)
     """
+
+
     if param_name not in df.columns:
         raise ValueError(f"Parameter '{param_name}' not found in data")
     
@@ -936,7 +938,7 @@ def run_full_sensitivity_analysis(data_dir: str,
     
     # 1. Load data
     df = load_experimental_data(data_dir)
-    
+
     # Auto-detect parameter name if needed
     if param_name == 'auto':
         # Look for common parameter names
@@ -971,6 +973,7 @@ def run_full_sensitivity_analysis(data_dir: str,
     print("1. TOTAL CAUSAL EFFECTS τ_j(a,b)")
     print("="*80)
     causal_effects = compute_causal_effects(df, param_name)
+    causal_effects.to_csv(output_path / 'causal_effects.csv', index=False)
     plot_causal_effects(causal_effects, 
                        output_path / f'causal_effects_{param_name}.png')
     

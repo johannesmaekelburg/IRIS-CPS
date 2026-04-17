@@ -119,15 +119,16 @@ def load_saltelli_results(results_dir: str, pattern: str = "results_scenario_*.j
             if scenario_filter and scenario not in scenario_filter:
                 continue
 
-            I = e.get("post_state", {}).get("inconsistency", {}).get("I_theta")
-            if I is None or (isinstance(I, float) and np.isnan(I)):
+            _v = e.get("post_state", {}).get("inconsistency", {}).get("I_MF_random")
+            if _v is None or (isinstance(_v, float) and np.isnan(_v)):
                 continue
+            I = 1.0 - float(_v)
 
             rows.append({
                 "s_u":             float(e["scale_factor"]),
                 "delta_c_u":       float(e["center_delta"]),
                 "R_u":             float(e["correlation_strength"]),
-                INCONSISTENCY_COL: float(I),
+                INCONSISTENCY_COL: I,
                 "scenario":        scenario,
                 "sample_idx":      e.get("sample_idx"),
             })
@@ -196,9 +197,10 @@ def load_mfmc_results(results_dir: str, pattern: str = "results_scenario_*.json"
         for e in experiments:
             u    = e["post_state"]["uncertainty"]
             inc  = e["post_state"]["inconsistency"]
-            I    = inc.get("I_theta")
-            if I is None or (isinstance(I, float) and np.isnan(I)):
+            _v   = inc.get("I_MF_random")
+            if _v is None or (isinstance(_v, float) and np.isnan(_v)):
                 continue
+            I = 1.0 - float(_v)
 
             post_radius = float(u["source_radius"])
             post_center = np.array(u["source_center"], dtype=float)

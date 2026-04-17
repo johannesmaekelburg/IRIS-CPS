@@ -25,6 +25,24 @@ plt.rcParams['font.size'] = 11
 
 
 # ============================================================================
+# Shared consistency-score accessor
+# ============================================================================
+
+def get_I_MF(inc: dict) -> float:
+    """Return the MFMC-corrected inconsistency score derived from I_MF_random.
+    I_MF_random is the MFMC-corrected consistency probability, so we return
+    1 - I_MF_random to match the I_theta convention (higher = more inconsistent).
+    Returns np.nan if not available — experiments without this field are excluded.
+    """
+    if not isinstance(inc, dict):
+        return np.nan
+    v = inc.get('I_MF_random')
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return np.nan
+    return 1.0 - float(v)
+
+
+# ============================================================================
 # Data Loading (Common)
 # ============================================================================
 
@@ -87,16 +105,7 @@ def load_experimental_data(data_dir: str,
             # Pre-intervention inconsistency
             pre_inconsistency = exp.get('pre_inconsistency', pre_state.get('inconsistency', {}))
             
-            # Prefer MFMC-corrected value; fall back to plain MC probability
-            I_theta_pre = pre_inconsistency.get('I_MF_sobol',
-                            pre_inconsistency.get('I_MF_halton',
-                            pre_inconsistency.get('I_MF_random',
-                            pre_inconsistency.get('I_theta'))))
-            if I_theta_pre is None or np.isnan(I_theta_pre):
-                mc_p_consistent = pre_inconsistency.get('mc_p_consistent_sobol',
-                                                       pre_inconsistency.get('mc_probability'))
-                if mc_p_consistent is not None:
-                    I_theta_pre = 1.0 - mc_p_consistent
+            I_theta_pre = get_I_MF(pre_inconsistency)
             
             record['I_theta'] = I_theta_pre
             record['I_theta_se'] = pre_inconsistency.get('mc_standard_error_sobol', np.nan)
@@ -112,16 +121,7 @@ def load_experimental_data(data_dir: str,
             # Post-intervention inconsistency
             post_inconsistency = exp.get('post_inconsistency', post_state.get('inconsistency', {}))
             
-            # Prefer MFMC-corrected value; fall back to plain MC probability
-            I_theta_post = post_inconsistency.get('I_MF_sobol',
-                             post_inconsistency.get('I_MF_halton',
-                             post_inconsistency.get('I_MF_random',
-                             post_inconsistency.get('I_theta'))))
-            if I_theta_post is None or np.isnan(I_theta_post):
-                mc_p_consistent_post = post_inconsistency.get('mc_p_consistent_sobol',
-                                                              post_inconsistency.get('mc_probability'))
-                if mc_p_consistent_post is not None:
-                    I_theta_post = 1.0 - mc_p_consistent_post
+            I_theta_post = get_I_MF(post_inconsistency)
             
             record['post_I_theta'] = I_theta_post
             record['post_jaccard'] = post_inconsistency.get('jaccard_index', np.nan)

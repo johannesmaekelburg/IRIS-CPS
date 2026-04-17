@@ -97,7 +97,7 @@ def load_saltelli_data(data_dir: str,
             for p in SALTELLI_PARAMS:
                 row[p] = exp.get(p, np.nan)
 
-            # I_theta: already an inconsistency score
+            # I_theta: raw plain-MC inconsistency score from data source
             s = _scalar(inc.get("I_theta"))
             if s is not None and not np.isnan(s):
                 row["I_theta"] = s

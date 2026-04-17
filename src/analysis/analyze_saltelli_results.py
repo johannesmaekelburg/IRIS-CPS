@@ -220,7 +220,7 @@ def load_matlab_results(json_path):
                 'scale_factor': exp.get('scale_factor'),
                 'center_delta': exp.get('center_delta'),
                 'correlation_strength': exp.get('correlation_strength'),
-                'I_theta': exp.get('post_state', {}).get('inconsistency', {}).get('I_theta', np.nan)
+                'I_theta': 1.0 - exp.get('post_state', {}).get('inconsistency', {}).get('I_MF_random', np.nan)
             })
     
     return results

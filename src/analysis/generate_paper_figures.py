@@ -143,8 +143,6 @@ def plot_aggregate_sobol(sobol_data: dict, out_path: Path) -> None:
     ax.set_xticklabels(labels)
     ax.set_ylabel('Sobol Index')
     ax.set_ylim(0, min(1.05, max(st_means) + max(st_stds) + 0.18))
-    ax.set_title(f'Aggregate Sobol Indices across {n_scen} Scenarios (mean ± std)',
-                 pad=6)
     ax.legend(loc='upper right')
     ax.spines[['top', 'right']].set_visible(False)
     ax.axhline(0, color='k', linewidth=0.5)
@@ -198,7 +196,6 @@ def plot_causal_vs_anticausal(sobol_data: dict,
         ax_l.set_xticks([0, 1])
         ax_l.set_xticklabels([r'$S_1$', r'$S_T$'])
         ax_l.set_ylabel('Sobol index')
-        ax_l.set_title(f'{label}\nForward causal (Sobol)', fontsize=8)
         ax_l.set_ylim(-0.05, 1.05)
         ax_l.axhline(0, color='k', linewidth=0.5, linestyle='--')
         ax_l.spines[['top', 'right']].set_visible(False)
@@ -230,11 +227,9 @@ def plot_causal_vs_anticausal(sobol_data: dict,
         # η² annotation
         eta2 = effect_map.get(ac_key, {}).get('eta2', float('nan'))
         mi   = effect_map.get(ac_key, {}).get('MI',   float('nan'))
-        ax_r.set_title(
-            f'{label}\nAnticausal: '
-            r'$\eta^2$' + f'={eta2:.3f},  MI={mi:.3f}',
-            fontsize=8
-        )
+        ax_r.text(0.05, 0.95, r'$\eta^2$' + f'={eta2:.3f},  MI={mi:.3f}',
+                  transform=ax_r.transAxes, va='top', fontsize=8,
+                  bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='none', alpha=0.7))
 
         # η² as a shaded band height indicator on secondary axis
         ax_r2 = ax_r.twinx()
@@ -244,9 +239,6 @@ def plot_causal_vs_anticausal(sobol_data: dict,
         ax_r2.set_ylabel(r'$\eta^2$', color=COLORS['eta2'], fontsize=8)
         ax_r2.tick_params(axis='y', labelcolor=COLORS['eta2'])
         ax_r2.spines[['top']].set_visible(False)
-
-    fig.suptitle('Causal (Forward) vs. Anticausal (Backward) Analysis per Parameter',
-                 fontsize=10, y=0.98)
 
     fig.savefig(out_path)
     plt.close(fig)

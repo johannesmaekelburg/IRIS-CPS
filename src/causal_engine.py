@@ -371,6 +371,158 @@ def create_convide_scenarios() -> List[Scenario]:
     return scenarios
 
 
+def create_cps_scenarios() -> List[Scenario]:
+    """Reproduce the 36 CPS-domain scenarios from generate_cps_domains_twostep.m.
+
+    All scenarios are 2-D with diagonal generators (cpz2d) and identity F/f.
+    Nine domains x 4 scenarios: Automotive, HVAC, Robot, Medical,
+    Railway, Satellite, SmartGrid, Water/Chemical, WindTurbine.
+    """
+    scenarios: list[Scenario] = []
+
+    def _s(sid, name, c_src, g_src, c_tgt, g_tgt):
+        return Scenario(
+            source=Zonotope(np.array(c_src), np.diag(g_src)),
+            target=Zonotope(np.array(c_tgt), np.diag(g_tgt)),
+            F=np.eye(2),
+            f=np.zeros(2),
+            name=f"CPS{sid}: {name}",
+        )
+
+    # ── Domain 1: Automotive ──────────────────────────────────────────────────
+    scenarios.append(_s( 1, "Automotive – Motor & Winding Temperature",
+                         [106.688,    101.592],  [8.0,    8.232],
+                         [102.0,       96.768],  [8.0,    8.232]))
+    scenarios.append(_s( 2, "Automotive – Battery Capacity & Clutch Delay",
+                         [ 57.360,     78.790],  [5.7,   15.0],
+                         [ 60.700,     70.000],  [5.7,   15.0]))
+    scenarios.append(_s( 3, "Automotive – Suspension Travel & Belt Force",
+                         [172.962,   3240.339],  [17.0,  627.2],
+                         [163.0,     2872.800],  [17.0,  627.2]))
+    scenarios.append(_s( 4, "Automotive – Brake Response & Thermal Coupling",
+                         [147.580,    101.592],  [30.0,   8.232],
+                         [130.000,     96.768],  [30.0,   8.232]))
+
+    # ── Domain 2: Building HVAC ───────────────────────────────────────────────
+    scenarios.append(_s( 5, "HVAC – Room Temperature & CO2",
+                         [ 23.172,    923.410],  [2.0,   185.0],
+                         [ 22.000,    815.000],  [2.0,   185.0]))
+    scenarios.append(_s( 6, "HVAC – Chiller COP & Pipe Pressure Drop",
+                         [  4.1246, 21068.500],  [0.784, 2250.0],
+                         [  4.5840, 19750.000],  [0.784, 2250.0]))
+    scenarios.append(_s( 7, "HVAC – Facade U-Value & Sprinkler Flow",
+                         [  0.18551,   84.140],  [0.035,   10.0],
+                         [  0.16500,   90.000],  [0.035,   10.0]))
+    scenarios.append(_s( 8, "HVAC – Elevator Load & BMS Latency",
+                         [ 23.4475,    16.481],  [3.75,    8.5],
+                         [ 21.2500,    11.500],  [3.75,    8.5]))
+
+    # ── Domain 3: Industrial Robot ────────────────────────────────────────────
+    scenarios.append(_s( 9, "Robot – TCP Position Error & Wrist Torque",
+                         [  0.12566,   51.688],  [0.0588,  8.0],
+                         [  0.09120,   47.000],  [0.0588,  8.0]))
+    scenarios.append(_s(10, "Robot – Contact Force & Cycle Time",
+                         [ 94.475,     15.2548], [37.5,    1.8],
+                         [ 72.500,     14.2000], [37.5,    1.8]))
+    scenarios.append(_s(11, "Robot – Weld Heat Input & Vision Calibration",
+                         [  0.60032,    0.16754],[0.12,   0.0784],
+                         [  0.53000,    0.12160],[0.12,   0.0784]))
+    scenarios.append(_s(12, "Robot – End-Effector Mass & Bus Jitter",
+                         [  4.8344,     6.688],  [0.4,    8.0],
+                         [  4.6000,     2.000],  [0.4,    8.0]))
+
+    # ── Domain 4: Medical Device ──────────────────────────────────────────────
+    scenarios.append(_s(13, "Medical – Insulin Dose & Ventilator Pressure",
+                         [  5.3344,    27.160],  [0.4,    6.86],
+                         [  5.1000,    23.140],  [0.4,    6.86]))
+    scenarios.append(_s(14, "Medical – Pacemaker Sensing & Infusion Pressure",
+                         [  6.7040,   271.020],  [4.116,  70.0],
+                         [  9.1160,   230.000],  [4.116,  70.0]))
+    scenarios.append(_s(15, "Medical – Defibrillator Energy & Radiation Dose",
+                         [193.790,     59.217],  [15.0,   2.94],
+                         [185.000,     60.940],  [15.0,   2.94]))
+    scenarios.append(_s(16, "Medical – Surgical Force & Drug Concentration",
+                         [  2.5032,    15.728],  [1.2,    5.488],
+                         [  1.8000,    12.512],  [1.2,    5.488]))
+
+    # ── Domain 5: Railway ─────────────────────────────────────────────────────
+    scenarios.append(_s(17, "Railway – Braking Distance & Axle Load",
+                         [946.180,    160.032],  [130.0,  12.0],
+                         [870.000,    153.000],  [130.0,  12.0]))
+    scenarios.append(_s(18, "Railway – Pantograph Force & GNSS Error",
+                         [151.020,      4.2697], [70.0,   1.764],
+                         [110.000,      3.2360], [70.0,   1.764]))
+    scenarios.append(_s(19, "Railway – Door Gap & Signalling Latency",
+                         [ 83.440,    417.200],  [40.0,  200.0],
+                         [ 60.000,    300.000],  [40.0,  200.0]))
+    scenarios.append(_s(20, "Railway – Traction Energy & Switch Heating",
+                         [ 31.9165,  2234.400],  [7.448, 400.0],
+                         [ 27.5520,  2000.000],  [7.448, 400.0]))
+
+    # ── Domain 6: Satellite Aerospace ────────────────────────────────────────
+    scenarios.append(_s(21, "Satellite – Attitude Error & Battery DoD",
+                         [  4.5131,    37.102],  [1.176,  7.0],
+                         [  3.8240,    33.000],  [1.176,  7.0]))
+    scenarios.append(_s(22, "Satellite – Panel Temperature & Propellant Mass",
+                         [ 85.032,     41.097],  [12.0,   2.65],
+                         [ 78.000,     42.650],  [12.0,   2.65]))
+    scenarios.append(_s(23, "Satellite – Downlink Rate & Reaction Wheel Torque",
+                         [ 23.408,     20.932],  [8.232,  2.25],
+                         [ 28.232,     22.250],  [8.232,  2.25]))
+    scenarios.append(_s(24, "Satellite – Natural Frequency & RAM Usage",
+                         [ 31.1385,    51.688],  [2.75,   8.0],
+                         [ 32.7500,    47.000],  [2.75,   8.0]))
+
+    # ── Domain 7: Smart Grid ──────────────────────────────────────────────────
+    scenarios.append(_s(25, "SmartGrid – Frequency Nadir & Transformer Load",
+                         [ 49.1035,   363.485],  [0.25,  88.2],
+                         [ 49.2500,   311.800],  [0.25,  88.2]))
+    scenarios.append(_s(26, "SmartGrid – Bus Voltage & Battery SOC",
+                         [  1.0793,    23.519],  [0.05,   8.5],
+                         [  1.0500,    28.500],  [0.05,   8.5]))
+    scenarios.append(_s(27, "SmartGrid – Relay Time & Demand Response",
+                         [ 72.548,     41.492],  [18.0,  15.68],
+                         [ 62.000,     50.680],  [18.0,  15.68]))
+    scenarios.append(_s(28, "SmartGrid – Cable Ampacity & Meter Latency",
+                         [412.420,     23.790],  [30.0,  15.0],
+                         [430.000,     15.000],  [30.0,  15.0]))
+
+    # ── Domain 8: Water / Chemical Process ───────────────────────────────────
+    scenarios.append(_s(29, "Water – Tank Level & Inlet Flow (SWaT)",
+                         [879.907,      0.65525],[290.08, 0.375],
+                         [709.920,      0.87500],[290.08, 0.375]))
+    scenarios.append(_s(30, "Water – UF Pressure Drop & Chlorine Conc. (SWaT)",
+                         [ 33.790,      0.29737],[15.0,  0.2352],
+                         [ 25.000,      0.43520],[15.0,  0.2352]))
+    scenarios.append(_s(31, "Chemical – Reactor Temp & Separator Pressure (TEP)",
+                         [122.153,     52.005],  [1.8032, 1.1956],
+                         [121.097,     51.304],  [1.8032, 1.1956]))
+    scenarios.append(_s(32, "Chemical – Distillation Temp & Actuator Pressure",
+                         [ 80.039,      5.716],  [3.528,  0.686],
+                         [ 77.972,      5.314],  [3.528,  0.686]))
+
+    # ── Domain 9: Wind Turbine ────────────────────────────────────────────────
+    scenarios.append(_s(33, "WindTurbine – Blade Fatigue & Nacelle Vibration",
+                         [2146059.2,    3.9411], [352800.0, 1.35],
+                         [2352800.0,    3.1500], [352800.0, 1.35]))
+    scenarios.append(_s(34, "WindTurbine – Tower Deflection & Power Deviation",
+                         [  0.54825,   -3.3771], [0.125,  3.92],
+                         [  0.47500,   -1.0800], [0.125,  3.92]))
+    scenarios.append(_s(35, "WindTurbine – Pitch Response & Gearbox Oil Temp",
+                         [  4.4618,    71.688],  [1.3,    8.0],
+                         [  3.7000,    67.000],  [1.3,    8.0]))
+    scenarios.append(_s(36, "WindTurbine – Foundation Settlement & SCADA Latency",
+                         [  2.5131,    84.475],  [1.176, 37.5],
+                         [  1.8240,    62.500],  [1.176, 37.5]))
+
+    return scenarios
+
+
+def create_all_scenarios() -> List[Scenario]:
+    """Return all 48 scenarios: 12 CONVIDE + 36 CPS."""
+    return create_convide_scenarios() + create_cps_scenarios()
+
+
 # ---------------------------------------------------------------------------
 # Global inconsistency  I(θ)
 # ---------------------------------------------------------------------------

@@ -414,6 +414,16 @@ classdef causal_experiment_engine_twostep
             if ~isfield(consistency_options, 'use_parallel')
                 consistency_options.use_parallel = false;
             end
+            % Non-uniform inner sampling (optional; default OFF = auto Gaussian)
+            if ~isfield(consistency_options, 'use_nonuniform_inner')
+                consistency_options.use_nonuniform_inner = false;
+            end
+            if ~isfield(consistency_options, 'inner_distribution')
+                consistency_options.inner_distribution = 'auto';  % 'auto' | 'gaussian' | 'truncated_normal'
+            end
+            if ~isfield(consistency_options, 'inner_dist_params')
+                consistency_options.inner_dist_params = struct();  % struct with .mu, .Sigma
+            end
             
             % Create output directory
             if ~exist(output_dir, 'dir')
@@ -675,6 +685,11 @@ classdef causal_experiment_engine_twostep
                 metadata.causality_type = zonotope_index.scenario_def.type;
                 metadata.consistency_method = consistency_options.method;
                 metadata.mc_samples = consistency_options.mc_samples;
+                metadata.use_nonuniform_inner = consistency_options.use_nonuniform_inner;
+                metadata.inner_distribution = consistency_options.inner_distribution;
+                if consistency_options.use_nonuniform_inner
+                    metadata.inner_dist_params = consistency_options.inner_dist_params;
+                end
                 metadata.n_repeats = zonotope_index.zonotope_files{1}.repeat_idx;
                 metadata.total_experiments = length(all_results);
                 metadata.zonotope_generation_timestamp = zonotope_index.generation_timestamp;
@@ -884,6 +899,10 @@ classdef causal_experiment_engine_twostep
                                     mc_opts.sampling_method = samp_method;
                                     mc_opts.return_details = true;
                                     mc_opts.verbose = false;
+                                    % Pass explicit inner distribution when enabled
+                                    if options.use_nonuniform_inner && ~isempty(fieldnames(options.inner_dist_params))
+                                        mc_opts.distribution = options.inner_dist_params;
+                                    end
 
                                     t_mc = tic;
                                     [mc_score, mc_details] = score_mc_probability(...
@@ -951,11 +970,14 @@ classdef causal_experiment_engine_twostep
                             end
                             
                             t_itheta = tic;
-                            [I_theta, I_details] = global_inconsistency(all_models, ...
-                                'n_samples', options.mc_samples, ...
-                                'method', i_theta_method, ...
-                                'return_details', true, ...
-                                'verbose', false);
+                            gi_args = {'n_samples', options.mc_samples, ...
+                                       'method', i_theta_method, ...
+                                       'return_details', true, ...
+                                       'verbose', false};
+                            if options.use_nonuniform_inner && ~isempty(fieldnames(options.inner_dist_params))
+                                gi_args = [gi_args, {'inner_dist_params', options.inner_dist_params}];
+                            end
+                            [I_theta, I_details] = global_inconsistency(all_models, gi_args{:});
                             state.inconsistency.timing_I_theta_s = toc(t_itheta);
 
                             state.inconsistency.I_theta = I_theta;

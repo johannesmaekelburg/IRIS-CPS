@@ -91,11 +91,8 @@ def plot_pretrain_curves(output_dir: Path) -> None:
         ax.plot(epochs, data[f"val_{task}"], label="val", color=PALETTE[1])
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Loss")
-        ax.set_title(task.replace("_", " ").title())
         ax.legend()
         ax.set_yscale("log")
-
-    fig.suptitle("Pretraining Loss Curves", fontweight="bold", y=1.02)
     fig.tight_layout()
     fig.savefig(output_dir / "pretrain_curves.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -124,7 +121,6 @@ def plot_finetune_curves(output_dir: Path) -> None:
     ax = axes[0, 0]
     ax.plot(epochs, data["train_loss"], color=PALETTE[0])
     ax.set_ylabel("Huber / MSE Loss")
-    ax.set_title("Training Loss")
     ax.set_yscale("log")
 
     # Val/Test MSE & MAE
@@ -135,7 +131,6 @@ def plot_finetune_curves(output_dir: Path) -> None:
         ax.plot(epochs, data["test_mse"], color=PALETTE[1], ls="--", label="Test MSE")
         ax.plot(epochs, data["test_mae"], color=PALETTE[2], ls="--", label="Test MAE")
     ax.set_ylabel("Error")
-    ax.set_title("Validation / Test Error")
     ax.legend(fontsize=8)
     ax.set_yscale("log")
 
@@ -146,7 +141,6 @@ def plot_finetune_curves(output_dir: Path) -> None:
         ax.plot(epochs, data["test_r2"], color=PALETTE[3], ls="--", label="Test")
     ax.axhline(1.0, ls="--", color="grey", alpha=0.5)
     ax.set_ylabel("R$^2$")
-    ax.set_title("R$^2$")
     ax.set_xlabel("Epoch")
     if has_test:
         ax.legend(fontsize=8)
@@ -158,7 +152,6 @@ def plot_finetune_curves(output_dir: Path) -> None:
         ax.plot(epochs, data["test_spearman_rho"], color=PALETTE[4], ls="--", label="Test")
     ax.axhline(1.0, ls="--", color="grey", alpha=0.5)
     ax.set_ylabel("Spearman $\\rho$")
-    ax.set_title("Rank Correlation")
     ax.set_xlabel("Epoch")
     if has_test:
         ax.legend(fontsize=8)
@@ -177,7 +170,6 @@ def plot_finetune_curves(output_dir: Path) -> None:
             a.axvline(best_test_ep, ls=":", color="blue", alpha=0.4,
                       label=f"best test (ep {int(best_test_ep)})")
 
-    fig.suptitle("Fine-tuning Training Curves", fontweight="bold")
     fig.tight_layout()
     fig.savefig(output_dir / "finetune_curves.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -224,7 +216,6 @@ def plot_predictions(
             "k--", alpha=0.4, lw=1)
     ax.set_xlabel("True $I(\\theta)$")
     ax.set_ylabel("Predicted $I(\\theta)$")
-    ax.set_title(f"True vs Predicted ({split_name})")
     ax.legend(fontsize=7, ncol=2, loc="upper left")
     ax.set_aspect("equal", adjustable="box")
 
@@ -237,7 +228,6 @@ def plot_predictions(
     ax.axhline(0, color="k", ls="--", alpha=0.4)
     ax.set_xlabel("True $I(\\theta)$")
     ax.set_ylabel("Residual (pred $-$ true)")
-    ax.set_title(f"Residuals ({split_name})")
 
     # --- 3. Error histogram ---
     ax = axes[1, 0]
@@ -245,7 +235,6 @@ def plot_predictions(
     ax.axvline(0, color="k", ls="--", alpha=0.4)
     ax.set_xlabel("Prediction Error")
     ax.set_ylabel("Count")
-    ax.set_title(f"Error Distribution ({split_name})")
     # Annotate stats
     ax.text(0.97, 0.95,
             f"mean={residuals.mean():.4f}\nstd={residuals.std():.4f}\n"
@@ -266,10 +255,7 @@ def plot_predictions(
         patch.set_facecolor(scenario_colors[s])
         patch.set_alpha(0.7)
     ax.set_ylabel("|Error|")
-    ax.set_title(f"Per-Scenario Absolute Error ({split_name})")
     ax.tick_params(axis="x", rotation=45)
-
-    fig.suptitle(f"Prediction Analysis — {split_name}", fontweight="bold")
     fig.tight_layout()
     fig.savefig(output_dir / f"predictions_{split_name.lower()}.png",
                 dpi=150, bbox_inches="tight")
@@ -316,11 +302,8 @@ def plot_predictions_combined(
 
         ax.set_xlabel("True $I(\\theta)$")
         ax.set_ylabel("Predicted $I(\\theta)$")
-        ax.set_title(name)
         ax.legend(fontsize=7, ncol=2, loc="lower right")
         ax.set_aspect("equal", adjustable="box")
-
-    fig.suptitle("True vs Predicted Inconsistency", fontweight="bold")
     fig.tight_layout()
     fig.savefig(output_dir / "scatter_combined.png", dpi=150, bbox_inches="tight")
     plt.close(fig)

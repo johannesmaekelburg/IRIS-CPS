@@ -88,7 +88,7 @@ def extract_fidelity_pairs(data: dict) -> pd.DataFrame:
             'sample_idx':         exp.get('sample_idx', np.nan),
             'jaccard_valid':      jaccard_valid,
             'I_AABB':             I_AABB,
-            'I_theta_pre':        pre_inc.get('I_theta', np.nan),
+            'I_theta_pre':        1.0 - pre_inc.get('I_MF_random', np.nan),
         }
 
         # Saltelli parameter values (only present for compound interventions)
@@ -100,8 +100,8 @@ def extract_fidelity_pairs(data: dict) -> pd.DataFrame:
             row[f'I_MC_{m}']  = inc.get(f'mc_probability_{m}', np.nan)
             row[f'I_MC_se_{m}'] = inc.get(f'mc_standard_error_{m}', np.nan)
 
-        # Primary I_theta (mean across methods, as stored by MATLAB)
-        row['I_theta'] = inc.get('I_theta', np.nan)
+        # Primary I_theta: MFMC-corrected estimate (inverted: I_MF_random is consistency prob)
+        row['I_theta'] = 1.0 - inc.get('I_MF_random', np.nan)
         records.append(row)
 
     return pd.DataFrame(records)

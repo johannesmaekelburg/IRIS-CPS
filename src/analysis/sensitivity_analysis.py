@@ -129,14 +129,9 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
             # Option 1: Flattened MATLAB export (post_inconsistency.I_theta)
             if 'post_inconsistency' in record and isinstance(record['post_inconsistency'], dict):
                 post_inc = record['post_inconsistency']
-                I_theta = post_inc.get('I_theta')
-                
-                # Compute from MC probability if I_theta is null
-                if I_theta is None or (isinstance(I_theta, float) and np.isnan(I_theta)):
-                    mc_p_consistent = post_inc.get('mc_p_consistent_sobol', post_inc.get('mc_probability'))
-                    if mc_p_consistent is not None:
-                        I_theta = 1.0 - mc_p_consistent
-                
+                _v = post_inc.get('I_MF_random')
+                I_theta = (1.0 - _v) if _v is not None else None
+
                 if I_theta is not None:
                     I_theta_se = post_inc.get('mc_standard_error_sobol', post_inc.get('I_theta_se', np.nan))
                     I_theta_ci95_lower = post_inc.get('I_theta_ci95_lower', np.nan)
@@ -159,16 +154,10 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                     continue
                 
                 inconsistency = post_state['inconsistency']
-                I_theta = inconsistency.get('I_theta')
-                
-                # Compute from MC probability if I_theta is null
-                if I_theta is None or (isinstance(I_theta, float) and np.isnan(I_theta)):
-                    mc_p_consistent = inconsistency.get('mc_p_consistent_sobol', inconsistency.get('mc_probability_sobol'))
-                    if mc_p_consistent is not None:
-                        I_theta = 1.0 - mc_p_consistent
-                
-                if I_theta is None:
+                _v = inconsistency.get('I_MF_random')
+                if _v is None:
                     continue
+                I_theta = 1.0 - _v
                 
                 I_theta_se = inconsistency.get('mc_standard_error_sobol', inconsistency.get('I_theta_se', np.nan))
                 I_theta_ci95_lower = inconsistency.get('I_theta_ci95_lower', np.nan)
@@ -210,11 +199,8 @@ def load_experimental_data(data_dir: str, pattern: str = 'results_*.json') -> pd
                 pre_inc = record['pre_state'].get('inconsistency', {})
             
             if pre_inc:
-                I_theta_pre = pre_inc.get('I_theta')
-                if I_theta_pre is None or (isinstance(I_theta_pre, float) and np.isnan(I_theta_pre)):
-                    mc_p_consistent_pre = pre_inc.get('mc_p_consistent_sobol', pre_inc.get('mc_probability_sobol'))
-                    if mc_p_consistent_pre is not None:
-                        I_theta_pre = 1.0 - mc_p_consistent_pre
+                _v = pre_inc.get('I_MF_random')
+                I_theta_pre = (1.0 - _v) if _v is not None else None
                 flat_record['I_theta_pre'] = I_theta_pre
             
             # Compute delta_I_theta if available

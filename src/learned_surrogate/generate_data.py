@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -65,6 +66,8 @@ from causal_engine import (
     compute_I_theta,
     compute_I_theta_aabb,
     create_convide_scenarios,
+    create_cps_scenarios,
+    create_all_scenarios,
     PARAM_NAMES,
     PARAM_BOUNDS,
 )
@@ -111,12 +114,15 @@ def random_zonotope(
     return Zonotope(c, G)
 
 
-def scenario_dir_name(scenario: Scenario) -> str:
-    """Directory name for a scenario, e.g. 'scenario_S04_Control_Design_Conflict'."""
+def scenario_dir_name(scenario: Scenario, global_idx: int) -> str:
+    """Directory name for a scenario, e.g. 'scenario_S04_Control_Design_Conflict'.
+
+    Uses *global_idx* (1-based position in create_all_scenarios()) so that
+    CONVIDE S1–S12 and CPS CPS1–CPS36 get unique, collision-free indices 1–48.
+    """
     parts = scenario.name.replace(":", "").split()
-    num = int(parts[0][1:])  # "S4" -> 4
     rest = "_".join(parts[1:])
-    return f"scenario_S{num:02d}_{rest}"
+    return f"scenario_S{global_idx:02d}_{rest}"
 
 
 def save_scenario_meta(scenario: Scenario, output_dir: Path) -> None:
@@ -425,6 +431,7 @@ def generate_train_inconsistency(
     n_samples: int,
     mc_samples: int,
     seed: int,
+    global_idx: int = 0,
 ) -> None:
     """Sample theta from PARAM_BOUNDS, compute I(theta) via MC probability.
 
@@ -434,7 +441,7 @@ def generate_train_inconsistency(
     Stores the post-intervention source zonotope features so the training
     script can build GNN graphs without re-running interventions.
     """
-    dir_name = scenario_dir_name(scenario)
+    dir_name = scenario_dir_name(scenario, global_idx)
     out_dir = output_dir / dir_name
     save_scenario_meta(scenario, out_dir)
 
@@ -563,17 +570,28 @@ def parse_scenarios(
 # Main
 # ---------------------------------------------------------------------------
 
+def _generate_scenario_worker(args_tuple) -> str:
+    """Top-level worker for multiprocessing (must be picklable)."""
+    scenario, output_dir, n_train, mc_samples, seed, global_idx = args_tuple
+    generate_train_inconsistency(
+        scenario, Path(output_dir), n_train, mc_samples,
+        seed=seed, global_idx=global_idx,
+    )
+    return scenario.name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate training data for the learned inconsistency surrogate.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  %(prog)s --tasks all --scenario all
-  %(prog)s --tasks train --scenario 4 --n_train 10000
+  %(prog)s --tasks all --source all            # all 48 scenarios (12 CONVIDE + 36 CPS)
+  %(prog)s --tasks all --source convide        # 12 CONVIDE only
+  %(prog)s --tasks all --source cps            # 36 CPS only
+  %(prog)s --tasks train --source cps --scenario 4 --n_train 10000
   %(prog)s --tasks pretrain
-  %(prog)s --tasks pretrain_volume pretrain_pairwise_aabb
-  %(prog)s --tasks train --scenario 8 --n_train 20000 --mc_samples 5000
+  %(prog)s --tasks train --source convide --scenario 8 --n_train 20000 --mc_samples 5000
         """,
     )
     parser.add_argument(
@@ -585,11 +603,17 @@ examples:
              "pretrain_affine_map  (can combine multiple)",
     )
     parser.add_argument(
+        "--source",
+        type=str,
+        default="all",
+        choices=["convide", "cps", "all"],
+        help="Scenario set: convide (12), cps (36), or all (48). Default: all",
+    )
+    parser.add_argument(
         "--scenario",
         type=str,
         default="all",
-        help="Scenario index 1-12 or 'all' (default: all). "
-             "Only affects 'train' task.",
+        help="Scenario index within the selected source set, or 'all'. Default: all",
     )
     parser.add_argument(
         "--output_dir",
@@ -625,6 +649,12 @@ examples:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--n_workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for scenario generation (default: 1)",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing data files (default: skip)",
@@ -633,8 +663,20 @@ examples:
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
     tasks = parse_tasks(args.tasks)
-    all_scenarios = create_convide_scenarios()
+
+    _source_map = {
+        "convide": create_convide_scenarios,
+        "cps":     create_cps_scenarios,
+        "all":     create_all_scenarios,
+    }
+    all_scenarios = _source_map[args.source]()
     selected_scenarios = parse_scenarios(args.scenario, all_scenarios)
+
+    # Build a global 1-based index map from scenario name -> index.
+    # Always based on create_all_scenarios() so indices are stable and
+    # match the 1–48 convention used in the training config.
+    _all_48 = create_all_scenarios()
+    _global_idx_map = {s.name: i + 1 for i, s in enumerate(_all_48)}
 
     # ── Banner ──
     print(f"\n{'=' * 60}")
@@ -646,6 +688,7 @@ examples:
         print(f"Scenarios      : {[s.name for s in selected_scenarios]}")
         print(f"n_train/scen   : {args.n_train}")
         print(f"MC samples/eval: {args.mc_samples}")
+        print(f"Workers        : {args.n_workers}")
     if tasks & PRETRAIN_TASKS:
         print(f"n_pretrain     : {args.n_pretrain}")
     print(f"Seed           : {args.seed}")
@@ -716,8 +759,10 @@ examples:
     # ── Training tasks (per-scenario) ──
 
     if "train" in tasks:
+        worker_args = []
         for i, scenario in enumerate(selected_scenarios):
-            dir_name = scenario_dir_name(scenario)
+            g_idx = _global_idx_map[scenario.name]
+            dir_name = scenario_dir_name(scenario, g_idx)
             path = output_dir / dir_name / "train_inconsistency.npz"
             if path.exists() and not args.overwrite:
                 print(
@@ -725,13 +770,19 @@ examples:
                     f"exists (use --overwrite)"
                 )
                 continue
-            generate_train_inconsistency(
-                scenario,
-                output_dir,
-                args.n_train,
-                args.mc_samples,
-                seed=args.seed + 100 + i,
-            )
+            worker_args.append((
+                scenario, str(output_dir), args.n_train, args.mc_samples,
+                args.seed + 100 + i, g_idx,
+            ))
+
+        if worker_args:
+            if args.n_workers > 1:
+                with mp.Pool(processes=args.n_workers) as pool:
+                    for name in pool.imap_unordered(_generate_scenario_worker, worker_args):
+                        print(f"  [train] Finished: {name}")
+            else:
+                for wa in worker_args:
+                    _generate_scenario_worker(wa)
 
     # ── Done ──
     dt_total = time.perf_counter() - t_total

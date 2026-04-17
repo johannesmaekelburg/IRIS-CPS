@@ -107,6 +107,7 @@ addParameter(p, 'verbose', false, @islogical);
 addParameter(p, 'method', 'mc', @(x) ismember(x, {'mc', 'jaccard', 'exact'}));
 addParameter(p, 'return_details', true, @islogical);
 addParameter(p, 'theta_params', [], @(x) isempty(x) || isstruct(x));
+addParameter(p, 'inner_dist_params', struct(), @(x) isempty(x) || isstruct(x));
 parse(p, models, varargin{:});
 
 n_samples = p.Results.n_samples;
@@ -194,7 +195,12 @@ switch lower(method)
         mc_opts.seed = seed;
         mc_opts.verbose = verbose;
         mc_opts.return_details = true;
-        
+        % Forward explicit inner distribution when provided
+        inner_dist_params = p.Results.inner_dist_params;
+        if ~isempty(fieldnames(inner_dist_params))
+            mc_opts.distribution = inner_dist_params;
+        end
+
         [p_consistent, mc_details] = score_mc_probability(model_list, mc_opts);
         
     case 'jaccard'

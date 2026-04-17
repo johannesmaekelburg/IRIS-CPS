@@ -28,14 +28,14 @@ METHOD_MAP = {
     'timing_jaccard_s':          ('Jaccard (AABB)',   None),
     'timing_jaccard_mc_sobol_s': ('Jaccard-MC Sobol', None),
     'timing_jaccard_mc_random_s':('Jaccard-MC Random',None),
-    'timing_mc_sobol_s':         ('MC Sobol',         'I_MF_sobol'),
+    'timing_mc_sobol_s':         ('MC Sobol',         'I_MF_random'),
     'timing_mc_random_s':        ('MC Random',        'I_theta'),
     'timing_mc_halton_s':        ('MC Halton',        None),
     'timing_I_theta_s':          ('I(θ)',             'I_theta'),
 }
 
 # Reference metric for correlations (Spearman ρ)
-REFERENCE_FIELD = 'I_MF_sobol'   # MFMC-Sobol as gold standard
+REFERENCE_FIELD = 'I_MF_random'   # MFMC-Sobol as gold standard
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────

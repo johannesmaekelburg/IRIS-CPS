@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -290,6 +291,9 @@ def main() -> None:
                         help="Skip pretraining, load checkpoint")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to pretrained checkpoint")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Optional run name appended to output_dir. "
+                             "Defaults to a timestamp (YYYYMMDD_HHMMSS).")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -298,8 +302,33 @@ def main() -> None:
 
     project_root = Path(__file__).resolve().parent.parent.parent
     data_root = project_root / config.data_root
-    output_dir = project_root / config.output_dir
+    run_tag = args.run_name or time.strftime("%Y%m%d_%H%M%S")
+    output_dir = project_root / config.output_dir / run_tag
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Save config file to output dir ────────────────────────────────────────
+    if args.config and Path(args.config).exists():
+        shutil.copy(args.config, output_dir / "config_used.yaml")
+    else:
+        # No YAML provided — save resolved dataclass config as YAML
+        import yaml
+        with open(output_dir / "config_used.yaml", "w") as _f:
+            yaml.dump(dataclasses.asdict(config), _f, default_flow_style=False)
+
+    # ── Tee stdout/stderr to output_dir/train.log ─────────────────────────────
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                s.write(data)
+        def flush(self):
+            for s in self._streams:
+                s.flush()
+
+    _log_file = open(output_dir / "train.log", "w", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, _log_file)
+    sys.stderr = _Tee(sys.__stderr__, _log_file)
 
     print(f"\n{'=' * 60}")
     print("GINE INCONSISTENCY SURROGATE — TRAINING")
@@ -489,12 +518,21 @@ def main() -> None:
 
     if config.train.loss == "huber":
         loss_fn = nn.HuberLoss(delta=config.train.huber_delta)
+    elif config.train.loss == "combined":
+        # Weighted sum of Huber (robust, good for ρ) + MSE (good for R²)
+        _huber = nn.HuberLoss(delta=config.train.huber_delta)
+        _mse   = nn.MSELoss()
+        _w     = getattr(config.train, "mse_weight", 0.5)
+        class _CombinedLoss(nn.Module):
+            def forward(self, pred, target):
+                return (1.0 - _w) * _huber(pred, target) + _w * _mse(pred, target)
+        loss_fn = _CombinedLoss()
     else:
         loss_fn = nn.MSELoss()
 
-    stopper = EarlyStopping(config.train.patience)
-    best_val_mse = float("inf")
-    best_test_mse = float("inf")
+    stopper = EarlyStopping(config.train.patience, mode="max")
+    best_val_rho = -float("inf")
+    best_test_rho = -float("inf")
     finetune_logger = MetricsLogger(output_dir / "finetune_log.csv")
 
     # ==================================================================
@@ -551,8 +589,8 @@ def main() -> None:
                   f"| rho={val_metrics['spearman_rho']:.4f}"
                   f"{test_str} | {dt:.1f}s")
 
-        if val_metrics["mse"] < best_val_mse:
-            best_val_mse = val_metrics["mse"]
+        if val_metrics["spearman_rho"] > best_val_rho:
+            best_val_rho = val_metrics["spearman_rho"]
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "config": dataclasses.asdict(config),
@@ -560,8 +598,8 @@ def main() -> None:
                 "val_metrics": val_metrics,
             }, output_dir / "best_model.pt")
 
-        if test_metrics is not None and test_metrics["mse"] < best_test_mse:
-            best_test_mse = test_metrics["mse"]
+        if test_metrics is not None and test_metrics["spearman_rho"] > best_test_rho:
+            best_test_rho = test_metrics["spearman_rho"]
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "config": dataclasses.asdict(config),
@@ -570,7 +608,7 @@ def main() -> None:
                 "test_metrics": test_metrics,
             }, output_dir / "best_model_test.pt")
 
-        if stopper.step(val_metrics["mse"], epoch):
+        if stopper.step(val_metrics["spearman_rho"], epoch):
             print(f"  Early stopping at epoch {epoch}")
             break
 

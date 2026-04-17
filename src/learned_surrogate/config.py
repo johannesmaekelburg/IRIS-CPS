@@ -19,7 +19,7 @@ class PretrainConfig:
     tasks: List[str] = field(default_factory=lambda: [
         "volume", "containment", "pairwise_aabb", "affine_map",
     ])
-    epochs: int = 50
+    epochs: int = 500
     batch_size: int = 256
     lr: float = 1e-3
     weight_decay: float = 1e-5
@@ -34,8 +34,8 @@ class PretrainConfig:
 
 @dataclass
 class TrainConfig:
-    scenarios_train: List[int] = field(default_factory=lambda: list(range(1, 11)))
-    scenarios_test: List[int] = field(default_factory=lambda: [11, 12])
+    scenarios_train: List[int] = field(default_factory=lambda: [1,2,3,4,6,7,8,9,10,11,12])
+    scenarios_test: List[int] = field(default_factory=lambda: [5])
     val_fraction: float = 0.15
     epochs: int = 100
     batch_size: int = 128
@@ -44,6 +44,7 @@ class TrainConfig:
     scheduler: str = "cosine"
     loss: str = "huber"
     huber_delta: float = 0.1
+    mse_weight: float = 0.5        # only used when loss == "combined"
     patience: int = 15
     freeze_backbone_epochs: int = 0
     backbone_lr_factor: float = 0.1

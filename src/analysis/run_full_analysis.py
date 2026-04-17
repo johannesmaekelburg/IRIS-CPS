@@ -242,28 +242,16 @@ def load_data_for_comparison(data_dir: str) -> pd.DataFrame:
             post_state = exp.get('post_state', {})
             post_inc = exp.get('post_inconsistency', post_state.get('inconsistency', {}))
             
-            # Compute I_theta from MC probability if not directly available
-            I_theta_post = post_inc.get('I_theta')
-            if I_theta_post is None or (isinstance(I_theta_post, float) and np.isnan(I_theta_post)):
-                mc_p_consistent = post_inc.get('mc_p_consistent_sobol', post_inc.get('mc_probability_sobol'))
-                if mc_p_consistent is not None:
-                    I_theta_post = 1.0 - mc_p_consistent
-            
-            record['I_theta'] = I_theta_post
+            _v = post_inc.get('I_MF_random')
+            record['I_theta'] = (1.0 - _v) if _v is not None else np.nan
             record['jaccard_index'] = post_inc.get('jaccard_index', np.nan)
-            
+
             # Extract pre-intervention inconsistency
             pre_state = exp.get('pre_state', {})
             pre_inc = exp.get('pre_inconsistency', pre_state.get('inconsistency', {}))
-            
-            # Compute pre I_theta
-            I_theta_pre = pre_inc.get('I_theta')
-            if I_theta_pre is None or (isinstance(I_theta_pre, float) and np.isnan(I_theta_pre)):
-                mc_p_consistent_pre = pre_inc.get('mc_p_consistent_sobol', pre_inc.get('mc_probability_sobol'))
-                if mc_p_consistent_pre is not None:
-                    I_theta_pre = 1.0 - mc_p_consistent_pre
-            
-            record['I_theta_pre'] = I_theta_pre
+
+            _v = pre_inc.get('I_MF_random')
+            record['I_theta_pre'] = (1.0 - _v) if _v is not None else np.nan
             
             if not np.isnan(record['I_theta']) and not np.isnan(record['I_theta_pre']):
                 record['delta_I_theta'] = record['I_theta'] - record['I_theta_pre']
@@ -593,8 +581,10 @@ def load_saltelli_data_for_plots(data_dir: str) -> pd.DataFrame:
             source_center = pre_unc.get('source_center', [])
             dim = len(source_center) if source_center else None
 
-            I_theta_pre = pre_inc.get('I_theta')
-            I_theta_post = post_inc.get('I_theta')
+            _vp = pre_inc.get('I_MF_random')
+            _vq = post_inc.get('I_MF_random')
+            I_theta_pre  = (1.0 - _vp) if _vp is not None else None
+            I_theta_post = (1.0 - _vq) if _vq is not None else None
             delta = causal.get('delta_I_theta')
             if delta is None and I_theta_pre is not None and I_theta_post is not None:
                 delta = I_theta_post - I_theta_pre
@@ -782,9 +772,10 @@ def _load_scenario_saltelli_data(json_path: Path):
     for exp in experiments:
         if exp.get('intervention_type') != 'compound':
             continue
-        I_theta = exp.get('post_state', {}).get('inconsistency', {}).get('I_theta')
-        if I_theta is None:
+        _v = exp.get('post_state', {}).get('inconsistency', {}).get('I_MF_random')
+        if _v is None:
             continue
+        I_theta = 1.0 - _v
         records.append({
             'scale_factor': exp['scale_factor'],
             'center_delta': exp['center_delta'],

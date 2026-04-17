@@ -131,6 +131,19 @@ class InconsistencyDataset(Dataset):
 
             n = int(npz["n_samples"])
 
+            # Per-scenario scale normalization: max absolute value across all
+            # source centers, source generators, target center, target generators.
+            # Computed over all samples (before split) for a consistent scale.
+            tgt_c_arr = np.array(meta["target_center"], dtype=np.float32)
+            tgt_G_arr = np.array(meta["target_generators"], dtype=np.float32)
+            scale = float(max(
+                float(np.abs(npz["source_center"][:n]).max()),
+                float(np.abs(npz["source_generators"][:n]).max()),
+                float(np.abs(tgt_c_arr).max()) if tgt_c_arr.size > 0 else 0.0,
+                float(np.abs(tgt_G_arr).max()) if tgt_G_arr.size > 0 else 0.0,
+                1e-8,
+            ))
+
             # Train/val split
             rng = np.random.default_rng(seed + s_idx)
             perm = rng.permutation(n)
@@ -151,6 +164,7 @@ class InconsistencyDataset(Dataset):
                     "I_theta_mc": float(npz["I_theta_mc"][i]),
                     "I_theta_aabb": float(npz["I_theta_aabb"][i]),
                     "scenario_idx": s_idx,
+                    "scale": scale,
                 })
 
     def len(self) -> int:
@@ -160,6 +174,7 @@ class InconsistencyDataset(Dataset):
         s = self._samples[idx]
         meta = s["meta"]
         dim = meta["dim"]
+        scale = s.get("scale", 1.0)
 
         # --- Node 0: intervened source ---
         src_c = s["source_center"].astype(np.float32)[:D_MAX]
@@ -167,14 +182,14 @@ class InconsistencyDataset(Dataset):
         src_n_gen = s["source_n_generators"]
 
         src_c_pad = np.zeros(D_MAX, dtype=np.float32)
-        src_c_pad[:D_MAX] = src_c
+        src_c_pad[:D_MAX] = src_c / scale
         src_G_t = np.zeros((P_MAX, D_MAX), dtype=np.float32)
-        src_G_t[:src_G.shape[1], :src_G.shape[0]] = src_G.T
+        src_G_t[:src_G.shape[1], :src_G.shape[0]] = src_G.T / scale
         src_mask = _generator_mask(src_n_gen)
 
         # --- Node 1: target (fixed per scenario) ---
-        tgt_c = _pad_center(np.array(meta["target_center"], dtype=np.float32))
-        tgt_G = _pad_generators(np.array(meta["target_generators"], dtype=np.float32))
+        tgt_c = _pad_center(np.array(meta["target_center"], dtype=np.float32)) / scale
+        tgt_G = _pad_generators(np.array(meta["target_generators"], dtype=np.float32)) / scale
         tgt_mask = _generator_mask(meta["target_n_generators"])
 
         # --- Stack nodes ---

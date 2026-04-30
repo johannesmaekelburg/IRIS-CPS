@@ -127,12 +127,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-init", type=float, default=10.0, help="Initial penalty lambda.")
     p.add_argument(
         "--search-mode",
-        choices=["hybrid", "surrogate", "cem", "mppi", "spsa"],
+        choices=["hybrid", "surrogate", "cem", "mppi", "spsa", "multifidelity"],
         default="hybrid",
         help=(
             "Counterfactual search mode. 'hybrid' lets the GNN propose multiple "
-            "repairs and uses MC/MFMC to select the winner; the others are direct "
-            "search baselines in theta-space."
+            "repairs and uses MC/MFMC to select the winner, 'multifidelity' adds "
+            "MFMC-guided SPSA refinement on top of the hybrid proposals, and the "
+            "others are direct search baselines in theta-space."
         ),
     )
     p.add_argument(
@@ -181,6 +182,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help="Initial perturbation scale as a fraction of box width for SPSA.",
+    )
+    # Multi-fidelity (Phase-2 SPSA) parameters
+    p.add_argument(
+        "--mf-spsa-iter",
+        type=int,
+        default=40,
+        help="SPSA refinement iterations in multi-fidelity mode (default: 40).",
+    )
+    p.add_argument(
+        "--mf-mc-per-eval",
+        type=int,
+        default=50,
+        help="MC samples per MFMC evaluation during SPSA refinement (default: 50).",
     )
     # Parallelism
     p.add_argument(
@@ -290,6 +304,8 @@ def main() -> None:
         mppi_temperature=args.temperature,
         init_sigma_frac=args.init_sigma_frac,
         spsa_perturb_scale=args.spsa_perturb_scale,
+        mf_spsa_iter=args.mf_spsa_iter,
+        mf_mc_per_eval=args.mf_mc_per_eval,
     )
 
     checkpoint = Path(args.checkpoint)
@@ -335,6 +351,8 @@ def main() -> None:
         "temperature": args.temperature,
         "init_sigma_frac": args.init_sigma_frac,
         "spsa_perturb_scale": args.spsa_perturb_scale,
+        "mf_spsa_iter": args.mf_spsa_iter,
+        "mf_mc_per_eval": args.mf_mc_per_eval,
         "output_path": str(out_path),
     }
     print(f"Streaming incremental results to: {out_path}")
@@ -343,7 +361,7 @@ def main() -> None:
         f"{args.search_mode}"
         + (
             f" (top-{args.rerank_top_k} MC/MFMC rerank, {args.candidate_starts} extra starts)"
-            if args.search_mode == "hybrid"
+            if args.search_mode in ("hybrid", "multifidelity")
             else f" (population={args.population_size}, elite={args.elite_frac:.2f})"
             if args.search_mode == "cem"
             else f" (population={args.population_size}, temp={args.temperature:.3f})"

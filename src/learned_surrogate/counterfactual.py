@@ -1089,6 +1089,9 @@ class CounterfactualOptimizer:
         """
         t0 = time.perf_counter()
         theta_star_np = np.asarray(theta_star, dtype=np.float32)
+        progress_prefix = (
+            f"  [S{scenario_idx:02d}]" if scenario_idx is not None else "  [counterfactual]"
+        )
 
         # Initial surrogate evaluation
         theta_star_t = torch.tensor(
@@ -1148,6 +1151,7 @@ class CounterfactualOptimizer:
         no_improve = 0
         prev_theta = theta.data.clone()
         final_iter = self.max_iter
+        report_every = max(25, self.max_iter // 10)
 
         for it in range(self.max_iter):
             optimizer.zero_grad()
@@ -1205,6 +1209,14 @@ class CounterfactualOptimizer:
                 # Escalate penalty if constraint still violated
                 if (it + 1) % self.escalation_freq == 0 and I_val > self.gamma:
                     lam = min(lam * self.lambda_scale, self.lambda_max)
+
+            if it == 0 or (it + 1) % report_every == 0:
+                print(
+                    f"{progress_prefix} {selection_mode} iter {it + 1}/{self.max_iter} "
+                    f"I={I_val:.4f} best={best_I:.4f} lam={lam:.2f} "
+                    f"elapsed={time.perf_counter() - t0:.1f}s",
+                    flush=True,
+                )
         else:
             final_iter = self.max_iter
 
@@ -1270,10 +1282,17 @@ class CounterfactualOptimizer:
             n_random_starts=n_candidate_starts,
             seed=seed,
         )
+        progress_prefix = (
+            f"  [S{scenario_idx:02d}]" if scenario_idx is not None else "  [counterfactual]"
+        )
 
         surrogate_candidates: List[CounterfactualResult] = []
         seen = set()
-        for start in starts:
+        for start_idx, start in enumerate(starts, start=1):
+            print(
+                f"{progress_prefix} hybrid candidate {start_idx}/{len(starts)} start",
+                flush=True,
+            )
             candidate = self._optimize_single(
                 theta_star=theta_star_np,
                 theta_init=start,
@@ -1288,6 +1307,12 @@ class CounterfactualOptimizer:
                 continue
             seen.add(key)
             surrogate_candidates.append(candidate)
+            print(
+                f"{progress_prefix} hybrid candidate {start_idx}/{len(starts)} "
+                f"done: valid={candidate.valid} I={candidate.I_surrogate_prime:.4f} "
+                f"iters={candidate.n_iter} prox={np.linalg.norm(candidate.delta_theta):.4f}",
+                flush=True,
+            )
 
         if not surrogate_candidates:
             return self.optimize(
@@ -1308,7 +1333,12 @@ class CounterfactualOptimizer:
 
         rerank_count = max(1, min(rerank_top_k, len(surrogate_candidates)))
         verified_candidates: List[CounterfactualResult] = []
-        for candidate in surrogate_candidates[:rerank_count]:
+        for rank_idx, candidate in enumerate(surrogate_candidates[:rerank_count], start=1):
+            print(
+                f"{progress_prefix} hybrid rerank {rank_idx}/{rerank_count} "
+                f"verify I={candidate.I_surrogate_prime:.4f}",
+                flush=True,
+            )
             I_mc = (
                 self._mfmc_verify(candidate.theta_prime, mc_samples)
                 if verify_mc
@@ -1341,6 +1371,269 @@ class CounterfactualOptimizer:
         )
         winner.selection_reason = reason
         winner.candidate_count = rerank_count
+        print(
+            f"{progress_prefix} hybrid winner: valid={winner.valid} "
+            f"I_mc={winner.I_mc_prime if winner.I_mc_prime is not None else float('nan'):.4f} "
+            f"reason={reason}",
+            flush=True,
+        )
+        return winner
+
+    # ------------------------------------------------------------------
+    # Multi-fidelity search (Phase 2: MFMC-guided SPSA refinement)
+    # ------------------------------------------------------------------
+
+    def _mfmc_spsa_refine(
+        self,
+        theta_init: np.ndarray,
+        theta_star_np: np.ndarray,
+        n_iter: int = 40,
+        mc_samples_per_eval: int = 50,
+        lr: float = 0.005,
+        perturb_scale: float = 0.05,
+        trust_radius: Optional[float] = None,
+        normalized_proximity: bool = True,
+        lam_prox: float = 0.5,
+        seed: int = 0,
+    ) -> Tuple[np.ndarray, float]:
+        """Phase-2 MFMC-guided SPSA refinement in a neighbourhood of theta_init.
+
+        Uses the MFMC estimator (cheap, unbiased) as the objective instead of
+        the biased surrogate.  Two MFMC evaluations per SPSA iteration
+        (theta ± ck*delta) give a noisy gradient estimate that drives theta
+        toward the true consistency boundary.
+
+        Args:
+            theta_init:         Starting point (surrogate output from Phase 1).
+            theta_star_np:      Original query — kept to track proximity.
+            n_iter:             SPSA iterations.
+            mc_samples_per_eval: MC samples per MFMC call (low: 50 for speed).
+            lr:                 SPSA step-size coefficient a_k = lr / (k+1)^0.602.
+            perturb_scale:      SPSA perturbation coefficient c_k = c0 / (k+1)^0.161.
+            trust_radius:       If set, project theta back into an L∞ ball of this
+                                half-width around theta_init after each step.
+            normalized_proximity: Use normalised L2 distance for the prox penalty.
+            lam_prox:           Weight on the proximity penalty in the SPSA objective.
+            seed:               RNG seed for the Bernoulli perturbation vectors.
+
+        Returns:
+            (best_theta, best_I_mfmc) — the best θ found and its MFMC value.
+        """
+        rng = np.random.default_rng(seed)
+        lb = self.theta_lb.cpu().numpy()
+        ub = self.theta_ub.cpu().numpy()
+        span = (ub - lb).clip(min=1e-8)
+
+        theta = theta_init.astype(np.float32).copy()
+        best_theta = theta.copy()
+        best_I = self._mfmc_verify(theta, mc_samples_per_eval)
+
+        for k in range(n_iter):
+            # Robbins–Monro sequences (SPSA standard)
+            ck = perturb_scale / (k + 1) ** 0.161
+            ak = lr / (k + 1) ** 0.602
+
+            # Bernoulli ±1 perturbation vector
+            delta = rng.choice([-1.0, 1.0], size=theta.shape).astype(np.float32)
+
+            theta_p = np.clip(theta + ck * delta, lb, ub)
+            theta_m = np.clip(theta - ck * delta, lb, ub)
+
+            # MFMC evaluations at perturbed points
+            I_p = self._mfmc_verify(theta_p, mc_samples_per_eval)
+            I_m = self._mfmc_verify(theta_m, mc_samples_per_eval)
+
+            # SPSA gradient of the penalised objective: I_MFMC + lam_prox * proximity
+            if normalized_proximity:
+                prox_p = float(np.sum(((theta_p - theta_star_np) / span) ** 2))
+                prox_m = float(np.sum(((theta_m - theta_star_np) / span) ** 2))
+            else:
+                prox_p = float(np.sum((theta_p - theta_star_np) ** 2))
+                prox_m = float(np.sum((theta_m - theta_star_np) ** 2))
+
+            obj_p = I_p + lam_prox * prox_p
+            obj_m = I_m + lam_prox * prox_m
+
+            grad_est = (obj_p - obj_m) / (2.0 * ck + 1e-12) * delta
+
+            # Gradient step + box projection
+            theta = np.clip(theta - ak * grad_est, lb, ub).astype(np.float32)
+
+            # Optional trust-region (L∞ ball around the Phase-1 solution)
+            if trust_radius is not None:
+                theta = np.clip(theta, theta_init - trust_radius, theta_init + trust_radius)
+                theta = np.clip(theta, lb, ub)
+
+            # Evaluate refined point
+            I_val = self._mfmc_verify(theta, mc_samples_per_eval)
+            if I_val < best_I or (I_val <= self.gamma_verify and best_I > self.gamma_verify):
+                best_I = I_val
+                best_theta = theta.copy()
+
+            # Early stop if already consistent
+            if best_I <= self.gamma_verify:
+                break
+
+        return best_theta, best_I
+
+    def optimize_multifidelity(
+        self,
+        theta_star: np.ndarray,
+        mc_samples: int = 500,
+        verify_mc: bool = True,
+        scenario_idx: Optional[int] = None,
+        normalized_proximity: bool = True,
+        n_candidate_starts: int = 3,
+        rerank_top_k: int = 4,
+        mf_spsa_iter: int = 40,
+        mf_mc_per_eval: int = 50,
+        seed: int = 0,
+    ) -> CounterfactualResult:
+        """Multi-fidelity counterfactual search.
+
+        Phase 1 — Hybrid surrogate search (identical to optimize_hybrid):
+            * N surrogate-gradient starts → top-K candidates by surrogate I.
+
+        Phase 2 — MFMC-guided SPSA refinement:
+            * Each top-K candidate is refined with SPSA using the MFMC
+              estimator (unbiased, cheap) as the objective.  This corrects
+              the surrogate-MC calibration gap without requiring retraining.
+
+        Phase 3 — Final MC/MFMC verification of the refined candidates.
+
+        The ``search_mode="hybrid"`` path is completely unchanged; this is an
+        additive mode that can be selected independently.
+        """
+        theta_star_np = np.asarray(theta_star, dtype=np.float32)
+        t0 = time.perf_counter()
+
+        progress_prefix = (
+            f"  [S{scenario_idx:02d}]" if scenario_idx is not None else "  [counterfactual]"
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 1: surrogate candidates (same as hybrid, no MC verification)
+        # ------------------------------------------------------------------
+        starts = self._candidate_starts(
+            theta_star_np=theta_star_np,
+            n_random_starts=n_candidate_starts,
+            seed=seed,
+        )
+
+        surrogate_candidates: List[CounterfactualResult] = []
+        seen: set = set()
+        for start_idx, start in enumerate(starts, start=1):
+            candidate = self._optimize_single(
+                theta_star=theta_star_np,
+                theta_init=start,
+                mc_samples=mc_samples,
+                verify_mc=False,
+                scenario_idx=scenario_idx,
+                normalized_proximity=normalized_proximity,
+                selection_mode="mf_proposal",
+            )
+            key = tuple(np.round(candidate.theta_prime.astype(np.float64), 6).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            surrogate_candidates.append(candidate)
+            print(
+                f"{progress_prefix} mf phase1 {start_idx}/{len(starts)}: "
+                f"I_surr={candidate.I_surrogate_prime:.4f} "
+                f"prox={np.linalg.norm(candidate.delta_theta):.4f}",
+                flush=True,
+            )
+
+        if not surrogate_candidates:
+            # Fallback: plain single surrogate run + final verification
+            return self.optimize(
+                theta_star=theta_star_np,
+                mc_samples=mc_samples,
+                verify_mc=verify_mc,
+                scenario_idx=scenario_idx,
+                normalized_proximity=normalized_proximity,
+            )
+
+        # Sort by surrogate inconsistency (best first)
+        surrogate_candidates.sort(
+            key=lambda c: (
+                0 if c.I_surrogate_prime <= self.gamma else 1,
+                c.I_surrogate_prime,
+                self._proximity_l2(c.theta_prime, theta_star_np, normalized_proximity),
+            )
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 2: MFMC-SPSA refinement of top-K candidates
+        # ------------------------------------------------------------------
+        rerank_count = max(1, min(rerank_top_k, len(surrogate_candidates)))
+        refined_candidates: List[CounterfactualResult] = []
+
+        for rank_idx, candidate in enumerate(surrogate_candidates[:rerank_count], start=1):
+            print(
+                f"{progress_prefix} mf phase2 refine {rank_idx}/{rerank_count} "
+                f"(I_surr={candidate.I_surrogate_prime:.4f})",
+                flush=True,
+            )
+            refined_theta, I_mfmc_refined = self._mfmc_spsa_refine(
+                theta_init=candidate.theta_prime,
+                theta_star_np=theta_star_np,
+                n_iter=mf_spsa_iter,
+                mc_samples_per_eval=mf_mc_per_eval,
+                normalized_proximity=normalized_proximity,
+                seed=seed + rank_idx,
+            )
+
+            # ------------------------------------------------------------------
+            # Phase 3: final high-fidelity verification of refined point
+            # ------------------------------------------------------------------
+            I_mc_final = (
+                self._mfmc_verify(refined_theta, mc_samples)
+                if verify_mc
+                else None
+            )
+            delta = refined_theta - theta_star_np
+            I_mc_final_str = f"{I_mc_final:.4f}" if I_mc_final is not None else "n/a"
+            print(
+                f"{progress_prefix} mf phase3 verify {rank_idx}/{rerank_count}: "
+                f"I_mfmc_refined={I_mfmc_refined:.4f} "
+                f"I_mc_final={I_mc_final_str} "
+                f"valid={I_mc_final is not None and I_mc_final <= self.gamma_verify}",
+                flush=True,
+            )
+            refined_candidates.append(
+                CounterfactualResult(
+                    theta_star=theta_star_np,
+                    theta_prime=refined_theta,
+                    delta_theta=delta,
+                    I_surrogate_star=candidate.I_surrogate_star,
+                    I_surrogate_prime=candidate.I_surrogate_prime,
+                    I_mc_prime=I_mc_final,
+                    gamma=self.gamma_verify,
+                    gamma_surrogate=self.gamma,
+                    n_iter=candidate.n_iter + mf_spsa_iter,
+                    converged=I_mfmc_refined <= self.gamma_verify,
+                    valid=(I_mc_final is not None and I_mc_final <= self.gamma_verify),
+                    wall_time_s=time.perf_counter() - t0,
+                    scenario_idx=scenario_idx,
+                    selection_mode="multifidelity",
+                    candidate_count=rerank_count,
+                )
+            )
+
+        winner, reason = self._select_verified_candidate(
+            refined_candidates,
+            theta_star_np=theta_star_np,
+            normalized=normalized_proximity,
+        )
+        winner.selection_reason = reason
+        winner.wall_time_s = time.perf_counter() - t0
+        print(
+            f"{progress_prefix} mf winner: valid={winner.valid} "
+            f"I_mc={winner.I_mc_prime if winner.I_mc_prime is not None else float('nan'):.4f} "
+            f"reason={reason}",
+            flush=True,
+        )
         return winner
 
 
@@ -1449,6 +1742,9 @@ class CounterfactualEvalConfig:
     mppi_temperature: float = 0.05
     init_sigma_frac: float = 0.2
     spsa_perturb_scale: float = 0.1
+    # Multi-fidelity (phase-2 SPSA) parameters
+    mf_spsa_iter: int = 40
+    mf_mc_per_eval: int = 50
 
 
 def _run_counterfactual_search(
@@ -1510,6 +1806,19 @@ def _run_counterfactual_search(
             scenario_idx=scenario_idx,
             normalized_proximity=cfg.normalize_proximity,
             perturb_scale=cfg.spsa_perturb_scale,
+            seed=query_seed,
+        )
+    if cfg.search_mode == "multifidelity":
+        return opt.optimize_multifidelity(
+            theta_star=theta_star,
+            mc_samples=cfg.mc_samples_verify,
+            verify_mc=True,
+            scenario_idx=scenario_idx,
+            normalized_proximity=cfg.normalize_proximity,
+            n_candidate_starts=cfg.n_candidate_starts,
+            rerank_top_k=cfg.rerank_top_k,
+            mf_spsa_iter=cfg.mf_spsa_iter,
+            mf_mc_per_eval=cfg.mf_mc_per_eval,
             seed=query_seed,
         )
     raise ValueError(f"Unknown search mode: {cfg.search_mode}")

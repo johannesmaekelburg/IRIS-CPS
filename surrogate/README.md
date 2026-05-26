@@ -33,7 +33,7 @@ Python 3.9+, PyTorch 2.x.  No GPU required (CPU inference ~2 µs/sample).
 
 ## Data
 
-Raw training data (~8 GB) is hosted on Zenodo: **[TODO: add DOI]**
+Raw training data (~8 GB) is hosted on figshare: https://figshare.com/s/75b399b32008c72925d5
 
 Download and place under:
 ```

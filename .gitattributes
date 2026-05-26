@@ -1,1 +1,2 @@
 *.json filter=lfs diff=lfs merge=lfs -text
+data/surrogate/**/*.npz filter=lfs diff=lfs merge=lfs -text

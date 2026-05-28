@@ -1,0 +1,16 @@
+[project]
+name = "causality-inconsistency-uncertainty"
+version = "0.1.0"
+description = "Causal inference framework for uncertainty-inconsistency analysis in CPS"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "seaborn>=0.12",
+    "scikit-learn>=1.2",
+    "SALib>=1.4",
+    "torch>=2.0",
+    "tqdm>=4.60",
+]

@@ -302,6 +302,38 @@ class ProductSetTransformer(nn.Module):
         return torch.sigmoid(log_p + bias)
 
 
+class ProductSetTransformerExact(ProductSetTransformer):
+    """Exact noisy-AND head: I = 1 - prod_i p_i * p_global.
+
+    Identical to ProductSetTransformer except the output is a true product of
+    per-dimension consistency probabilities. Each per-dim head output is read
+    as a logit; p_i = sigmoid(l_i) in (0,1) is the probability that a source
+    realization is contained in the target along dimension i. The global term
+    is one additional containment factor p_g = sigmoid(b(g)). Consistency is
+    their product (a point must be contained in ALL dimensions), so
+
+        P(consistent) = prod_i p_i * p_g,   I = 1 - P(consistent).
+
+    Computed in log-space for stability: log P = sum_i logsigmoid(l_i) +
+    logsigmoid(b), then I = 1 - exp(log P) = -expm1(log P). This directly
+    encodes the conjunction structure (no logistic approximation), with
+    I in [0, 1) by construction.
+    """
+
+    def forward(self, per_dim, mask, global_feats):
+        x = self.project(per_dim)                              # (B, D, d_model)
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        logit = self.dim_head(x).squeeze(-1)                   # (B, D)
+        log_p = F.logsigmoid(logit)                            # (B, D), <= 0
+        log_p = (log_p * mask).sum(dim=1)                      # (B,) masked sum
+        bias = self.global_bias(global_feats).squeeze(-1)      # (B,)
+        log_consistent = log_p + F.logsigmoid(bias)            # (B,), <= 0
+
+        return (-torch.expm1(log_consistent)).clamp(0.0, 1.0)  # 1 - exp(.)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Registry
 # ═══════════════════════════════════════════════════════════════════════
@@ -312,6 +344,7 @@ MODEL_REGISTRY = {
     "siamese": SiameseDeepSets,
     "set_transformer": SmallSetTransformer,
     "product_transformer": ProductSetTransformer,
+    "product_transformer_exact": ProductSetTransformerExact,
     "product_transformer_large": partial(
         ProductSetTransformer, d_model=64, n_heads=4, ff_dim=128, n_layers=2),
 }

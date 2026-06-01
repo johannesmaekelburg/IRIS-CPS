@@ -302,6 +302,140 @@ class ProductSetTransformer(nn.Module):
         return torch.sigmoid(log_p + bias)
 
 
+class ProductSetTransformerExact(ProductSetTransformer):
+    """Exact noisy-AND head: I = 1 - prod_i p_i * p_global.
+
+    Identical to ProductSetTransformer except the output is a true product of
+    per-dimension consistency probabilities. Each per-dim head output is read
+    as a logit; p_i = sigmoid(l_i) in (0,1) is the probability that a source
+    realization is contained in the target along dimension i. The global term
+    is one additional containment factor p_g = sigmoid(b(g)). Consistency is
+    their product (a point must be contained in ALL dimensions), so
+
+        P(consistent) = prod_i p_i * p_g,   I = 1 - P(consistent).
+
+    Computed in log-space for stability: log P = sum_i logsigmoid(l_i) +
+    logsigmoid(b), then I = 1 - exp(log P) = -expm1(log P). This directly
+    encodes the conjunction structure (no logistic approximation), with
+    I in [0, 1) by construction.
+    """
+
+    def forward(self, per_dim, mask, global_feats):
+        x = self.project(per_dim)                              # (B, D, d_model)
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        logit = self.dim_head(x).squeeze(-1)                   # (B, D)
+        log_p = F.logsigmoid(logit)                            # (B, D), <= 0
+        log_p = (log_p * mask).sum(dim=1)                      # (B,) masked sum
+        bias = self.global_bias(global_feats).squeeze(-1)      # (B,)
+        log_consistent = log_p + F.logsigmoid(bias)            # (B,), <= 0
+
+        return (-torch.expm1(log_consistent)).clamp(0.0, 1.0)  # 1 - exp(.)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. Direction-Probe Support Network
+# ═══════════════════════════════════════════════════════════════════════
+
+class DirectionProbeNet(nn.Module):
+    """Support-function separation model over a learned set of probe directions.
+
+    Geometric basis. Two zonotopes overlap iff for every direction v,
+        <o, v> <= h1(v) + h2(v),   o = c1 - c2,   h_k(v) = sum_j |g_kj . v|.
+    "Contained along all directions" is a conjunction, so inconsistency is a
+    product over directions of per-direction containment probabilities. This
+    model instantiates that directly:
+
+      - Probe directions V = { offset hat(o) } u { axes e_i (real dims) }
+        u { L learned directions }. The offset and axes recover the existing
+        per-dim + support-function features as special cases; the learned
+        directions are differentiable analogues of attention queries.
+      - For each v, supports are computed exactly from the RAW generators by
+        sum-pooling |g . v| over the generator set (handles arbitrary
+        generator counts; permutation- and sign-invariant). This is the
+        ReLU<->zonotope support-function duality (Froese et al.): a sum of
+        |g . v| is a 2-layer ReLU network evaluating the support function.
+      - A shared per-direction MLP maps (h1, h2, |o.v|) to a containment
+        logit; the masked sum of log-sigmoids is the log-product, and
+        I = 1 - prod_v p_v * p_dim is the exact noisy-AND (as in
+        ProductSetTransformerExact), with a per-dimensionality calibration
+        factor p_dim.
+
+    Crucially, it is NOT given the hand-engineered support globals
+    (sep_ratio, off_over_tgt) - it must compute support from raw geometry.
+    That is the whole point of the comparison.
+    """
+
+    def __init__(self, n_learned: int = 6, mlp_hidden: int = 32):
+        super().__init__()
+        self.n_learned = n_learned
+        # Learned probe directions (in the padded MAX_DIM space).
+        self.learned_dirs = nn.Parameter(torch.randn(n_learned, MAX_DIM) * 0.5)
+        # Shared per-direction containment head on (h1, h2, |o.v|).
+        self.dir_mlp = nn.Sequential(
+            nn.Linear(3, mlp_hidden),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden, mlp_hidden),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden, 1),
+        )
+        # Start near p_v ~ 1 (small weights + positive bias) so the initial
+        # log-product is moderate rather than saturating I near 1 (which would
+        # vanish the gradient through the 1 - exp(.) head).
+        nn.init.normal_(self.dir_mlp[-1].weight, std=0.01)
+        nn.init.constant_(self.dir_mlp[-1].bias, 3.0)
+        # Per-dimensionality calibration bias (indexed by d-1), starts ~ p=0.95.
+        self.dim_bias = nn.Parameter(torch.full((MAX_DIM,), 3.0))
+
+    def forward(self, src_center, src_generators, src_gen_mask,
+                tgt_center, tgt_generators, tgt_gen_mask, dim_mask):
+        """
+        src_center/tgt_center:        (B, MAX_DIM)
+        src_generators/tgt_generators:(B, P_MAX, MAX_DIM)  row = one generator
+        src_gen_mask/tgt_gen_mask:    (B, P_MAX)  1=real generator
+        dim_mask:                     (B, MAX_DIM) 1=real spatial dimension
+        """
+        B = src_center.shape[0]
+        eps = 1e-10
+        o = src_center - tgt_center                              # (B, D)
+        off_mag = o.norm(dim=1, keepdim=True)                    # (B, 1)
+        off_hat = o / (off_mag + eps)                            # (B, D)
+
+        # ── Assemble probe directions (B, n_dir, D) and validity (B, n_dir) ──
+        offset_dir = off_hat.unsqueeze(1)                        # (B, 1, D)
+        offset_valid = (off_mag > eps).float()                  # (B, 1)
+
+        axes = torch.eye(MAX_DIM, device=o.device).unsqueeze(0).expand(B, -1, -1)
+        axes_valid = dim_mask                                    # (B, D)
+
+        q = self.learned_dirs.unsqueeze(0).expand(B, -1, -1)     # (B, L, D)
+        q = q * dim_mask.unsqueeze(1)                            # live in real subspace
+        q = q / (q.norm(dim=2, keepdim=True) + eps)              # unit directions
+        q_valid = torch.ones(B, self.n_learned, device=o.device)
+
+        V = torch.cat([offset_dir, axes, q], dim=1)             # (B, n_dir, D)
+        vmask = torch.cat([offset_valid, axes_valid, q_valid], dim=1)  # (B, n_dir)
+
+        # ── Exact supports via sum-pool of |g . v| over generator set ──
+        proj_s = torch.einsum("bpd,bnd->bpn", src_generators, V).abs()
+        h1 = (proj_s * src_gen_mask.unsqueeze(-1)).sum(dim=1)    # (B, n_dir)
+        proj_t = torch.einsum("bpd,bnd->bpn", tgt_generators, V).abs()
+        h2 = (proj_t * tgt_gen_mask.unsqueeze(-1)).sum(dim=1)    # (B, n_dir)
+        proj_o = torch.einsum("bd,bnd->bn", o, V).abs()          # (B, n_dir)
+
+        feat = torch.stack([h1, h2, proj_o], dim=-1)            # (B, n_dir, 3)
+        logit = self.dir_mlp(feat).squeeze(-1)                  # (B, n_dir)
+
+        log_p = F.logsigmoid(logit)                             # (B, n_dir) <= 0
+        log_p = (log_p * vmask).sum(dim=1)                      # (B,) masked log-product
+
+        d_idx = (dim_mask.sum(dim=1).long() - 1).clamp(0, MAX_DIM - 1)
+        log_consistent = log_p + F.logsigmoid(self.dim_bias[d_idx])
+
+        return (-torch.expm1(log_consistent)).clamp(0.0, 1.0)   # 1 - prod p
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Registry
 # ═══════════════════════════════════════════════════════════════════════
@@ -338,6 +472,11 @@ MODEL_REGISTRY = {
     "set_transformer": SmallSetTransformer,
     "product_transformer": ProductSetTransformer,
     "product_transformer_exact": ProductSetTransformerExact,
+    "direction_probe": DirectionProbeNet,
+    # Size-matched to product_transformer_exact (~9.4k params) for a
+    # capacity-controlled comparison: wider per-direction MLP + more probes.
+    "direction_probe_large": partial(
+        DirectionProbeNet, n_learned=12, mlp_hidden=94),
     "product_transformer_large": partial(
         ProductSetTransformer, d_model=64, n_heads=4, ff_dim=128, n_layers=2),
 }

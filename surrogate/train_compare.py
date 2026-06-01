@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.stats import spearmanr
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from .dataset_v2 import (ZonotopeDatasetV2, collate_fn,
@@ -73,6 +73,16 @@ def _forward(model, batch, model_name, device):
             batch["tgt_gen_mask"].to(device),
             batch["global_v2"].to(device),
         )
+    elif model_name.startswith("direction_probe"):
+        return model(
+            batch["src_center"].to(device),
+            batch["src_generators"].to(device),
+            batch["src_gen_mask"].to(device),
+            batch["tgt_center"].to(device),
+            batch["tgt_generators"].to(device),
+            batch["tgt_gen_mask"].to(device),
+            batch["mask"].to(device),
+        )
     else:
         return model(
             batch["per_dim_v2"].to(device),
@@ -109,7 +119,8 @@ def compute_metrics(preds, labels):
 
 def _run_phase(model, model_name, train_loader, val_loader, optimizer,
                criterion, n_epochs, device, history, desc, track_best=True,
-               select_metric="balanced"):
+               select_metric="balanced", epoch_scatter_dir=None,
+               train_eval_loader=None, scatter_stride=10):
     """Run a training phase. Returns (best_metrics, best_state).
 
     select_metric: "balanced" picks best by mean of per-dim MSE (so a late
@@ -164,11 +175,28 @@ def _run_phase(model, model_name, train_loader, val_loader, optimizer,
             "best": f"{best_select:.5f}" if track_best else "—",
         })
 
+        # ── Epoch scatter snapshots (every scatter_stride epochs + last) ──
+        if epoch_scatter_dir is not None and (
+                epoch % scatter_stride == 0 or epoch == n_epochs):
+            _epoch_scatter(preds, labels, dims, f"val epoch {epoch}",
+                           epoch_scatter_dir / f"epoch_{epoch:03d}_val.png")
+            if train_eval_loader is not None:
+                tp, tl, td = collect_predictions(
+                    model, train_eval_loader, model_name, device)
+                for d in sorted(set(td)):
+                    mm = td == d
+                    _epoch_scatter(
+                        tp[mm], tl[mm], td[mm],
+                        f"train {d}D epoch {epoch}",
+                        epoch_scatter_dir / f"epoch_{epoch:03d}_train{d}d.png")
+
     return best_metrics, best_state
 
 
 def train_one_model(model, model_name, train_loader, val_loader,
-                    args, device, pretrain_loader=None):
+                    args, device, pretrain_loader=None,
+                    epoch_scatter_dir=None, train_eval_loader=None,
+                    scatter_stride=10):
     """Train a single model, save best state dict, return best val metrics.
 
     If pretrain_loader is given, first pretrain on it (synth), then
@@ -192,7 +220,10 @@ def train_one_model(model, model_name, train_loader, val_loader,
     best_metrics, best_state = _run_phase(
         model, model_name, train_loader, val_loader, optimizer,
         criterion, args.epochs, device, history,
-        desc=f"  {model_name}", track_best=True)
+        desc=f"  {model_name}", track_best=True,
+        epoch_scatter_dir=epoch_scatter_dir,
+        train_eval_loader=train_eval_loader,
+        scatter_stride=scatter_stride)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -208,6 +239,30 @@ def train_one_model(model, model_name, train_loader, val_loader,
 DIM_MARKERS = {2: "o", 3: "s", 4: "D"}
 DIM_LABELS = {2: "2D", 3: "3D", 4: "4D"}
 DIM_COLORS = {2: "#4878CF", 3: "#6ACC65", 4: "#D65F5F"}
+
+
+def _epoch_scatter(preds, labels, dims, title, path):
+    """Lightweight pred-vs-true scatter for a single epoch snapshot."""
+    fig, ax = plt.subplots(figsize=(4.5, 4.5))
+    mse = float(np.mean((preds - labels) ** 2)) if len(preds) else float("nan")
+    for d in sorted(set(dims)):
+        m = dims == d
+        ax.scatter(labels[m], preds[m], s=4, alpha=0.15,
+                   marker=DIM_MARKERS.get(d, "o"),
+                   color=DIM_COLORS.get(d, "#333"),
+                   label=DIM_LABELS.get(d, f"{d}D"), rasterized=True)
+    ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.5)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("True I(θ)")
+    ax.set_ylabel("Predicted I(θ)")
+    ax.set_title(f"{title}  (MSE={mse:.4f})", fontsize=9)
+    ax.set_aspect("equal")
+    if len(set(dims)) > 1:
+        ax.legend(fontsize=7, markerscale=3, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
 
 
 def plot_scatter_single(preds, labels, dims, model_name, metrics, ax):
@@ -558,6 +613,21 @@ def main():
     parser.add_argument("--loso", action="store_true",
                         help="Leave-one-scenario-out CV over the scenarios of "
                              "the chosen --dims. Robust eval for few scenarios.")
+    parser.add_argument("--n_val_synth", type=int, default=0,
+                        help="Hold out this many synthetic scenarios (per dim) "
+                             "as a separate validation set; train on the rest. "
+                             "Reported separately from the real held-out set.")
+    parser.add_argument("--holdout", nargs="+", default=None,
+                        help="Explicit real scenario file(s) to hold out for "
+                             "validation, e.g. --holdout results_scenario_7.json. "
+                             "Overrides the random split. Use to avoid "
+                             "degenerate (constant I) holdouts.")
+    parser.add_argument("--save_epoch_scatters", action="store_true",
+                        help="Save train (per-dim) and val scatter plots into "
+                             "<run_dir>/epoch_scatters/ (see --scatter_stride).")
+    parser.add_argument("--scatter_stride", type=int, default=10,
+                        help="Save epoch scatters every N epochs (and the last "
+                             "epoch). Default 10.")
     args = parser.parse_args()
 
     all_model_names = ["original", "deepsets_v2", "flat_mlp",
@@ -584,21 +654,37 @@ def main():
         by_dim[_get_scenario_dim(jf)].append(jf)
 
     rng = np.random.default_rng(42)
+    holdout_set = set(args.holdout) if args.holdout else None
     train_files, val_files = [], []
     for dim, files in sorted(by_dim.items()):
         if args.dims and dim not in args.dims:
             continue
         files = list(rng.permutation(files))
+        if holdout_set is not None:
+            def _is_holdout(f):
+                return (f.name in holdout_set
+                        or any(str(f).endswith(h) for h in holdout_set))
+            val = [f for f in files if _is_holdout(f)]
+            train = [f for f in files if not _is_holdout(f)]
+            if val:  # only apply to dims that contain a named holdout
+                val_files.extend(val)
+                train_files.extend(train)
+                print(f"  dim={dim}: {len(train)} train, {len(val)} val "
+                      f"(explicit holdout)")
+                continue
         n_val = max(1, int(args.val_fraction * len(files)))
         val_files.extend(files[:n_val])
         train_files.extend(files[n_val:])
         print(f"  dim={dim}: {len(files)-n_val} train, {n_val} val")
 
     print(f"Inductive split: {len(train_files)} train scenarios, "
-          f"{len(val_files)} val scenarios\n")
+          f"{len(val_files)} val scenarios")
+    print(f"  Held-out REAL: {[f.name for f in val_files]}\n")
 
-    # ── Synthetic data (training only) ──
+    # ── Synthetic data ──
+    # synth_files → training; synth_val_files → separate held-out eval.
     synth_files = []
+    synth_val_files = []
     if args.synthetic_dir:
         synth_dir = Path(args.synthetic_dir)
         if not synth_dir.is_absolute():
@@ -621,10 +707,17 @@ def main():
             cap = caps.get(dim)
             if cap is not None and cap < len(files):
                 files = list(synth_rng.choice(files, size=cap, replace=False))
-            synth_files.extend(files)
-            print(f"  Synthetic dim={dim}: {len(files)} scenarios"
+            files = list(synth_rng.permutation(files))
+            # Hold out n_val_synth scenarios (per dim) for separate evaluation
+            n_hold = min(args.n_val_synth, max(0, len(files) - 1))
+            synth_val_files.extend(files[:n_hold])
+            synth_files.extend(files[n_hold:])
+            print(f"  Synthetic dim={dim}: {len(files)-n_hold} train, "
+                  f"{n_hold} held-out for eval"
                   + (f" (capped from {len(synth_by_dim[dim])})"
                      if cap is not None and cap < len(synth_by_dim[dim]) else ""))
+        if synth_val_files:
+            print(f"  Held-out SYNTH: {[f.name for f in synth_val_files]}")
 
     # ── Load data ──
     # Pretrain mode: synth → pretrain loader, real → fine-tune loader.
@@ -641,9 +734,13 @@ def main():
                                      max_samples=args.max_samples)
         pretrain_ds = None
     val_ds = ZonotopeDatasetV2(files=val_files, label_key="I_theta")
+    synth_val_ds = (ZonotopeDatasetV2(files=synth_val_files, label_key="I_theta")
+                    if synth_val_files else None)
     dt = time.time() - t0
     print(f"  {len(train_ds):,} train + {len(val_ds):,} val samples "
           f"loaded in {dt:.1f}s")
+    if synth_val_ds is not None:
+        print(f"  {len(synth_val_ds):,} held-out synth eval samples")
     if pretrain_ds is not None:
         print(f"  {len(pretrain_ds):,} synth pretrain samples (separate phase)")
     elif synth_files:
@@ -680,6 +777,21 @@ def main():
         pretrain_loader = DataLoader(pretrain_ds, batch_size=args.batch_size,
                                      shuffle=True, collate_fn=collate_fn,
                                      num_workers=0)
+    synth_val_loader = None
+    if synth_val_ds is not None:
+        synth_val_loader = DataLoader(synth_val_ds, batch_size=args.batch_size,
+                                      shuffle=False, collate_fn=collate_fn,
+                                      num_workers=0)
+
+    # Subsampled training set used only for per-epoch scatter snapshots
+    train_eval_loader = None
+    if args.save_epoch_scatters:
+        n_eval = min(len(train_ds), 40000)
+        idx = np.random.default_rng(0).choice(
+            len(train_ds), size=n_eval, replace=False).tolist()
+        train_eval_loader = DataLoader(
+            Subset(train_ds, idx), batch_size=args.batch_size,
+            shuffle=False, collate_fn=collate_fn, num_workers=0)
 
     # ── Train each model ──
     suffix = "_synth" if synth_files else ""
@@ -699,8 +811,9 @@ def main():
         "device": str(device),
         "n_train_samples": len(train_ds),
         "n_val_samples": len(val_ds),
-        "val_scenarios": [f.name for f in val_files],
-        "n_synth_scenarios": len(synth_files),
+        "val_real_scenarios": [f.name for f in val_files],
+        "val_synth_scenarios": [f.name for f in synth_val_files],
+        "n_synth_train_scenarios": len(synth_files),
         "n_dim_feat": N_DIM_FEAT_V2,
         "n_global": N_GLOBAL_V2,
     }
@@ -725,10 +838,18 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"  Parameters: {n_params:,}  |  Device: {device}\n")
 
+        epoch_scatter_dir = None
+        if args.save_epoch_scatters:
+            epoch_scatter_dir = out_dir / "epoch_scatters" / name
+            epoch_scatter_dir.mkdir(parents=True, exist_ok=True)
+
         t0 = time.time()
         metrics, history = train_one_model(
             model, name, train_loader, val_loader, args, device,
-            pretrain_loader=pretrain_loader)
+            pretrain_loader=pretrain_loader,
+            epoch_scatter_dir=epoch_scatter_dir,
+            train_eval_loader=train_eval_loader,
+            scatter_stride=args.scatter_stride)
         elapsed = time.time() - t0
 
         metrics["n_params"] = n_params
@@ -744,12 +865,23 @@ def main():
               f"MSE={metrics['mse']:.5f}, "
               f"R²={metrics['r2']:.4f}, "
               f"ρ={metrics['spearman']:.4f}")
-        print(f"  Per-dimension (val):")
+        print(f"  Per-dimension (real val):")
         for d in sorted(set(dims)):
             m = dims == d
             dm = compute_metrics(preds[m], labels[m])
             print(f"    dim={d}: MSE={dm['mse']:.5f}  MAE={dm['mae']:.4f}  "
                   f"R²={dm['r2']:.4f}  ρ={dm['spearman']:.4f}  N={int(m.sum()):,}")
+
+        # ── Evaluate on held-out synthetic scenarios (separate) ──
+        synth_metrics = None
+        if synth_val_loader is not None:
+            sp, sl, _ = collect_predictions(
+                model, synth_val_loader, name, device)
+            synth_metrics = compute_metrics(sp, sl)
+            metrics["synth_val"] = synth_metrics
+            print(f"  Held-out SYNTH val: MSE={synth_metrics['mse']:.5f}  "
+                  f"MAE={synth_metrics['mae']:.4f}  R²={synth_metrics['r2']:.4f}  "
+                  f"ρ={synth_metrics['spearman']:.4f}  N={len(sl):,}")
         print(f"  Time: {elapsed:.1f}s")
 
         # ── Save model checkpoint (loadable by a colleague) ──
@@ -760,6 +892,8 @@ def main():
             "n_global": N_GLOBAL_V2,
             "n_params": n_params,
             "val_metrics": metrics,
+            "val_real_scenarios": [f.name for f in val_files],
+            "val_synth_scenarios": [f.name for f in synth_val_files],
             "run_id": run_id,
             "feature_order": {
                 "per_dim": ["delta_c", "r1_norm", "r2_norm", "cos", "width_ratio"],

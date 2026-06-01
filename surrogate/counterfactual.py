@@ -52,6 +52,10 @@ import torch.nn as nn
 from .dataset import N_DIM_FEAT, N_GLOBAL, MAX_DIM, _upr_onehot
 from .model import DeepSetsZonotope
 
+# V2 feature dimensions (models_v2.py)
+_N_DIM_FEAT_V2 = 5
+_N_GLOBAL_V2   = 5
+
 # ── Parameter box ─────────────────────────────────────────────────────────────
 PARAM_NAMES  = ["scale_factor", "center_delta", "correlation_strength"]
 PARAM_BOUNDS = [
@@ -94,10 +98,12 @@ class DifferentiableIntervention(nn.Module):
         upr_offsets: Optional[np.ndarray],
         upr_onehot:  Optional[np.ndarray],
         device: torch.device,
+        use_v2: bool = False,
     ):
         super().__init__()
         d = len(pre_c)
         self.d = d
+        self.use_v2 = use_v2
 
         def _t(a):
             return torch.tensor(np.asarray(a, dtype=np.float32), device=device)
@@ -201,30 +207,68 @@ class DifferentiableIntervention(nn.Module):
                 dot = (g1_prop_i[safe] * self.tgt_G[i]).sum(dim=1)
                 cos_vals[safe, i] = dot / (n1[safe] * n2)
 
-        # Pad to (B, MAX_DIM, N_DIM_FEAT)
-        per_dim = torch.zeros(B, MAX_DIM, N_DIM_FEAT,
-                              dtype=theta.dtype, device=theta.device)
-        per_dim[:, :self.d, 0] = delta_c
-        per_dim[:, :self.d, 1] = r1_n
-        per_dim[:, :self.d, 2] = r2_n
-        per_dim[:, :self.d, 3] = cos_vals
-
-        # ── Global features  (B, N_GLOBAL) ──────────────────────────────────
+        # ── Shared global components ─────────────────────────────────────────
         log_vol = torch.log(
             r1_prop.prod(dim=1).clamp(min=self.EPS)
             / (self.r2_raw.prod().clamp(min=self.EPS) + self.EPS)
             + self.EPS
         )   # (B,)
-        norm_dist = torch.linalg.norm(
-            c1_prop - self.tgt_c, dim=1
-        ) / (sigma.mean(dim=1) + self.EPS)   # (B,)
-
-        upr_oh = self.upr_onehot.unsqueeze(0).expand(B, -1)   # (B, N_UPR)
-        global_feats = torch.cat(
-            [log_vol.unsqueeze(1), norm_dist.unsqueeze(1), upr_oh], dim=1
-        )   # (B, N_GLOBAL)
+        offset    = c1_prop - self.tgt_c                          # (B, d)
+        off_mag   = torch.linalg.norm(offset, dim=1)              # (B,)
+        norm_dist = off_mag / (sigma.mean(dim=1) + self.EPS)      # (B,)
 
         mask_b = self.mask.unsqueeze(0).expand(B, -1)   # (B, MAX_DIM)
+
+        if self.use_v2:
+            # ── V2 per-dim (5 features): + width_ratio ───────────────────
+            width_ratio = r1_prop / (self.r2_raw.unsqueeze(0) + self.EPS)  # (B, d)
+
+            per_dim = torch.zeros(B, MAX_DIM, _N_DIM_FEAT_V2,
+                                  dtype=theta.dtype, device=theta.device)
+            per_dim[:, :self.d, 0] = delta_c
+            per_dim[:, :self.d, 1] = r1_n
+            per_dim[:, :self.d, 2] = r2_n
+            per_dim[:, :self.d, 3] = cos_vals
+            per_dim[:, :self.d, 4] = width_ratio
+
+            # ── V2 global (5): log_vol, norm_dist, dim, sep_ratio, off_over_tgt
+            # Support functions along the offset direction
+            off_hat = torch.zeros_like(offset)
+            safe_off = off_mag > self.EPS
+            off_hat[safe_off] = offset[safe_off] / off_mag[safe_off].unsqueeze(1)
+
+            # tgt_G: (d, n_gen_t) → (B, n_gen_t) projections → abs sum
+            tgt_support = (off_hat @ self.tgt_G).abs().sum(dim=1)  # (B,)
+
+            # g1_prop: (B, d, n_gen)
+            g1_prop = self.upr_scales.abs().view(1, self.d, 1) * post_G
+            # (B, 1, d) bmm (B, d, n_gen) → (B, 1, n_gen) → squeeze → abs sum
+            src_support = off_hat.unsqueeze(1).bmm(g1_prop).squeeze(1).abs().sum(dim=1)  # (B,)
+
+            sep_ratio   = off_mag / (src_support + tgt_support + self.EPS)          # (B,)
+            off_over_tgt = (off_mag / (tgt_support + self.EPS)).clamp(max=10.0)     # (B,)
+
+            dim_feat = torch.full((B,), float(self.d),
+                                  dtype=theta.dtype, device=theta.device)
+
+            global_feats = torch.stack(
+                [log_vol, norm_dist, dim_feat, sep_ratio, off_over_tgt], dim=1
+            )   # (B, 5)
+
+        else:
+            # ── V1 per-dim (4 features) ──────────────────────────────────
+            per_dim = torch.zeros(B, MAX_DIM, N_DIM_FEAT,
+                                  dtype=theta.dtype, device=theta.device)
+            per_dim[:, :self.d, 0] = delta_c
+            per_dim[:, :self.d, 1] = r1_n
+            per_dim[:, :self.d, 2] = r2_n
+            per_dim[:, :self.d, 3] = cos_vals
+
+            # ── V1 global (10): log_vol, norm_dist, UPR one-hot ──────────
+            upr_oh = self.upr_onehot.unsqueeze(0).expand(B, -1)   # (B, N_UPR)
+            global_feats = torch.cat(
+                [log_vol.unsqueeze(1), norm_dist.unsqueeze(1), upr_oh], dim=1
+            )   # (B, N_GLOBAL=10)
 
         return per_dim, mask_b, global_feats
 
@@ -494,12 +538,20 @@ class BatchedCounterfactualOptimizer:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_scenario_geometry(json_path: Path) -> dict:
-    """Extract base zonotope geometry from a scenario JSON file."""
+    """Extract base zonotope geometry from a scenario JSON file.
+
+    Real measurement files store a ``pre_state`` (before the UPR mapping).
+    Synthetic_v6 files only store ``post_state`` because the affine map F is
+    already baked into the saved geometry.  In the latter case we use
+    ``post_state`` directly with identity UPR (scale=1, offset=0).
+    """
     import json as _json
     data = _json.loads(Path(json_path).read_text(encoding="utf-8"))
     exp  = data["experiments"][0]
 
-    unc   = exp["pre_state"]["uncertainty"]
+    # Prefer pre_state; fall back to post_state (synthetic_v6 files)
+    state_key = "pre_state" if "pre_state" in exp else "post_state"
+    unc   = exp[state_key]["uncertainty"]
     pre_c = np.array(unc["source_center"],     dtype=np.float64)
     pre_G = np.array(unc["source_generators"], dtype=np.float64)
     tgt_c = np.array(unc["target_center"],     dtype=np.float64)
@@ -511,6 +563,15 @@ def load_scenario_geometry(json_path: Path) -> dict:
     upr_scales = upr_offsets = upr_onehot = None
     cr = exp.get("consistency_relations")
     d  = len(pre_c)
+    # For post_state fallback: F is baked in, so default to identity UPR
+    if state_key == "post_state" and (not cr or len(cr) < d):
+        upr_scales  = np.ones(d,  dtype=np.float64)
+        upr_offsets = np.zeros(d, dtype=np.float64)
+        from .dataset import _upr_onehot as _oh
+        upr_onehot  = _oh("identity")
+        return dict(pre_c=pre_c, pre_G=pre_G, tgt_c=tgt_c, tgt_G=tgt_G,
+                    upr_scales=upr_scales, upr_offsets=upr_offsets,
+                    upr_onehot=upr_onehot, d=d)
     if cr and isinstance(cr, list) and len(cr) >= d:
         upr_scales  = np.array([r["mapping"].get("scale",  1.0) for r in cr[:d]],
                                 dtype=np.float64)
@@ -536,6 +597,7 @@ def run_counterfactuals_for_scenario(
     gamma:      float = 0.5,
     max_queries: int  = 50,
     device:     torch.device = torch.device("cpu"),
+    use_v2:     bool  = False,
     **opt_kwargs,
 ) -> List[CounterfactualResult]:
     """Gradient-based counterfactual search for one scenario.
@@ -548,10 +610,11 @@ def run_counterfactuals_for_scenario(
     rows        : list of dicts with scale_factor, center_delta,
                   correlation_strength, i_surr
     geom        : from load_scenario_geometry()
-    model       : frozen DeepSetsZonotope
+    model       : frozen DeepSetsZonotope or v2 model
     gamma       : consistency threshold
     max_queries : cap on number of inconsistent points to explain
     device      : torch device
+    use_v2      : True if model expects v2 features (5 per-dim, 5 global)
     **opt_kwargs: forwarded to BatchedCounterfactualOptimizer
     """
     intervention = DifferentiableIntervention(
@@ -563,6 +626,7 @@ def run_counterfactuals_for_scenario(
         upr_offsets = geom["upr_offsets"],
         upr_onehot  = geom["upr_onehot"],
         device      = device,
+        use_v2      = use_v2,
     ).to(device)
 
     optimizer = BatchedCounterfactualOptimizer(
@@ -597,6 +661,7 @@ def run_counterfactuals_parallel(
     max_queries: int   = 50,
     device:      torch.device = torch.device("cpu"),
     max_workers: int   = 4,
+    use_v2:      bool  = False,
     **opt_kwargs,
 ) -> dict:
     """Run counterfactual search for multiple scenarios in parallel threads.
@@ -608,11 +673,12 @@ def run_counterfactuals_parallel(
     Args
     ----
     scenarios   : list of dicts with keys 'domain', 'rows', 'json_file'
-    model       : frozen DeepSetsZonotope (shared across threads, read-only)
+    model       : frozen surrogate model (shared across threads, read-only)
     gamma       : consistency threshold
     max_queries : cap per scenario
     device      : torch device
     max_workers : thread pool size
+    use_v2      : True if model expects v2 features (5 per-dim, 5 global)
     **opt_kwargs: forwarded to BatchedCounterfactualOptimizer
 
     Returns
@@ -634,7 +700,7 @@ def run_counterfactuals_parallel(
             cfs  = run_counterfactuals_for_scenario(
                 rows, geom, model,
                 gamma=gamma, max_queries=max_queries,
-                device=device, **opt_kwargs)
+                device=device, use_v2=use_v2, **opt_kwargs)
             return idx, cfs
         except Exception as exc:
             print(f"  [warn] CF failed for {json_file}: {exc}")

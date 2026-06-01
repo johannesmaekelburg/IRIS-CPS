@@ -171,15 +171,15 @@ class ZonotopeDatasetV2(Dataset):
             for d in (data_dirs or []):
                 file_iter.extend(sorted(Path(d).glob("results_scenario_*.json")))
 
-        for jf in file_iter:
-            self._load(jf, label_key)
+        for sc_id, jf in enumerate(file_iter):
+            self._load(jf, label_key, sc_id)
             if max_samples and len(self.samples) >= max_samples:
                 break
 
         if max_samples:
             self.samples = self.samples[:max_samples]
 
-    def _load(self, json_file, label_key):
+    def _load(self, json_file, label_key, scenario_id=0):
         with open(json_file) as f:
             data = json.load(f)
 
@@ -222,6 +222,7 @@ class ZonotopeDatasetV2(Dataset):
                     "i_theta": i_theta,
                     "i_aabb": i_aabb,
                     "i_mfmc": i_mfmc,
+                    "scenario_id": scenario_id,
                 }
                 self.samples.append(sample)
             except (KeyError, ValueError, TypeError):
@@ -321,4 +322,5 @@ def collate_fn(batch):
         "i_theta": [s["i_theta"] for s in batch],
         "i_aabb": [s["i_aabb"] for s in batch],
         "i_mfmc": [s["i_mfmc"] for s in batch],
+        "scenario_id": [s.get("scenario_id", -1) for s in batch],
     }

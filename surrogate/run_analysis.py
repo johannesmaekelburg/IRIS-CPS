@@ -70,6 +70,17 @@ DATA_DIRS = [
     _ROOT / "data" / "measurements_cps_v6",
 ]
 MODEL_PATH = _ROOT / "surrogate" / "model.pt"
+
+# ── V2 model registry (populated lazily so surrogate.models_v2 is optional) ──
+_V2_MODEL_CLASS_NAMES: set[str] = set()
+try:
+    from surrogate.models_v2 import MODEL_REGISTRY as _V2_REGISTRY, load_checkpoint as _load_v2_checkpoint
+    _V2_MODEL_CLASS_NAMES = {
+        (cls.func if hasattr(cls, "func") else cls).__name__
+        for cls in _V2_REGISTRY.values()
+    }
+except ImportError:
+    _load_v2_checkpoint = None
 PARAMS = ["scale_factor", "center_delta", "correlation_strength"]
 PARAM_LABELS = {
     "scale_factor":         r"Scale $s_u$",
@@ -142,14 +153,35 @@ def _strong_cmap(name, lo=0.25):
     )
 
 
-def _hexbin_panel(ax, ref, est, cmap, accent, ylabel, annotate=True, alpha=1.0):
+def _scatter_panel(ax, ref, est, accent, ylabel, annotate=True,
+                   max_pts=40_000, rng_seed=0):
+    """Scatter panel with transparent points.
+
+    Subsamples to *max_pts* when the dataset is larger so rendering stays fast
+    while density is still visible through alpha-blending.
+    """
     import matplotlib.colors as mcolors
     valid = np.isfinite(ref) & np.isfinite(est)
     ref, est = ref[valid], est[valid]
-    ax.set_facecolor(mcolors.to_rgba(accent, alpha=0.08))
-    ax.hexbin(ref, est, gridsize=50, cmap=_strong_cmap(cmap, lo=0.30),
-              mincnt=1, vmin=1, linewidths=0.0, rasterized=True, alpha=alpha)
+
+    # Subsample for large datasets
+    n = len(ref)
+    if n > max_pts:
+        rng = np.random.default_rng(rng_seed)
+        idx = rng.choice(n, size=max_pts, replace=False)
+        ref_p, est_p = ref[idx], est[idx]
+    else:
+        ref_p, est_p = ref, est
+
+    # Alpha scales with dataset size so denser clouds look denser
+    alpha = max(0.08, min(0.40, 6_000 / max(len(ref_p), 1)))
+
+    ax.set_facecolor(mcolors.to_rgba(accent, alpha=0.06))
+    ax.scatter(ref_p, est_p, s=2.5, color=accent, alpha=alpha,
+               linewidths=0, rasterized=True, zorder=2)
+
     ax.plot([0, 1], [0, 1], color="#333333", lw=1.4, ls="--", alpha=0.6, zorder=3)
+
     m = _metrics(est, ref)
     if annotate:
         ann = (rf"$\rho={m['rho']:.3f}$" + "\n"
@@ -179,24 +211,45 @@ from surrogate.dataset import ZonotopeDataset, collate_fn
 from torch.utils.data import DataLoader
 
 
-def _load_accuracy_data(data_dirs, model, device, max_samples=None):
+def _load_accuracy_data(data_dirs, model, device, max_samples=None,
+                         dims_filter=None, files=None):
     """
-    Run surrogate on the full dataset via ZonotopeDataset — identical to
-    evaluate.py.  Returns flat numpy arrays ready for plotting.
-    """
-    ds = ZonotopeDataset(data_dirs, label_key="I_theta",
-                         max_samples=max_samples)
-    loader = DataLoader(ds, batch_size=2048, shuffle=False,
-                        collate_fn=collate_fn, num_workers=0)
+    Run surrogate on the full dataset.  Automatically selects v1 or v2
+    dataset/features based on the model type.
 
-    preds, i_thetas, i_aabbs, i_mfmcs, dims = [], [], [], [], []
+    dims_filter : list[int] | None
+        If set (e.g. [2]), only samples whose zonotope dimension is in the
+        list are retained.  Use this when the model was trained on a subset
+        of dimensions.
+    files : list[Path] | None
+        Explicit file list (overrides data_dirs glob). Use to restrict to
+        specific scenario files (e.g. val split only).
+    """
+    if _is_v2_model(model):
+        from surrogate.dataset_v2 import ZonotopeDatasetV2
+        from surrogate.dataset_v2 import collate_fn as collate_fn_v2
+        ds     = ZonotopeDatasetV2(data_dirs, label_key="I_theta",
+                                   max_samples=max_samples, files=files)
+        loader = DataLoader(ds, batch_size=2048, shuffle=False,
+                            collate_fn=collate_fn_v2, num_workers=0)
+        pd_key, gf_key = "per_dim_v2", "global_v2"
+        label_key = "label"
+    else:
+        ds     = ZonotopeDataset(data_dirs, label_key="I_theta",
+                                 max_samples=max_samples, files=files)
+        loader = DataLoader(ds, batch_size=2048, shuffle=False,
+                            collate_fn=collate_fn, num_workers=0)
+        pd_key, gf_key = "per_dim", "global_feats"
+        label_key = "i_theta"
+
+    preds, i_thetas, i_aabbs, i_mfmcs, dims, sc_ids = [], [], [], [], [], []
     t_total = 0.0
 
     with torch.no_grad():
         for batch in loader:
-            pd = batch["per_dim"].to(device)
+            pd = batch[pd_key].to(device)
             mk = batch["mask"].to(device)
-            gf = batch["global_feats"].to(device)
+            gf = batch[gf_key].to(device)
 
             t0 = time.perf_counter()
             out = model(pd, mk, gf).cpu().numpy()
@@ -206,23 +259,40 @@ def _load_accuracy_data(data_dirs, model, device, max_samples=None):
             i_thetas.extend(batch["i_theta"])
             i_aabbs.extend(batch["i_aabb"])
             i_mfmcs.extend(batch["i_mfmc"])
-            # dim = number of real (non-padded) dimensions per sample
+            sc_ids.extend(batch.get("scenario_id", [-1] * len(batch["i_theta"])))
             mask_np = batch["mask"].numpy()
             dims.extend(mask_np.sum(axis=1).astype(int).tolist())
 
-    n = len(ds)
+    i_surr  = np.concatenate(preds)
+    i_theta = np.array(i_thetas, dtype=np.float32)
+    i_aabb  = np.array(i_aabbs,  dtype=np.float32)
+    i_mfmc  = np.array(i_mfmcs,  dtype=np.float32)
+    dim_arr = np.array(dims,      dtype=np.int32)
+    sc_arr  = np.array(sc_ids,    dtype=np.int32)
+
+    if dims_filter is not None:
+        keep = np.isin(dim_arr, dims_filter)
+        i_surr  = i_surr[keep]
+        i_theta = i_theta[keep]
+        i_aabb  = i_aabb[keep]
+        i_mfmc  = i_mfmc[keep]
+        dim_arr = dim_arr[keep]
+        sc_arr  = sc_arr[keep]
+        print(f"  dims_filter={dims_filter}: kept {keep.sum():,} / {len(keep):,} samples")
+
     return dict(
-        i_surr  = np.concatenate(preds),
-        i_theta = np.array(i_thetas, dtype=np.float32),
-        i_aabb  = np.array(i_aabbs,  dtype=np.float32),
-        i_mfmc  = np.array(i_mfmcs,  dtype=np.float32),
-        dim     = np.array(dims,      dtype=np.int32),
+        i_surr  = i_surr,
+        i_theta = i_theta,
+        i_aabb  = i_aabb,
+        i_mfmc  = i_mfmc,
+        dim     = dim_arr,
+        scenario_id = sc_arr,
         t_surr_total = t_total,
-        n = n,
+        n = len(i_surr),
     )
 
 
-def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None):
+def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None, files=None):
     """
     Second pass over JSONs to collect timing, Sobol params, and domain labels.
 
@@ -230,6 +300,10 @@ def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None):
       t_aabb, t_mfmc         — per-sample timing arrays (aligned with acc)
       sobol_scenarios        — list of {domain, rows} per scenario
       domain                 — per-sample domain string array (aligned with acc)
+
+    files : list[Path] | None
+        Explicit file list (overrides data_dirs glob). Use to restrict to
+        specific scenario files (e.g. val split only).
     """
     # Try to import domain utilities from src/analysis
     try:
@@ -241,9 +315,12 @@ def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None):
         DOMAIN_SHORT = {}
         DOMAIN_ORDER = []
 
-    all_files = []
-    for d in data_dirs:
-        all_files.extend(sorted(Path(d).glob("results_scenario_*.json")))
+    if files is not None:
+        all_files = list(files)
+    else:
+        all_files = []
+        for d in data_dirs:
+            all_files.extend(sorted(Path(d).glob("results_scenario_*.json")))
     if max_scenarios:
         all_files = all_files[:max_scenarios]
 
@@ -361,12 +438,12 @@ def plot_acc_scatter(acc: dict, out_dir: Path):
                              gridspec_kw={"width_ratios": [1, 1, 1, 0.62],
                                           "wspace": 0.30})
 
-    m_aabb = _hexbin_panel(axes[0], ref, aabb, "Oranges", C_AABB,
-                           r"AABB $(1-J_C)$",      alpha=0.70)
-    m_mfmc = _hexbin_panel(axes[1], ref, mfmc, "Blues",   C_MFMC,
-                           r"MFMC $(1-I_\mathrm{MF})$")
-    m_surr = _hexbin_panel(axes[2], ref, surr, "Purples", C_SURR,
-                           r"Surrogate $\hat{I}$")
+    m_aabb = _scatter_panel(axes[0], ref, aabb, C_AABB,
+                            r"AABB $(1-J_C)$")
+    m_mfmc = _scatter_panel(axes[1], ref, mfmc, C_MFMC,
+                            r"MFMC $(1-I_\mathrm{MF})$")
+    m_surr = _scatter_panel(axes[2], ref, surr, C_SURR,
+                            r"Surrogate $\hat{I}$")
 
     axes[0].set_title("AABB",      fontsize=FS_TITLE, pad=4, color=C_AABB)
     axes[1].set_title("MFMC",      fontsize=FS_TITLE, pad=4, color=C_MFMC)
@@ -666,12 +743,24 @@ def _reproduce_split(val_fraction: float = 0.15):
     return train_files, val_files
 
 
-def _per_scenario_accuracy(file_list, model, device, label_key="I_theta"):
-    """Run surrogate inference per scenario; return list of per-scenario dicts."""
+def _per_scenario_accuracy(file_list, model, device, label_key="I_theta",
+                            dims_filter=None):
+    """Run surrogate inference per scenario; return list of per-scenario dicts.
+
+    Automatically uses v1 or v2 feature extraction based on the model type.
+    dims_filter: list[int] | None — skip samples whose zonotope dimension is
+    not in this list.
+    """
     import json, torch
-    from surrogate.dataset import _make_features, _upr_onehot
-    from surrogate.model import MAX_DIM, N_DIM_FEAT, N_GLOBAL
-    from surrogate.dataset import collate_fn
+    from surrogate.model import MAX_DIM
+
+    use_v2 = _is_v2_model(model)
+    if use_v2:
+        from surrogate.dataset_v2 import _compute_features, _extract_upr
+        from surrogate.models_v2 import N_DIM_FEAT, N_GLOBAL
+    else:
+        from surrogate.dataset import _make_features, _upr_onehot
+        from surrogate.model import N_DIM_FEAT, N_GLOBAL
 
     results = []
     model.eval()
@@ -686,7 +775,6 @@ def _per_scenario_accuracy(file_list, model, device, label_key="I_theta"):
             if key in exp0:
                 domain = exp0[key]; break
         if domain == "unknown":
-            # Fall back to directory name heuristic
             parent = Path(jf).parent.name
             domain = "CPS" if "cps" in parent.lower() else "CONVIDE"
 
@@ -707,28 +795,37 @@ def _per_scenario_accuracy(file_list, model, device, label_key="I_theta"):
                 d = len(c1)
                 if d > MAX_DIM:
                     continue
+                if dims_filter is not None and d not in dims_filter:
+                    continue
 
-                upr_scales = upr_offsets = upr_oh = None
-                cr = exp.get("consistency_relations")
-                if cr and isinstance(cr, list) and len(cr) >= d:
-                    upr_scales, upr_offsets = [], []
-                    dom_type = "unknown"
-                    for rel in cr[:d]:
-                        m = rel.get("mapping", {})
-                        upr_scales.append(float(m.get("scale", 1.0)))
-                        upr_offsets.append(float(m.get("offset", 0.0)))
-                        if dom_type == "unknown":
-                            dom_type = rel.get("upr_type", "unknown")
-                    upr_oh = _upr_onehot(dom_type)
+                if use_v2:
+                    scales, offsets, upr_oh = _extract_upr(exp, d)
+                    feats = _compute_features(c1, G1, c2, G2, scales, offsets, upr_oh)
+                    pd_pad = np.zeros((MAX_DIM, N_DIM_FEAT), dtype=np.float32)
+                    pd_pad[:d] = feats["per_dim_v2"]
+                    global_feats = feats["global_v2"]
+                else:
+                    upr_scales = upr_offsets = upr_oh = None
+                    cr = exp.get("consistency_relations")
+                    if cr and isinstance(cr, list) and len(cr) >= d:
+                        upr_scales, upr_offsets = [], []
+                        dom_type = "unknown"
+                        for rel in cr[:d]:
+                            m = rel.get("mapping", {})
+                            upr_scales.append(float(m.get("scale", 1.0)))
+                            upr_offsets.append(float(m.get("offset", 0.0)))
+                            if dom_type == "unknown":
+                                dom_type = rel.get("upr_type", "unknown")
+                        upr_oh = _upr_onehot(dom_type)
+                    per_dim, global_feats = _make_features(
+                        c1, G1, c2, G2,
+                        upr_scales=upr_scales,
+                        upr_offsets=upr_offsets,
+                        upr_type_onehot=upr_oh,
+                    )
+                    pd_pad = np.zeros((MAX_DIM, N_DIM_FEAT), dtype=np.float32)
+                    pd_pad[:d] = per_dim
 
-                per_dim, global_feats = _make_features(
-                    c1, G1, c2, G2,
-                    upr_scales=upr_scales,
-                    upr_offsets=upr_offsets,
-                    upr_type_onehot=upr_oh,
-                )
-                pd_pad = np.zeros((MAX_DIM, N_DIM_FEAT), dtype=np.float32)
-                pd_pad[:d] = per_dim
                 mask = np.zeros(MAX_DIM, dtype=np.float32)
                 mask[:d] = 1.0
 
@@ -767,7 +864,7 @@ def _per_scenario_accuracy(file_list, model, device, label_key="I_theta"):
 
 
 def plot_generalization(model, device, out_dir: Path,
-                        val_fraction: float = 0.15):
+                        val_fraction: float = 0.15, dims_filter=None):
     """Inductive generalization figure: train vs held-out val scenarios.
 
     Three panels:
@@ -781,8 +878,8 @@ def plot_generalization(model, device, out_dir: Path,
     train_files, val_files = _reproduce_split(val_fraction)
     print(f"  Split: {len(train_files)} train / {len(val_files)} val scenarios")
 
-    train_res = _per_scenario_accuracy(train_files, model, device)
-    val_res   = _per_scenario_accuracy(val_files,   model, device)
+    train_res = _per_scenario_accuracy(train_files, model, device, dims_filter=dims_filter)
+    val_res   = _per_scenario_accuracy(val_files,   model, device, dims_filter=dims_filter)
 
     if not train_res and not val_res:
         print("  [warn] No per-scenario data — skipping generalization figure.")
@@ -1104,10 +1201,10 @@ def plot_summary_panel(acc: dict, acc_metrics, timing, sobol_results, out_dir: P
     ax3 = fig.add_subplot(gs[2])
     ax4 = fig.add_subplot(gs[3])
 
-    # Panel 1 — surrogate hexbin
+    # Panel 1 — surrogate scatter
     ref  = acc["i_theta"]
     surr = acc["i_surr"]
-    _hexbin_panel(ax1, ref, surr, "Purples", C_SURR, r"Surrogate $\hat{I}$")
+    _scatter_panel(ax1, ref, surr, C_SURR, r"Surrogate $\hat{I}$")
     ax1.set_title("Accuracy (vs MC)", fontsize=FS_TITLE)
 
     # Panel 2 — metric bars for all methods
@@ -3047,8 +3144,31 @@ def plot_sobol_by_domain(sobol_results: list, out_dir: Path,
 
 
 def plot_conditional_sensitivity(sobol_scenarios: list, out_dir: Path,
-                                  n_bins: int = 4):
-    """Sobol S1/ST per I_theta regime (quantile-binned by inconsistency level)."""
+                                  n_bins: int = 4, n_boot: int = 2000,
+                                  rng_seed: int = 0):
+    """Sobol S1/ST/interaction by inconsistency regime (scenario-level binning).
+
+    Replaces the previous per-sample subsetting approach, which broke the
+    Saltelli sample structure required by Sobol estimators.
+
+    Method
+    ------
+    1. Compute S1 and ST from each scenario's *intact* Saltelli design
+       (N % 5 == 0 guard preserved from _sobol_per_scenario).
+    2. Bin *scenarios* by their median I_theta into ``n_bins`` quantile
+       groups (Low → Saturated).  This preserves sample structure within
+       every scenario; only the aggregation is regime-conditional.
+    3. Bootstrap *across scenarios* within each bin (B = n_boot resamples)
+       to obtain 95 % CIs for S1, ST, and the interaction proxy ST − S1.
+    4. Plot as disconnected dot + error-bar panels (3 panels: S1 | ST |
+       ST − S1).  X-axis is categorical; connecting lines are omitted.
+    5. Regime legend entries include the quantile interval [lo, hi] and n.
+
+    Label
+    -----
+    Titled "Sobol indices by I_θ regime" — valid because Saltelli structure
+    is respected per scenario; only regime *aggregation* is conditional.
+    """
     try:
         from SALib.analyze import sobol as sobol_analyze
     except ImportError:
@@ -3059,28 +3179,22 @@ def plot_conditional_sensitivity(sobol_scenarios: list, out_dir: Path,
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n[Paper] Conditional sensitivity ({n_bins} I_theta bins)...")
-
-    # Pool all rows
-    all_rows = []
-    for sc in sobol_scenarios:
-        rows = sc["rows"] if isinstance(sc, dict) else sc
-        all_rows.extend(rows)
-
-    i_theta_all = np.array([r["i_theta"] for r in all_rows])
-    valid_mask  = np.isfinite(i_theta_all)
-    if valid_mask.sum() < 50:
-        print("  [warn] Not enough data for conditional Sobol.")
-        return
-
-    bins = np.quantile(i_theta_all[valid_mask], np.linspace(0, 1, n_bins + 1))
-    bins[0] -= 1e-6; bins[-1] += 1e-6
+    print(f"\n[Paper] Conditional sensitivity — scenario-level binning "
+          f"({n_bins} regimes, {n_boot} bootstrap resamples)...")
 
     problem = {"num_vars": 3, "names": PARAMS, "bounds": [[0, 1]] * 3}
 
-    def _si(Y):
+    def _si_intact(rows):
+        """Sobol on an intact Saltelli block; returns (s1, st) dicts or (None, None)."""
+        N = len(rows)
+        if N < 10 or N % 5 != 0:
+            return None, None
         try:
-            si = sobol_analyze.analyze(problem, Y, calc_second_order=False,
+            Y = np.array([r["i_theta"] for r in rows], dtype=float)
+            if np.std(Y) < 1e-9:
+                return None, None
+            si = sobol_analyze.analyze(problem, Y,
+                                       calc_second_order=False,
                                        print_to_console=False)
             s1 = {p: max(0.0, float(si["S1"][i])) for i, p in enumerate(PARAMS)}
             st = {p: max(0.0, float(si["ST"][i])) for i, p in enumerate(PARAMS)}
@@ -3088,94 +3202,184 @@ def plot_conditional_sensitivity(sobol_scenarios: list, out_dir: Path,
         except Exception:
             return None, None
 
-    bin_results = []
-    for b in range(n_bins):
-        lo, hi = bins[b], bins[b + 1]
-        bin_rows = [
-            r for r in all_rows
-            if np.isfinite(r["i_theta"]) and lo <= r["i_theta"] < hi
-            and all(r.get(p) is not None for p in PARAMS)
-        ]
-        N = len(bin_rows)
-        valid_N = (N // 5) * 5
-        if valid_N < 10:
-            bin_results.append(None)
-            continue
-        bin_rows = bin_rows[:valid_N]
+    def _si_surr_intact(rows):
+        N = len(rows)
+        if N < 10 or N % 5 != 0:
+            return None, None
+        try:
+            Y = np.array([r["i_surr"] for r in rows], dtype=float)
+            if np.std(Y) < 1e-9:
+                return None, None
+            si = sobol_analyze.analyze(problem, Y,
+                                       calc_second_order=False,
+                                       print_to_console=False)
+            s1 = {p: max(0.0, float(si["S1"][i])) for i, p in enumerate(PARAMS)}
+            st = {p: max(0.0, float(si["ST"][i])) for i, p in enumerate(PARAMS)}
+            return s1, st
+        except Exception:
+            return None, None
 
-        s1_mc, st_mc = _si(np.array([r["i_theta"] for r in bin_rows]))
-        s1_su, st_su = _si(np.array([r["i_surr"]  for r in bin_rows]))
+    # ── Step 1: per-scenario Sobol + median I_theta ───────────────────────────
+    sc_records = []
+    for sc in sobol_scenarios:
+        rows   = sc["rows"] if isinstance(sc, dict) else sc
+        domain = sc.get("domain", "Unknown") if isinstance(sc, dict) else "Unknown"
+        if not rows:
+            continue
+        med_i = float(np.median([r["i_theta"] for r in rows
+                                 if np.isfinite(r["i_theta"])]))
+        s1_mc, st_mc   = _si_intact(rows)
+        s1_su, st_su   = _si_surr_intact(rows)
         if s1_mc is None or s1_su is None:
-            bin_results.append(None)
             continue
-        bin_results.append(dict(lo=lo, hi=hi, N=valid_N,
-                                s1_mc=s1_mc, st_mc=st_mc,
-                                s1_su=s1_su, st_su=st_su))
+        sc_records.append(dict(med_i=med_i, s1_mc=s1_mc, st_mc=st_mc,
+                                s1_su=s1_su, st_su=st_su, domain=domain))
 
-    valid_bins = [r for r in bin_results if r is not None]
-    if not valid_bins:
-        print("  [warn] Not enough data per bin.")
+    if len(sc_records) < n_bins * 2:
+        print(f"  [warn] Only {len(sc_records)} valid scenarios — "
+              "not enough for regime analysis.")
         return
 
-    n_v = len(valid_bins)
-    # Short, readable regime labels (always 4 bins; trim gracefully if fewer)
+    # ── Step 2: bin scenarios by median I_theta quartiles ────────────────────
+    med_vals = np.array([r["med_i"] for r in sc_records])
+    bin_edges = np.quantile(med_vals, np.linspace(0, 1, n_bins + 1))
+    bin_edges[0]  -= 1e-9
+    bin_edges[-1] += 1e-9
+
     _regime_names = ["Low", "Mid", "High", "Saturated"]
-    blbls = [_regime_names[i] if i < len(_regime_names) else f"Bin {i}"
-             for i in range(n_v)]
+    bins_data = []
+    for b in range(n_bins):
+        lo, hi = bin_edges[b], bin_edges[b + 1]
+        members = [r for r in sc_records if lo < r["med_i"] <= hi]
+        if not members:
+            continue
+        bins_data.append(dict(lo=lo, hi=hi, members=members,
+                              label=_regime_names[b] if b < len(_regime_names)
+                              else f"Bin {b}"))
 
-    x       = np.arange(len(PARAMS))
-    # Perceptually uniform, print-safe colour ramp (light → dark)
-    _ramp   = ["#b3cde3", "#6baed6", "#2171b5", "#084594"]
-    regime_cols = [_ramp[i % len(_ramp)] for i in range(n_v)]
+    if not bins_data:
+        print("  [warn] Empty bins after scenario grouping.")
+        return
 
+    # ── Step 3: bootstrap S1, ST, ST−S1 across scenarios per bin ────────────
+    rng = np.random.default_rng(rng_seed)
+
+    def _boot_stats(members, key_s1, key_st, n_boot):
+        """Bootstrap mean ± 95 % CI for S1, ST, ST-S1 over scenario list."""
+        n = len(members)
+        s1_boot = np.zeros((n_boot, len(PARAMS)))
+        st_boot = np.zeros((n_boot, len(PARAMS)))
+        for b in range(n_boot):
+            idx = rng.integers(0, n, size=n)
+            s1_boot[b] = [np.mean([members[i][key_s1][p] for i in idx])
+                          for p in PARAMS]
+            st_boot[b] = [np.mean([members[i][key_st][p] for i in idx])
+                          for p in PARAMS]
+        inter_boot = np.clip(st_boot - s1_boot, 0, None)
+        def _ci(arr):
+            mn  = arr.mean(axis=0)
+            lo  = np.percentile(arr, 2.5,  axis=0)
+            hi  = np.percentile(arr, 97.5, axis=0)
+            return mn, lo, hi
+        return _ci(s1_boot), _ci(st_boot), _ci(inter_boot)
+
+    bin_stats_mc   = []
+    bin_stats_surr = []
+    for bd in bins_data:
+        mc_res   = _boot_stats(bd["members"], "s1_mc", "st_mc",   n_boot)
+        surr_res = _boot_stats(bd["members"], "s1_su", "st_su",   n_boot)
+        bin_stats_mc.append(mc_res)
+        bin_stats_surr.append(surr_res)
+
+    # ── Step 4: three-panel dot + CI figure ───────────────────────────────────
     from matplotlib.lines import Line2D
 
+    _ramp       = ["#b3cde3", "#6baed6", "#2171b5", "#084594"]
+    regime_cols = [_ramp[i % len(_ramp)] for i in range(len(bins_data))]
+
+    n_p   = len(PARAMS)
+    x_pos = np.arange(n_p, dtype=float)
+
+    # Horizontal jitter per regime so dots don't stack
+    n_reg  = len(bins_data)
+    jitter = np.linspace(-0.18, 0.18, n_reg) if n_reg > 1 else [0.0]
+
+    panel_titles = [
+        r"First-order $S_1$",
+        r"Total-effect $S_T$",
+        r"Interaction $S_T - S_1$",
+    ]
+
     fig, axes = plt.subplots(
-        1, 2,
-        figsize=(10.0, 4.4),
-        gridspec_kw={"wspace": 0.34},
+        1, 3,
+        figsize=(13.0, 4.4),
+        gridspec_kw={"wspace": 0.36},
     )
 
-    for ax, key_mc, key_su, title in [
-        (axes[0], "s1_mc", "s1_su", r"First-order $S_1$ by regime"),
-        (axes[1], "st_mc", "st_su", r"Total-effect $S_T$ by regime"),
-    ]:
-        for b_idx, br in enumerate(valid_bins):
-            col = regime_cols[b_idx]
-            # Higher-inconsistency regimes get thicker lines
-            lw_mc = LW_MAIN + 0.6 * (b_idx / max(1, n_v - 1))
-            # MC — solid
-            ax.plot(x, [br[key_mc][p] for p in PARAMS],
-                    color=col, lw=lw_mc, marker="o", markersize=4.5,
-                    ls="-", zorder=4 + b_idx)
-            # Surrogate — dashed, same colour
-            ax.plot(x, [br[key_su][p] for p in PARAMS],
-                    color=col, lw=lw_mc - 0.4, marker="^", markersize=4.0,
-                    ls="--", zorder=4 + b_idx, alpha=0.85)
+    for panel_idx, (ax, title) in enumerate(zip(axes, panel_titles)):
+        for b_idx, (bd, col, jit) in enumerate(
+                zip(bins_data, regime_cols, jitter)):
+            mc_res, surr_res = bin_stats_mc[b_idx], bin_stats_surr[b_idx]
+            mn_mc,  lo_mc,  hi_mc  = mc_res[panel_idx]
+            mn_su,  lo_su,  hi_su  = surr_res[panel_idx]
 
-        ax.set_xticks(x)
-        ax.set_xticklabels([PARAM_LABELS[p] for p in PARAMS], fontsize=FS_LABEL)
-        ax.set_ylim(-0.02, 1.08)
-        ax.set_ylabel("Sobol index", fontsize=FS_LABEL)
+            xj = x_pos + jit
+            # MC — filled circle
+            ax.errorbar(
+                xj, mn_mc,
+                yerr=[mn_mc - lo_mc, hi_mc - mn_mc],
+                fmt="o", color=col, markersize=5.5,
+                capsize=3, elinewidth=1.0, lw=0,
+                zorder=5 + b_idx, label=None,
+            )
+            # Surrogate — open triangle, same colour, slight inner jitter
+            ax.errorbar(
+                xj + 0.04, mn_su,
+                yerr=[mn_su - lo_su, hi_su - mn_su],
+                fmt="^", color=col, markersize=4.5,
+                capsize=3, elinewidth=0.8, lw=0,
+                markerfacecolor="none", markeredgewidth=1.2,
+                zorder=5 + b_idx, label=None,
+            )
+
+        ax.axhline(0, color="#aaa", lw=0.7, ls="--", zorder=1)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([PARAM_LABELS[p] for p in PARAMS],
+                           fontsize=FS_LABEL)
+        ax.set_ylim(-0.05, 1.08)
+        ax.set_ylabel("Sobol index" if panel_idx == 0 else "",
+                      fontsize=FS_LABEL)
         ax.set_title(title, fontsize=FS_TITLE)
         _style_ax(ax)
 
-    # Compact two-part legend: regime colours + line-style key
+    # Legend: regime rows (colour) + estimator column (marker style)
     regime_handles = [
-        Line2D([0], [0], color=regime_cols[i], lw=2.2, marker="o",
-               markersize=4, label=blbls[i])
-        for i in range(n_v)
+        Line2D([0], [0], color=regime_cols[i], marker="o", markersize=5,
+               lw=0,
+               label=(f"{bd['label']}  "
+                      f"[{bd['lo']:.2f}, {bd['hi']:.2f}]  "
+                      f"n={len(bd['members'])}"))
+        for i, bd in enumerate(bins_data)
     ]
     style_handles = [
-        Line2D([0], [0], color="#555", lw=2.2, ls="-",  label="MC",
-               marker="o", markersize=4),
-        Line2D([0], [0], color="#555", lw=1.8, ls="--", label="Surrogate",
-               marker="^", markersize=4),
+        Line2D([0], [0], color="#555", marker="o", markersize=5,
+               lw=0, label="MC  (filled ●)"),
+        Line2D([0], [0], color="#555", marker="^", markersize=5,
+               lw=0, markerfacecolor="none",
+               markeredgewidth=1.2, label="Surrogate  (open ▲)"),
     ]
     axes[0].legend(
         handles=regime_handles + style_handles,
-        fontsize=FS_LEGEND - 0.5, ncol=2,
-        framealpha=0.88, handlelength=1.8,
+        fontsize=FS_LEGEND - 0.5, ncol=1,
+        framealpha=0.88, handlelength=1.2,
+        title="Regime  [med. $I_θ$ interval]",
+        title_fontsize=FS_LEGEND - 1,
+    )
+
+    fig.suptitle(
+        "Sobol indices by $I_\\theta$ regime  "
+        "(scenario-level binning, 95 % bootstrap CI)",
+        fontsize=FS_TITLE + 0.5, y=1.01,
     )
 
     fig.tight_layout()
@@ -3317,7 +3521,7 @@ def _cf_domain_short(domain: str) -> str:
 
 def plot_counterfactual(sobol_scenarios, out_dir, model=None,
                         device=None, gamma=0.5, max_queries=40,
-                        max_workers=4):
+                        max_workers=4, use_v2=False):
     """Q4 counterfactual figures — publication-quality outputs.
 
     Uses batched gradient-based counterfactual search (Adam + penalty
@@ -3336,7 +3540,7 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
     """
     import matplotlib.patches as mpatches
     from .counterfactual import (
-        run_counterfactuals_parallel, PARAM_NAMES,
+        run_counterfactuals_parallel, PARAM_NAMES, PARAM_BOUNDS,
     )
 
     print(f"\n[Q4] Counterfactual explanations (gamma={gamma}, "
@@ -3356,7 +3560,8 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
         sc_cfs = run_counterfactuals_parallel(
             sc_list, model,
             gamma=gamma, max_queries=max_queries,
-            device=device, max_workers=max_workers)
+            device=device, max_workers=max_workers,
+            use_v2=use_v2)
     else:
         sc_cfs = {}
 
@@ -3426,6 +3631,38 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
     print(f"  Found {n_total} counterfactual pairs across "
           f"{len(domain_dists)} domain(s), {len(sc_records)} scenario(s).")
 
+    # -- Export raw per-repair data to CSV (used by combine_q4_figures.py for
+    #    merged q4_directions and q4_fix_direction figures across eval sets)
+    import csv
+    csv_path = out_dir / "q4_repairs_raw.csv"
+    _sc_domain_map = {sc_id: dom for sc_id, dom, _, _ in sc_records}
+    with open(csv_path, "w", newline="") as _csv_fh:
+        _writer = csv.writer(_csv_fh)
+        _writer.writerow([
+            "domain", "scenario_id",
+            "delta_scale", "delta_center", "delta_corr",
+            "theta_star_scale", "theta_star_center", "theta_star_corr",
+            "theta_prime_scale", "theta_prime_center", "theta_prime_corr",
+            "dist_normalised", "dominant_param",
+            "i_surr_star", "i_surr_prime",
+        ])
+        for sc_id, domain, _rows, cfs in sc_records:
+            for cf in cfs:
+                dt = np.asarray(cf.delta_theta, dtype=float)
+                ts = np.asarray(cf.theta_star,  dtype=float)
+                tp = np.asarray(cf.theta_prime, dtype=float)
+                _writer.writerow([
+                    domain, sc_id,
+                    round(float(dt[0]), 6), round(float(dt[1]), 6), round(float(dt[2]), 6),
+                    round(float(ts[0]), 6), round(float(ts[1]), 6), round(float(ts[2]), 6),
+                    round(float(tp[0]), 6), round(float(tp[1]), 6), round(float(tp[2]), 6),
+                    round(float(cf.dist_normalised), 6),
+                    getattr(cf, "dominant_param", ""),
+                    round(float(getattr(cf, "i_surr_star",  float("nan"))), 6),
+                    round(float(getattr(cf, "i_surr_prime", float("nan"))), 6),
+                ])
+    print(f"  Saved: q4_repairs_raw.csv  ({n_total} rows)")
+
     def _dom_dominant(d):
         counts = domain_dom[d]
         return max(counts, key=counts.get)
@@ -3469,44 +3706,60 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
 
         hero_cf = max(cfs, key=lambda c: c.dist_normalised)
 
-        # All theta* as faint gray dots
+        # All theta* as faint gray dots (reduced to avoid clutter)
         ax.scatter([c.theta_star[0] for c in cfs],
                    [c.theta_star[1] for c in cfs],
-                   s=16, c="#999999", alpha=0.30, linewidths=0, zorder=4)
+                   s=9, c="#999999", alpha=0.18, linewidths=0, zorder=4)
 
         # Hero theta* -- red circle
         ax.scatter([hero_cf.theta_star[0]], [hero_cf.theta_star[1]],
                    s=160, c="#cc2222", edgecolors="white", linewidths=1.6,
                    zorder=7, label=r"Inconsistent $\theta^*$")
 
-        # Hero theta' -- green triangle
+        # Hero theta' -- green triangle (enlarged, black border for emphasis)
         ax.scatter([hero_cf.theta_prime[0]], [hero_cf.theta_prime[1]],
-                   s=140, marker="^", c="#1a7a1a", edgecolors="white",
-                   linewidths=1.6, zorder=7, label=r"Consistent $\theta'$")
+                   s=195, marker="^", c="#1a7a1a", edgecolors="#111111",
+                   linewidths=2.0, zorder=7, label=r"Consistent $\theta'$")
 
-        # Repair arrow
+        # Repair arrow — reduced thickness so landscape remains visually primary
         ax.annotate("",
                     xy    =(hero_cf.theta_prime[0], hero_cf.theta_prime[1]),
                     xytext=(hero_cf.theta_star[0],  hero_cf.theta_star[1]),
                     arrowprops=dict(arrowstyle="-|>", color="#111111",
-                                    lw=2.4, mutation_scale=18),
+                                    lw=1.55, mutation_scale=13),
                     zorder=8)
 
-        # "Minimal repair" label at arrow midpoint
+        # "Minimal repair" label — offset perpendicular, semi-transparent box
         mx = (hero_cf.theta_star[0] + hero_cf.theta_prime[0]) / 2
         my = (hero_cf.theta_star[1] + hero_cf.theta_prime[1]) / 2
-        ax.text(mx, my, "Minimal repair",
+        dx = hero_cf.theta_prime[0] - hero_cf.theta_star[0]
+        dy = hero_cf.theta_prime[1] - hero_cf.theta_star[1]
+        norm = (dx**2 + dy**2) ** 0.5 + 1e-10
+        perp_scale = norm * 0.24
+        ox = -dy / norm * perp_scale
+        oy =  dx / norm * perp_scale
+        ax.text(mx + ox, my + oy, "Minimal repair",
                 ha="center", va="bottom", fontsize=FS_ANNOT + 1,
                 color="#111111", fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.25", fc="white",
-                          ec="#bbbbbb", alpha=0.90, lw=0.8),
+                bbox=dict(boxstyle="round,pad=0.30", fc="white",
+                          ec="#888888", alpha=0.93, lw=0.9),
                 zorder=9)
 
-        # Distance annotation (bottom-right)
+        # Distance + I(θ*) before + I(θ') after annotations (bottom-right)
+        i_prime = getattr(hero_cf, "i_surr_prime", float("nan"))
+        # Look up I(θ*) from rows by nearest-neighbour match
+        dists_r = ((scales - hero_cf.theta_star[0])**2
+                   + (centers - hero_cf.theta_star[1])**2)
+        i_star_val = float(i_surr[int(np.argmin(dists_r))]) if valid.any() else float("nan")
+        ann_lines = rf"$d = {hero_cf.dist_normalised:.2f}$"
+        if np.isfinite(i_star_val):
+            ann_lines += "\n" + rf"$\hat{{I}}(\theta^*) = {i_star_val:.2f}$"
+        if np.isfinite(i_prime):
+            ann_lines += "\n" + rf"$\hat{{I}}(\theta') = {i_prime:.2f}$"
         ax.text(0.97, 0.04,
-                rf"$d = {hero_cf.dist_normalised:.2f}$",
+                ann_lines,
                 transform=ax.transAxes, ha="right", va="bottom",
-                fontsize=FS_ANNOT + 1,
+                fontsize=FS_ANNOT + 1, linespacing=1.5,
                 bbox=dict(boxstyle="round,pad=0.25", fc="white",
                           ec="#cccccc", alpha=0.85, lw=0.7))
 
@@ -3539,7 +3792,8 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
                        colors=["#222222"], linewidths=[2.0],
                        linestyles=["--"], zorder=3)
 
-        arrow_kw = dict(lw=1.5, mutation_scale=10, arrowstyle="-|>", alpha=0.80)
+        # Arrowheads explicit: larger mutation_scale, slightly reduced lw+alpha
+        arrow_kw = dict(lw=1.2, mutation_scale=13, arrowstyle="-|>", alpha=0.68)
         for cf in cfs:
             ax.annotate("",
                         xy    =(cf.theta_prime[0], cf.theta_prime[1]),
@@ -3553,15 +3807,19 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
             for p in PARAMS_3
         ]
         ax.legend(handles=handles_traj,
-                  title="Dominant repair",
-                  title_fontsize=FS_LEGEND - 0.5,
-                  fontsize=FS_LEGEND - 0.5, loc="upper left",
+                  title="Dominant repair param.",
+                  title_fontsize=FS_LEGEND - 1,
+                  fontsize=FS_LEGEND - 1, loc="upper left",
                   framealpha=0.88, edgecolor="#cccccc",
-                  handlelength=1.2, borderpad=0.6)
+                  handlelength=1.1, borderpad=0.5,
+                  labelspacing=0.35)
 
+        # Semantic clarification below the panel title
         ax.set_xlabel(PARAM_LABELS["scale_factor"], fontsize=FS_LABEL)
         ax.set_ylabel(PARAM_LABELS["center_delta"], fontsize=FS_LABEL)
-        ax.set_title(panel_title, fontsize=FS_TITLE, pad=6)
+        ax.set_title(panel_title + "\n"
+                     r"$\it{Arrows\ terminate\ at\ nearest\ consistent\ config.}$",
+                     fontsize=FS_TITLE, pad=6)
         _style_ax(ax, grid_axis="both")
 
     for sc_id, domain, rows, cfs in sc_records:
@@ -3594,60 +3852,47 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
         plt.close(fig)
         print(f"  Saved: {fname}.png/pdf  ({len(cfs)} repairs, domain={dlabel})")
 
-    # -- 4. Overview figure: stacked bar + box
+    # -- 3b. Standalone q4_landscape figure (prefer scenario 49, else global hero)
+    _LANDSCAPE_SC_ID = 49
+    _best_sc_land = None
+    _best_dist_land = -1.0
+    for _sc_id_l, _dom_l, _rows_l, _cfs_l in sc_records:
+        if len(_cfs_l) < 2:
+            continue
+        if _sc_id_l == _LANDSCAPE_SC_ID:
+            _best_sc_land = (_sc_id_l, _dom_l, _rows_l, _cfs_l)
+            break
+        _md = max(c.dist_normalised for c in _cfs_l)
+        if _md > _best_dist_land:
+            _best_dist_land = _md
+            _best_sc_land = (_sc_id_l, _dom_l, _rows_l, _cfs_l)
+    if _best_sc_land is not None:
+        _sc_id_l, _dom_l, _rows_l, _cfs_l = _best_sc_land
+        _dlabel_l = _cf_domain_short(_dom_l)
+        fig_l, ax_l = plt.subplots(1, 1, figsize=(7.2, 4.8))
+        _draw_landscape_ax(
+            ax_l, fig_l, _rows_l, _cfs_l, _dom_l,
+            panel_title="",
+            show_cbar=True)
+        fig_l.tight_layout()
+        for ext in ("png", "pdf"):
+            fig_l.savefig(out_dir / f"q4_landscape.{ext}", dpi=300,
+                          bbox_inches="tight")
+        plt.close(fig_l)
+        print(f"  Saved: q4_landscape.png/pdf  "
+              f"(scenario={_sc_id_l}, domain={_dlabel_l})")
+
+    # -- 4. Repair distance figure (boxplot only) → q4_distances
     domains  = sorted(domain_dists.keys(),
                       key=lambda d: (PARAMS_3.index(_dom_dominant(d)), d))
     dlabels  = [_cf_domain_short(d) for d in domains]
     n_dom    = len(domains)
 
-    bar_w   = max(0.55, min(0.75, 2.5 / max(n_dom, 1)))
-    fig_w   = max(9.0, n_dom * 1.55 + 3.0)
-    fig, axes = plt.subplots(1, 2, figsize=(fig_w, max(4.2, n_dom * 0.38 + 2.8)),
-                             gridspec_kw={"width_ratios": [1.15, 1],
-                                          "wspace": 0.38})
+    bar_w  = max(0.55, min(0.75, 2.5 / max(n_dom, 1)))
+    fig_w  = max(7.0, n_dom * 1.35 + 2.5)
+    fig, ax_box = plt.subplots(1, 1,
+                               figsize=(fig_w, max(3.4, n_dom * 0.22 + 2.0)))
 
-    ax_bar = axes[0]
-    totals  = np.array([sum(domain_dom[d].values()) for d in domains], dtype=float)
-    bottoms = np.zeros(n_dom)
-    handles_bar = []
-    dom_dominant_idx = [PARAMS_3.index(_dom_dominant(d)) for d in domains]
-
-    for p_idx, param in enumerate(PARAMS_3):
-        frac = np.array([domain_dom[d][param] / max(totals[i], 1)
-                         for i, d in enumerate(domains)])
-        bars = ax_bar.bar(np.arange(n_dom), frac * 100, bottom=bottoms,
-                          width=bar_w,
-                          color=_CF_COLORS[param], alpha=0.85,
-                          label=_CF_SHORT[param], zorder=3)
-        for xi, bar in enumerate(bars):
-            if dom_dominant_idx[xi] == p_idx:
-                bar.set_edgecolor("#111")
-                bar.set_linewidth(2.0)
-            else:
-                bar.set_edgecolor("none")
-        for xi, (b, h) in enumerate(zip(bottoms, frac * 100)):
-            if h > 14:
-                ax_bar.text(xi, b + h / 2, f"{h:.0f}%",
-                            ha="center", va="center",
-                            fontsize=FS_ANNOT, color="white", fontweight="bold")
-        bottoms += frac * 100
-        handles_bar.append(bars[0])
-
-    ax_bar.set_xlim(-0.6, n_dom - 0.4)
-    ax_bar.set_ylim(0, 115)
-    ax_bar.set_xticks(np.arange(n_dom))
-    ax_bar.set_xticklabels(dlabels, rotation=30 if n_dom > 4 else 0,
-                           ha="right" if n_dom > 4 else "center",
-                           fontsize=FS_LABEL)
-    ax_bar.set_ylabel("Fraction of repairs (%)", fontsize=FS_LABEL)
-    ax_bar.set_title("Dominant repair parameter per domain",
-                     fontsize=FS_TITLE, pad=7)
-    ax_bar.legend(handles=handles_bar, labels=[_CF_SHORT[p] for p in PARAMS_3],
-                  fontsize=FS_LEGEND, loc="upper right",
-                  framealpha=0.90, edgecolor="#cccccc")
-    _style_ax(ax_bar, grid_axis="y")
-
-    ax_box = axes[1]
     bp_data = [domain_dists[d] for d in domains]
     medians = [float(np.median(domain_dists[d])) for d in domains]
     hardest_idx = int(np.argmax(medians))
@@ -3668,26 +3913,15 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
     for i, patch in enumerate(bp["boxes"]):
         patch.set_facecolor(cmap_d(i % 10))
         patch.set_alpha(0.50)
-        if i == hardest_idx:
-            patch.set_edgecolor("#111")
-            patch.set_linewidth(2.6)
-            patch.set_alpha(0.80)
 
-    for i, med in enumerate(medians):
-        ax_box.text(i + bar_w * 0.52, med, f"{med:.2f}",
-                    va="center", fontsize=FS_ANNOT, color="#333333")
+    y_maxes = [max(domain_dists[d]) for d in domains]
+    for i, (med, ymax) in enumerate(zip(medians, y_maxes)):
+        offset = (max(y_maxes) - min(medians)) * 0.07 + 0.02
+        ax_box.text(i, ymax + offset, f"{med:.2f}",
+                    ha="center", va="bottom", fontsize=FS_ANNOT + 1.0,
+                    color="#333333", fontweight="semibold")
 
-    if n_dom > 0:
-        dy = (max(medians) - min(medians)) * 0.22 if len(medians) > 1 else 0.05
-        ax_box.annotate(
-            "Hardest\nto repair",
-            xy=(hardest_idx, medians[hardest_idx]),
-            xytext=(min(hardest_idx + 0.7, n_dom - 0.1),
-                    medians[hardest_idx] + dy),
-            fontsize=FS_ANNOT, color="#111",
-            arrowprops=dict(arrowstyle="->", color="#555", lw=0.9),
-            bbox=dict(boxstyle="round,pad=0.22", fc="white",
-                      ec="#aaa", alpha=0.88, lw=0.6))
+    # "Hardest to repair" annotation removed — median labels are sufficient
 
     ax_box.set_xticks(np.arange(n_dom))
     ax_box.set_xticklabels(dlabels, rotation=30 if n_dom > 4 else 0,
@@ -3695,25 +3929,21 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
                            fontsize=FS_LABEL)
     ax_box.set_ylabel(r"Normalised repair distance $\|\theta'-\theta^*\|$",
                       fontsize=FS_LABEL)
-    ax_box.set_title("Repair distance to consistency", fontsize=FS_TITLE, pad=7)
+    # title removed — caption carries this information
     ax_box.set_xlim(-0.6, n_dom - 0.4)
     _style_ax(ax_box, grid_axis="y")
 
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"q4_overview.{ext}", dpi=300,
+        fig.savefig(out_dir / f"q4_distances.{ext}", dpi=300,
                     bbox_inches="tight")
     plt.close(fig)
-    print("  Saved: q4_overview.png/pdf")
+    print("  Saved: q4_distances.png/pdf")
 
     # -- 5. Fix-direction: mean signed shift, one panel per parameter
     if domain_cfs_raw:
         param_full  = ["scale_factor", "center_delta", "correlation_strength"]
-        param_xlbls = [
-            r"Repair shift -- Scale $s_u$",
-            r"Repair shift -- Center $\Delta c_u$",
-            r"Repair shift -- Corr. $\rho_u$",
-        ]
+        param_xlbls = ["Scale repair", "Center repair", "Correlation repair"]
 
         fig_h = max(3.8, n_dom * 0.52 + 1.8)
         fig, axes = plt.subplots(1, 3,
@@ -3793,13 +4023,442 @@ def plot_counterfactual(sobol_scenarios, out_dir, model=None,
         plt.close(fig)
         print("  Saved: q4_fix_direction.png/pdf")
 
+    # -- 6. Repair structure: ternary (dominant param) + parallel coords (signed)
+    # Collect all repairs in one flat pass over domain_cfs_raw
+    _SPANS = np.array([b[1] - b[0] for b in PARAM_BOUNDS], dtype=float)  # [3.05, 2.10, 1.05]
+    _SQRT3_2 = 3.0 ** 0.5 / 2.0
+    # Vertices in 2D cartesian: Scale=bottom-left, Center=bottom-right, Corr=top
+    _VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, _SQRT3_2]])
+
+    def _bary2cart(pts):
+        """(N,3) barycentric → (N,2) cartesian via vertex linear combination."""
+        return np.asarray(pts) @ _VERTS
+
+    all_tern, all_par, all_dom = [], [], []
+    for d in sorted(domain_cfs_raw.keys()):
+        for cf in domain_cfs_raw[d]:
+            dt = np.array(cf.delta_theta, dtype=float)
+            abs_n = np.abs(dt) / (_SPANS + 1e-10)
+            total = abs_n.sum() + 1e-10
+            all_tern.append(abs_n / total)          # normalised absolute → ternary
+            all_par.append(dt / (_SPANS + 1e-10))   # signed, span-scaled
+            all_dom.append(d)
+
+    if not all_tern:
+        return
+
+    all_tern = np.array(all_tern)   # (N, 3)
+    all_par  = np.array(all_par)    # (N, 3)
+    all_dom  = np.array(all_dom)
+    dom_uniq = sorted(set(all_dom))
+    n_du     = len(dom_uniq)
+
+    _cmap_rs  = plt.cm.tab10 if n_du <= 10 else plt.cm.tab20
+    _dc       = {d: _cmap_rs(i % 20) for i, d in enumerate(dom_uniq)}
+    _ds       = {d: _cf_domain_short(d) for d in dom_uniq}
+
+    # ══ Figure A: Ternary — repair composition in 3D simplex ═════════════════
+    fig_t, ax_t = plt.subplots(1, 1, figsize=(7.2, 5.8))
+
+    tri_pts = np.vstack([_VERTS, _VERTS[0]])
+    ax_t.plot(tri_pts[:, 0], tri_pts[:, 1],
+              color="#444444", lw=1.6, zorder=2)
+
+    for lvl in (0.25, 0.50, 0.75):
+        for axis in range(3):
+            p = np.zeros((2, 3))
+            p[0, axis] = lvl;  p[0, (axis+1) % 3] = 1 - lvl; p[0, (axis+2) % 3] = 0
+            p[1, axis] = lvl;  p[1, (axis+1) % 3] = 0;        p[1, (axis+2) % 3] = 1 - lvl
+            xy = _bary2cart(p)
+            ax_t.plot(xy[:, 0], xy[:, 1],
+                      color="#aaaaaa", lw=0.5, alpha=0.45, zorder=1, ls="--")
+
+    for d in dom_uniq:
+        mask = all_dom == d
+        if not mask.any():
+            continue
+        xy = _bary2cart(all_tern[mask])
+        ax_t.scatter(xy[:, 0], xy[:, 1],
+                     s=30, color=_dc[d], alpha=0.44,
+                     linewidths=0, zorder=3)
+
+    legend_handles = []
+    for d in dom_uniq:
+        mask = all_dom == d
+        if not mask.any():
+            continue
+        cen = all_tern[mask].mean(axis=0)
+        cen /= cen.sum() + 1e-10
+        xy_c = _bary2cart(cen.reshape(1, 3))[0]
+        ax_t.scatter([xy_c[0]], [xy_c[1]],
+                     s=195, color=_dc[d], marker="D",
+                     edgecolors="#111111", linewidths=1.9,
+                     zorder=6, alpha=1.0)
+        ax_t.text(xy_c[0], xy_c[1] + 0.027, _ds[d],
+                  ha="center", va="bottom",
+                  fontsize=FS_ANNOT - 0.5, color=_dc[d],
+                  fontweight="bold", zorder=7)
+        legend_handles.append(
+            mpatches.Patch(color=_dc[d], label=_ds[d]))
+
+    _vlabels  = [r"Scale $s_u$", r"Center $\Delta c_u$", r"Corr. $\rho_u$"]
+    _vcolors  = [_CF_COLORS["scale_factor"],
+                 _CF_COLORS["center_delta"],
+                 _CF_COLORS["correlation_strength"]]
+    _voffsets = [(-0.08, -0.07), (0.08, -0.07), (0.0, 0.06)]
+    for (ox, oy), lbl, col, v in zip(_voffsets, _vlabels, _vcolors, _VERTS):
+        ax_t.text(v[0] + ox, v[1] + oy, lbl,
+                  ha="center", va="center",
+                  fontsize=FS_LABEL, fontweight="bold", color=col, zorder=8)
+
+    _vdom_lbl = ["Scale-dominated", "Center-dominated", "Corr.-dominated"]
+    _vdom_off = [(-0.16, 0.08), (0.18, 0.08), (0.0, 0.10)]
+    for (ox, oy), lbl, col, v in zip(_vdom_off, _vdom_lbl, _vcolors, _VERTS):
+        ax_t.text(v[0] + ox, v[1] + oy, lbl,
+                  ha="center", va="center",
+                  fontsize=FS_ANNOT - 0.5, color=col,
+                  style="italic", alpha=0.60, zorder=8)
+
+    ax_t.set_xlim(-0.20, 1.20)
+    ax_t.set_ylim(-0.15, _SQRT3_2 + 0.18)
+    ax_t.set_aspect("equal", adjustable="box")
+    ax_t.axis("off")
+    # title and normalisation subtitle removed — caption carries this information
+
+    fig_t.legend(handles=legend_handles,
+                 title="Domain  (\u25c6 = centroid)",
+                 title_fontsize=FS_LEGEND,
+                 fontsize=FS_LEGEND,
+                 loc="lower center",
+                 bbox_to_anchor=(0.5, -0.01),
+                 ncol=n_du,
+                 framealpha=0.93, edgecolor="#cccccc",
+                 handlelength=1.2, borderpad=0.5,
+                 handletextpad=0.4, columnspacing=1.0)
+
+    for ext in ("png", "pdf"):
+        fig_t.savefig(out_dir / f"q4_ternary.{ext}", dpi=300,
+                      bbox_inches="tight")
+    plt.close(fig_t)
+    print("  Saved: q4_ternary.png/pdf")
+
+    # ══ Figure B: Parallel coordinates — signed repair directions ═════════════
+    fig_p, ax_p = plt.subplots(1, 1, figsize=(10.0, 4.4))
+
+    x_pos = np.array([0, 1, 2])
+    y_abs = max(np.abs(all_par).max() * 1.18, 0.15)
+
+    ax_p.fill_between([-0.35, 2.35], [0, 0], [y_abs, y_abs],
+                      color="#ccffcc", alpha=0.08, zorder=0)
+    ax_p.fill_between([-0.35, 2.35], [-y_abs, -y_abs], [0, 0],
+                      color="#ffcccc", alpha=0.08, zorder=0)
+    ax_p.text(2.30, y_abs * 0.90,  "increase",
+              ha="right", va="top",
+              fontsize=FS_ANNOT, color="#448844", style="italic")
+    ax_p.text(2.30, -y_abs * 0.90, "decrease",
+              ha="right", va="bottom",
+              fontsize=FS_ANNOT, color="#884444", style="italic")
+
+    for xi in x_pos:
+        ax_p.axvline(xi, color="#999999", lw=0.9, alpha=0.50, zorder=1)
+    ax_p.axhline(0, color="#444444", lw=1.0, ls="--", alpha=0.55, zorder=3)
+
+    for d in dom_uniq:
+        mask = all_dom == d
+        for row in all_par[mask]:
+            ax_p.plot(x_pos, row, color=_dc[d],
+                      alpha=0.09, lw=0.50, zorder=2)
+
+    for d in dom_uniq:
+        mask = all_dom == d
+        if not mask.any():
+            continue
+        mean_row = all_par[mask].mean(axis=0)
+        ax_p.plot(x_pos, mean_row, color=_dc[d],
+                  alpha=0.95, lw=2.5, zorder=5,
+                  marker="o", markersize=5.5,
+                  markeredgecolor="white", markeredgewidth=0.9)
+        ax_p.text(2.04, mean_row[2], _ds[d],
+                  ha="left", va="center",
+                  fontsize=FS_ANNOT - 0.5, color=_dc[d],
+                  fontweight="bold", zorder=7)
+
+    p_xlbls = [r"Scale $s_u$", r"Center $\Delta c_u$", r"Corr. $\rho_u$"]
+    ax_p.set_xlim(-0.35, 2.55)
+    ax_p.set_ylim(-y_abs, y_abs)
+    ax_p.set_xticks(x_pos)
+    ax_p.set_xticklabels(p_xlbls, fontsize=FS_LABEL)
+    ax_p.set_ylabel(r"Repair shift (span-normalised $\delta\theta_i / \mathrm{range}_i$)",
+                    fontsize=FS_LABEL)
+    # title removed — caption carries this information
+    ax_p.spines["bottom"].set_visible(False)
+    _style_ax(ax_p, grid_axis="y")
+
+    for ext in ("png", "pdf"):
+        fig_p.savefig(out_dir / f"q4_directions.{ext}", dpi=300,
+                      bbox_inches="tight")
+    plt.close(fig_p)
+    print("  Saved: q4_directions.png/pdf")
+
+    # -- 7. Three-panel repair decomposition:
+    #        (a) mean signed components  (b) absolute composition  (c) distance
+    if not domain_cfs_raw:
+        return
+
+    # Domain ordering consistent with overview (by dominant repair param)
+    domains_3p = sorted(domain_cfs_raw.keys(),
+                        key=lambda d: (PARAMS_3.index(_dom_dominant(d)), d))
+    dlabels_3p = [_cf_domain_short(d) for d in domains_3p]
+    n_d3 = len(domains_3p)
+    x_d  = np.arange(n_d3)
+
+    # Per-domain statistics
+    signed_means = np.zeros((n_d3, 3))
+    abs_means    = np.zeros((n_d3, 3))
+    dists_3p     = []
+
+    for di, d in enumerate(domains_3p):
+        cfs_d  = domain_cfs_raw[d]
+        dt_all = np.array([cf.delta_theta for cf in cfs_d], dtype=float)
+        dt_n   = dt_all / (_SPANS + 1e-10)   # span-normalised
+        signed_means[di] = dt_n.mean(axis=0)
+        abs_means[di]    = np.abs(dt_n).mean(axis=0)
+        dists_3p.append([cf.dist_normalised for cf in cfs_d])
+
+    # Absolute fractions normalised to 100 %
+    abs_tot  = abs_means.sum(axis=1, keepdims=True).clip(min=1e-10)
+    abs_frac = abs_means / abs_tot * 100.0
+
+    p_colors = [_CF_COLORS[p] for p in PARAMS_3]
+    p_labels = [r"Scale $s_u$", r"Center $\Delta c_u$", r"Corr. $\rho_u$"]
+
+    fig_w = max(7.5, n_d3 * 1.05 + 2.5)
+    fig, axes = plt.subplots(
+        3, 1, sharex=True,
+        figsize=(fig_w, 10.0),
+        gridspec_kw={"hspace": 0.08, "height_ratios": [1.0, 0.82, 0.82]})
+
+    bw      = 0.24
+    offsets = np.array([-bw, 0.0, bw])
+
+    # ── (a) Mean signed repair components ────────────────────────────────────
+    ax_a = axes[0]
+    handles_leg = []
+    for pi, (col, lbl) in enumerate(zip(p_colors, p_labels)):
+        bars = ax_a.bar(x_d + offsets[pi], signed_means[:, pi],
+                        width=bw * 0.88, color=col, alpha=0.84,
+                        label=lbl, zorder=3)
+        handles_leg.append(bars[0])
+
+    ax_a.axhline(0, color="#333333", lw=1.0, zorder=4)
+    y_a = max(np.abs(signed_means).max() * 1.28, 0.06)
+    ax_a.fill_between([-0.6, n_d3 - 0.4], 0, y_a,
+                      color="#ccffcc", alpha=0.07, zorder=0)
+    ax_a.fill_between([-0.6, n_d3 - 0.4], -y_a, 0,
+                      color="#ffcccc", alpha=0.07, zorder=0)
+    ax_a.text(n_d3 - 0.48,  y_a * 0.88, "increase",
+              ha="right", va="top",
+              fontsize=FS_ANNOT, color="#448844", style="italic")
+    ax_a.text(n_d3 - 0.48, -y_a * 0.88, "decrease",
+              ha="right", va="bottom",
+              fontsize=FS_ANNOT, color="#884444", style="italic")
+    ax_a.set_xlim(-0.6, n_d3 - 0.4)
+    ax_a.set_ylim(-y_a, y_a)
+    ax_a.set_ylabel("Mean signed\nrepair shift", fontsize=FS_LABEL)
+    ax_a.set_title("(a) Mean signed repair components — direction of intervention",
+                   fontsize=FS_TITLE, pad=6)
+    _style_ax(ax_a, grid_axis="y")
+
+    # ── (b) Absolute repair composition (stacked, 100 %) ─────────────────────
+    ax_b = axes[1]
+    bottoms_b = np.zeros(n_d3)
+    for pi, col in enumerate(p_colors):
+        bars_b = ax_b.bar(x_d, abs_frac[:, pi],
+                          bottom=bottoms_b, width=0.54,
+                          color=col, alpha=0.86, zorder=3)
+        for xi, (bot, h) in enumerate(zip(bottoms_b, abs_frac[:, pi])):
+            if h > 15:
+                ax_b.text(xi, bot + h / 2, f"{h:.0f}%",
+                          ha="center", va="center",
+                          fontsize=FS_ANNOT + 1.5, color="white",
+                          fontweight="bold", zorder=5)
+        bottoms_b += abs_frac[:, pi]
+
+    ax_b.axhline(100, color="#666666", lw=0.8, ls="--", alpha=0.40, zorder=2)
+    ax_b.set_xlim(-0.6, n_d3 - 0.4)
+    ax_b.set_ylim(0, 114)
+    ax_b.set_ylabel("Repair composition\n(%)", fontsize=FS_LABEL)
+    ax_b.set_title("(b) Absolute repair composition — which parameter dominates",
+                   fontsize=FS_TITLE, pad=6)
+    _style_ax(ax_b, grid_axis="y")
+
+    # ── (c) Repair distance distribution ─────────────────────────────────────
+    ax_c = axes[2]
+    medians_c   = [float(np.median(d)) for d in dists_3p]
+    hardest_idx = int(np.argmax(medians_c))
+    y_maxes_c   = [max(d) if d else 0.0 for d in dists_3p]
+    glob_max    = max(y_maxes_c) if y_maxes_c else 1.0
+
+    bp = ax_c.boxplot(
+        dists_3p,
+        positions=x_d,
+        widths=0.50,
+        patch_artist=True,
+        showfliers=True,
+        medianprops=dict(color="#111111", lw=2.1),
+        whiskerprops=dict(color="#666666", lw=1.2),
+        capprops=dict(color="#666666", lw=1.2),
+        flierprops=dict(marker=".", color="#bbbbbb", markersize=3.5, alpha=0.55),
+        boxprops=dict(linewidth=1.2))
+
+    cmap_c = plt.cm.tab10
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(cmap_c(i % 10))
+        patch.set_alpha(0.45)
+        if i == hardest_idx:
+            patch.set_edgecolor("#111111")
+            patch.set_linewidth(2.5)
+            patch.set_alpha(0.82)
+
+    # Median labels above each box
+    for i, (med, ymax) in enumerate(zip(medians_c, y_maxes_c)):
+        ax_c.text(i, ymax + glob_max * 0.05, f"{med:.2f}",
+                  ha="center", va="bottom",
+                  fontsize=FS_ANNOT + 0.5, color="#333333")
+
+    if n_d3 > 0:
+        dx_ann = min(0.70, (n_d3 - 1 - hardest_idx) * 0.5 + 0.3)
+        ax_c.annotate(
+            "Hardest\nto repair",
+            xy=(hardest_idx, medians_c[hardest_idx]),
+            xytext=(hardest_idx + dx_ann,
+                    medians_c[hardest_idx] + glob_max * 0.25),
+            fontsize=FS_ANNOT, color="#111111",
+            arrowprops=dict(arrowstyle="->", color="#555555", lw=0.9),
+            bbox=dict(boxstyle="round,pad=0.22", fc="white",
+                      ec="#aaaaaa", alpha=0.90, lw=0.6))
+
+    ax_c.set_xlim(-0.6, n_d3 - 0.4)
+    ax_c.set_ylim(0, glob_max * 1.40)
+    ax_c.set_xticks(x_d)
+    ax_c.set_xticklabels(
+        dlabels_3p,
+        rotation=30 if n_d3 > 4 else 0,
+        ha="right" if n_d3 > 4 else "center",
+        fontsize=FS_LABEL)
+    ax_c.set_ylabel(r"Repair distance $\|\theta'-\theta^*\|$",
+                    fontsize=FS_LABEL)
+    ax_c.set_title("(c) Repair distance distribution — cost of consistency restoration",
+                   fontsize=FS_TITLE, pad=6)
+    _style_ax(ax_c, grid_axis="y")
+
+    # Shared legend — single horizontal row below all panels
+    fig.legend(
+        handles=handles_leg,
+        labels=p_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.025),
+        ncol=3,
+        fontsize=FS_LEGEND + 0.5,
+        framealpha=0.93,
+        edgecolor="#cccccc",
+        handlelength=1.5,
+        handletextpad=0.6,
+        columnspacing=2.0)
+
+    fig.suptitle(
+        "Counterfactual repair decomposition across CPS domains",
+        fontsize=FS_TITLE + 1, y=1.01, fontweight="semibold")
+
+    for ext in ("png", "pdf"):
+        fig.savefig(out_dir / f"q4_repair_decomposition.{ext}", dpi=300,
+                    bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: q4_repair_decomposition.png/pdf")
+
+    # -- 8. Save machine-readable statistics for fact-checking
+    stats = {}
+    for d in sorted(domain_dom.keys(), key=_cf_domain_short):
+        total = sum(domain_dom[d].values())
+        dists = np.array(domain_dists[d]) if d in domain_dists else np.array([])
+        stats[_cf_domain_short(d)] = {
+            "n_repairs":    int(total),
+            "scale_pct":    round(domain_dom[d]["scale_factor"]    / max(total,1) * 100, 1),
+            "center_pct":   round(domain_dom[d]["center_delta"]    / max(total,1) * 100, 1),
+            "corr_pct":     round(domain_dom[d]["correlation_strength"] / max(total,1) * 100, 1),
+            "median_dist":  round(float(np.median(dists)), 4) if len(dists) else None,
+            "mean_dist":    round(float(np.mean(dists)),   4) if len(dists) else None,
+            "max_dist":     round(float(np.max(dists)),    4) if len(dists) else None,
+        }
+    # Hero repair
+    best_cf2 = None; best_d2 = -1; best_sc2 = None; best_dom2 = None
+    for sc_idx2, scenario2 in enumerate(sobol_scenarios):
+        dom2  = (scenario2.get("domain","?") if isinstance(scenario2, dict)
+                 else "unknown")
+        rows2 = (scenario2.get("rows",[]) if isinstance(scenario2, dict)
+                 else scenario2)
+        for cf2 in sc_cfs.get(sc_idx2, []):
+            if cf2.dist_normalised > best_d2:
+                best_d2 = cf2.dist_normalised; best_cf2 = cf2
+                best_sc2 = scenario2; best_dom2 = dom2
+    if best_cf2:
+        rows2   = best_sc2.get("rows",[]) if isinstance(best_sc2, dict) else best_sc2
+        scales2 = np.array([r.get("scale_factor",np.nan) for r in rows2])
+        centr2  = np.array([r.get("center_delta", np.nan) for r in rows2])
+        isurr2  = np.array([r.get("i_surr",       np.nan) for r in rows2])
+        valid2  = np.isfinite(scales2) & np.isfinite(centr2) & np.isfinite(isurr2)
+        dr2     = (scales2 - best_cf2.theta_star[0])**2 + (centr2 - best_cf2.theta_star[1])**2
+        i_star2 = float(isurr2[int(np.argmin(dr2))]) if valid2.any() else float("nan")
+        stats["_hero_repair"] = {
+            "domain":         _cf_domain_short(best_dom2),
+            "scenario_id":    best_sc2.get("scenario_id","?") if isinstance(best_sc2,dict) else "?",
+            "dist_normalised":round(float(best_cf2.dist_normalised), 4),
+            "i_theta_star":   round(i_star2, 4),
+            "i_theta_prime":  round(float(getattr(best_cf2,"i_surr_prime",float("nan"))), 4),
+            "theta_star":     [round(x,4) for x in best_cf2.theta_star.tolist()],
+            "theta_prime":    [round(x,4) for x in best_cf2.theta_prime.tolist()],
+        }
+    stats_path = out_dir / "q4_stats.json"
+    stats_path.write_text(json.dumps(stats, indent=2))
+    print(f"  Saved: q4_stats.json")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Main
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _load_model(device):
-    ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+def _load_model(device, model_path=None):
+    """Load surrogate checkpoint.
+
+    Returns
+    -------
+    model       : nn.Module in eval mode
+    trained_dims: list[int] | None  — dimensions the model was trained on,
+                  auto-read from run_config.json next to the checkpoint.
+                  None means "all dimensions".
+    """
+    path = Path(model_path) if model_path else MODEL_PATH
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    # Auto-detect training dims from run_config.json in the same directory
+    trained_dims = None
+    cfg_path = path.parent / "run_config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            dims_cfg = cfg.get("args", {}).get("dims") or cfg.get("dims")
+            if dims_cfg:
+                trained_dims = [int(d) for d in dims_cfg]
+        except Exception:
+            pass
+
+    # V2 checkpoint: saved by train_compare.py — has 'model_name' + 'state_dict'
+    if "model_name" in ckpt and _load_v2_checkpoint is not None:
+        model = _load_v2_checkpoint(path, map_location=device)
+        model.to(device)
+        return model, trained_dims
+
+    # V1 checkpoint: saved by surrogate/train.py — has 'args' + 'model_state'
     saved_args = ckpt["args"]
     model = DeepSetsZonotope(
         phi_hidden=saved_args["phi_hidden"],
@@ -3807,7 +4466,78 @@ def _load_model(device):
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    return model
+    return model, trained_dims
+
+
+def _is_v2_model(model) -> bool:
+    """True when the model expects v2 features (per_dim_v2 / global_v2)."""
+    return type(model).__name__ in _V2_MODEL_CLASS_NAMES
+
+
+def _export_eval_data(out_path, acc, ts, domain, domain_short,
+                      domain_order, sobol_results):
+    """Serialize acc/timing/domain/Sobol data for later use by combined figures.
+
+    Writes two files to *out_path* (a directory):
+      acc.npz   — large numeric arrays (i_surr, i_theta, i_aabb, i_mfmc, dim, scenario_id)
+      meta.json — timing scalars, domain labels, Sobol results, etc.
+    """
+    out_path = Path(out_path)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # ── Numeric arrays ────────────────────────────────────────────────────────
+    np.savez_compressed(
+        out_path / "acc.npz",
+        i_surr     = acc["i_surr"].astype(np.float32),
+        i_theta    = acc["i_theta"].astype(np.float32),
+        i_aabb     = acc["i_aabb"].astype(np.float32),
+        i_mfmc     = acc["i_mfmc"].astype(np.float32),
+        dim        = acc["dim"].astype(np.int32),
+        scenario_id= np.array(acc["scenario_id"], dtype=np.int32),
+    )
+
+    # ── Metadata / small objects ───────────────────────────────────────────────
+    timing = {
+        "us_aabb": float(ts.get("us_aabb", 0.0)),
+        "us_mfmc": float(ts.get("us_mfmc", 0.0)),
+        "us_mc":   float(ts.get("us_mc",   0.0)),
+        "us_surr": float(acc["t_surr_total"] / max(acc["n"], 1) * 1e6),
+    }
+
+    # domain / domain_short may be numpy arrays or lists — normalise to lists
+    def _to_list(x):
+        if x is None:
+            return []
+        if hasattr(x, "tolist"):
+            return x.tolist()
+        return list(x)
+
+    def _make_json_safe(obj):
+        """Recursively convert numpy scalars / arrays in obj to plain Python."""
+        if isinstance(obj, dict):
+            return {k: _make_json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_make_json_safe(v) for v in obj]
+        if hasattr(obj, "item"):          # numpy scalar
+            return obj.item()
+        if hasattr(obj, "tolist"):        # numpy array
+            return obj.tolist()
+        return obj
+
+    meta = {
+        "t_surr_total": float(acc["t_surr_total"]),
+        "n":            int(acc["n"]),
+        "timing":       timing,
+        "domain":       _to_list(domain),
+        "domain_short": _make_json_safe(domain_short),
+        "domain_order": _to_list(domain_order),
+        "sobol_results": _make_json_safe(sobol_results),
+    }
+    (out_path / "meta.json").write_text(
+        json.dumps(meta, indent=2), encoding="utf-8")
+
+    print(f"\n  [export] Saved eval data to {out_path}/")
+    print(f"           acc.npz ({acc['n']:,} samples)  meta.json")
 
 
 def main(args):
@@ -3820,7 +4550,7 @@ def main(args):
         "q1": {"acc_scatter", "per_domain_table", "threshold_by_domain",
                "efficiency", "pareto"},
         "q2": {"acc_by_dim", "accuracy_by_domain", "error_by_regime",
-               "exploration_budget", "consistency_rate", "generalization",
+               "exploration_budget", "consistency_rate",
                "response_surface_comparison", "paper_landscape"},
         "q3": {"sensitivity_surrogate", "sensitivity_compare", "sobol_by_domain",
                "response_surfaces", "conditional_sensitivity",
@@ -3876,9 +4606,47 @@ def main(args):
     need_sobol  = bool(requested & _SOBOL_PLOTS)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nLoading surrogate model from {MODEL_PATH} (device={device})...")
-    model = _load_model(device)
-    print(f"  Model: {sum(p.numel() for p in model.parameters())} parameters")
+    _mpath = args.model_path or MODEL_PATH
+    print(f"\nLoading surrogate model from {_mpath} (device={device})...")
+    model, trained_dims = _load_model(device, model_path=args.model_path)
+    print(f"  Model: {type(model).__name__}  "
+          f"{sum(p.numel() for p in model.parameters())} parameters")
+
+    # Resolve dims filter: explicit --dims > auto-detected from run_config.json
+    if args.dims:
+        dims_filter = [int(d) for d in args.dims.replace(",", " ").split()]
+    else:
+        dims_filter = trained_dims
+    if dims_filter is not None:
+        print(f"  Dims filter: {dims_filter}  "
+              f"(source: {'--dims arg' if args.dims else 'run_config.json'})")
+
+    # Resolve data directories: --data arg overrides built-in DATA_DIRS
+    if args.data:
+        data_dirs = [Path(p) for p in args.data]
+    else:
+        data_dirs = DATA_DIRS
+    print(f"  Data dirs: {[str(d) for d in data_dirs]}")
+
+    # Build scenario-filtered file list if --scenarios is given.
+    # First match across dirs wins (avoids double-loading when the same ID
+    # exists in both e.g. measurements_v6 and synthetic_v6).
+    _files_filter = None
+    if args.scenarios:
+        sc_ids = {int(s.strip()) for s in args.scenarios.replace(",", " ").split()
+                  if s.strip().isdigit()}
+        import re as _re
+        _files_filter = []
+        _seen_ids: set = set()
+        for d in data_dirs:
+            for jf in sorted(Path(d).glob("results_scenario_*.json")):
+                m = _re.search(r"results_scenario_(\d+)\.json", jf.name)
+                if m:
+                    sc_id = int(m.group(1))
+                    if sc_id in sc_ids and sc_id not in _seen_ids:
+                        _files_filter.append(jf)
+                        _seen_ids.add(sc_id)
+        print(f"  Scenario filter: {sorted(sc_ids)} → {len(_files_filter)} files")
 
     acc = domain = sobol_scenarios = domain_short = domain_order = None
     t_aabb = t_mfmc = t_mc = None
@@ -3887,8 +4655,10 @@ def main(args):
 
     if need_acc:
         print("\nLoading accuracy data and running surrogate inference...")
-        acc = _load_accuracy_data(DATA_DIRS, model, device,
-                                  max_samples=args.max_samples)
+        acc = _load_accuracy_data(data_dirs, model, device,
+                                  max_samples=args.max_samples,
+                                  dims_filter=dims_filter,
+                                  files=_files_filter)
         print(f"  n={acc['n']:,}  finite_aabb={np.isfinite(acc['i_aabb']).sum():,}  "
               f"finite_mfmc={np.isfinite(acc['i_mfmc']).sum():,}")
 
@@ -3897,11 +4667,14 @@ def main(args):
         # load a minimal acc if not already loaded.
         if acc is None:
             print("\nLoading accuracy data (needed for domain alignment)...")
-            acc = _load_accuracy_data(DATA_DIRS, model, device,
-                                      max_samples=args.max_samples)
+            acc = _load_accuracy_data(data_dirs, model, device,
+                                      max_samples=args.max_samples,
+                                      dims_filter=dims_filter,
+                                      files=_files_filter)
         print("\nLoading timing, Sobol parameters, and domain labels from JSON...")
-        ts = _load_timing_and_sobol(DATA_DIRS, acc,
-                                    max_scenarios=args.max_scenarios)
+        ts = _load_timing_and_sobol(data_dirs, acc,
+                                    max_scenarios=args.max_scenarios,
+                                    files=_files_filter)
         t_aabb          = ts["t_aabb"]
         t_mfmc          = ts["t_mfmc"]
         t_mc            = ts["t_mc"]
@@ -3918,6 +4691,18 @@ def main(args):
     if need_sobol and sobol_scenarios:
         print("\nComputing Sobol sensitivity indices (this may take a minute)...")
         sobol_results = _sobol_per_scenario(sobol_scenarios)
+
+    # ── Export pre-computed data (for combined figures) ───────────────────────
+    if getattr(args, "export_data", None) and acc is not None:
+        _export_eval_data(
+            out_path     = Path(args.export_data),
+            acc          = acc,
+            ts           = ts if need_ts else {},
+            domain       = domain       if need_ts else [],
+            domain_short = domain_short if need_ts else {},
+            domain_order = domain_order if need_ts else [],
+            sobol_results= sobol_results or [],
+        )
 
     # ── Q1 ────────────────────────────────────────────────────────────────────
     if want(*_RQ_PLOTS["q1"]):
@@ -3995,9 +4780,6 @@ def main(args):
         q2.mkdir(parents=True, exist_ok=True)
         plot_consistency_rate(acc, q2)
 
-    if want("generalization"):
-        q2.mkdir(parents=True, exist_ok=True)
-        plot_generalization(model, device, q2)
 
     if want("response_surface_comparison"):
         q2.mkdir(parents=True, exist_ok=True)
@@ -4085,12 +4867,21 @@ def main(args):
         cf_ids_arg = getattr(args, "cf_scenarios", None)
         if cf_ids_arg:
             wanted_ids = {int(x) for x in cf_ids_arg.replace(",", " ").split()}
-            cf_sc = [s for s in sobol_scenarios
-                     if isinstance(s, dict) and s.get("scenario_id") in wanted_ids]
+            # Deduplicate: keep first match per scenario_id to avoid
+            # double-counting IDs that appear in both data directories
+            _seen_ids = set()
+            cf_sc = []
+            for s in sobol_scenarios:
+                if isinstance(s, dict) and s.get("scenario_id") in wanted_ids:
+                    sid = s.get("scenario_id")
+                    if sid not in _seen_ids:
+                        cf_sc.append(s)
+                        _seen_ids.add(sid)
             print(f"  Filtering to {len(cf_sc)} scenario(s): {sorted(wanted_ids)}")
 
         plot_counterfactual(cf_sc, q4, model=model,
-                            device=device, gamma=args.gamma)
+                            device=device, gamma=args.gamma,
+                            use_v2=_is_v2_model(model))
 
     # ── Summary panel ─────────────────────────────────────────────────────────
     if want("summary_panel"):
@@ -4114,7 +4905,7 @@ Plot names (--plots):
   Q1 plots     : acc_scatter  per_domain_table  threshold_by_domain
                  efficiency  pareto
   Q2 plots     : acc_by_dim  accuracy_by_domain  error_by_regime
-                 exploration_budget  consistency_rate  generalization
+                 exploration_budget  consistency_rate
                  response_surface_comparison
   Q3 plots     : sensitivity_surrogate  sensitivity_compare  sobol_by_domain
                  response_surfaces  conditional_sensitivity
@@ -4128,6 +4919,25 @@ Examples:
   --plots q4
   --plots q1,q2
 """)
+    p.add_argument("--model-path",     type=str, default=None,
+                   help="Path to a surrogate checkpoint (.pt). Supports both v1 "
+                        "(DeepSetsZonotope, saved by surrogate/train.py) and v2 "
+                        "(ProductSetTransformer etc., saved by surrogate/train_compare.py). "
+                        "Defaults to surrogate/model.pt.")
+    p.add_argument("--data",          type=str, nargs='+', default=None,
+                   help="One or more data directories containing "
+                        "results_scenario_*.json files. Overrides the built-in "
+                        "DATA_DIRS constant (e.g. --data data/measurements_v6 "
+                        "data/measurements_cps_v6).")
+    p.add_argument("--scenarios",     type=str, default=None,
+                   help="Comma-separated scenario IDs to restrict analysis to "
+                        "(e.g. --scenarios 1,3,7,25). Files not matching any "
+                        "listed ID are skipped. Useful for val-split evaluation.")
+    p.add_argument("--dims",           type=str, default=None,
+                   help="Comma-separated zonotope dimensions to evaluate on "
+                        "(e.g. --dims 2  or  --dims 2,3). Auto-detected from "
+                        "run_config.json next to the checkpoint when present. "
+                        "Omit to use all dimensions.")
     p.add_argument("--output",        type=str, default="results/paper_figures",
                    help="Root output directory. Sub-folders Q1..Q4 are created automatically.")
     p.add_argument("--plots",         type=str, default=None,
@@ -4146,6 +4956,10 @@ Examples:
     p.add_argument("--cf_scenarios",  type=str,   default=None,
                    help="Comma-separated scenario ids to use for Q4 counterfactual "
                         "(e.g. --cf_scenarios 35,49,7). Omit to use all loaded scenarios.")
+    p.add_argument("--export-data",   type=str,   default=None,
+                   help="If given, save all computed accuracy/timing/domain/Sobol data "
+                        "to this directory (creates acc.npz + meta.json) so that "
+                        "run_combined_figures.py can load them without re-running inference.")
     return p.parse_args()
 
 

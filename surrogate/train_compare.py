@@ -73,6 +73,16 @@ def _forward(model, batch, model_name, device):
             batch["tgt_gen_mask"].to(device),
             batch["global_v2"].to(device),
         )
+    elif model_name.startswith("direction_probe"):
+        return model(
+            batch["src_center"].to(device),
+            batch["src_generators"].to(device),
+            batch["src_gen_mask"].to(device),
+            batch["tgt_center"].to(device),
+            batch["tgt_generators"].to(device),
+            batch["tgt_gen_mask"].to(device),
+            batch["mask"].to(device),
+        )
     else:
         return model(
             batch["per_dim_v2"].to(device),

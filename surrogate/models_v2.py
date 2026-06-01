@@ -440,6 +440,31 @@ class DirectionProbeNet(nn.Module):
 # Registry
 # ═══════════════════════════════════════════════════════════════════════
 
+class ProductSetTransformerExact(ProductSetTransformer):
+    """Exact noisy-AND head: I = 1 - prod_i p_i * p_global.
+
+    Identical architecture to ProductSetTransformer but the forward pass
+    computes the product of per-dimension containment probabilities in
+    log-space for numerical stability:
+
+        log P(consistent) = sum_i logsigmoid(l_i) + logsigmoid(b)
+        I = 1 - exp(log P)  = -expm1(log P),  in [0, 1).
+    """
+
+    def forward(self, per_dim, mask, global_feats):
+        x = self.project(per_dim)
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        logit = self.dim_head(x).squeeze(-1)               # (B, D)
+        log_p = F.logsigmoid(logit)                        # (B, D), <= 0
+        log_p = (log_p * mask).sum(dim=1)                  # (B,) masked sum
+        bias = self.global_bias(global_feats).squeeze(-1)  # (B,)
+        log_consistent = log_p + F.logsigmoid(bias)        # (B,), <= 0
+
+        return (-torch.expm1(log_consistent)).clamp(0.0, 1.0)
+
+
 MODEL_REGISTRY = {
     "deepsets_v2": DeepSetsV2,
     "flat_mlp": FlatMLP,

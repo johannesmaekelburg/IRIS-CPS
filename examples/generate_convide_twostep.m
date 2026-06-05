@@ -32,7 +32,7 @@ warning('off', 'all');  % Suppress all warnings temporarily
 lastwarn('');  % Clear last warning
 
 % Configuration
-if ~exist('run_step1', 'var'), run_step1 = false; end   % FALSE: skip zonotope generation (re-use existing zonotopes)
+if ~exist('run_step1', 'var'), run_step1 = true; end    % TRUE: generate zonotopes (set false to re-use existing)
 if ~exist('run_step2', 'var'), run_step2 = true; end    % Set to false to skip consistency computation
 
 % Quick pilot mode for low-pre validation only
@@ -43,7 +43,7 @@ if ~exist('low_pre_pilot_mc_samples', 'var'), low_pre_pilot_mc_samples = 300; en
 
 % Saltelli Sampling Mode (for sensitivity analysis)
 if ~exist('use_saltelli_mode', 'var'), use_saltelli_mode = true; end  % TRUE: Use Saltelli compound interventions, FALSE: Use discrete CONVIDE interventions
-if ~exist('saltelli_samples_file', 'var'), saltelli_samples_file = fullfile(fileparts(fileparts(mfilename('fullpath'))), 'data', 'saltelli_samples_3param.csv'); end  % Path to CSV file with Saltelli samples
+if ~exist('saltelli_samples_file', 'var'), saltelli_samples_file = fullfile(fileparts(fileparts(mfilename('fullpath'))), 'data', 'saltelli_samples_3param_v6.csv'); end  % Path to CSV file with Saltelli samples
 if ~exist('saltelli_params', 'var'), saltelli_params = {'scale_factor', 'center_delta', 'correlation_strength'}; end
 
 if ~exist('seed', 'var'), seed = 2025; end
@@ -54,11 +54,11 @@ if ~exist('use_parallel_step2', 'var'), use_parallel_step2 = []; end
 
 %% Parallel Computing Setup
 % Set to true if running on a multi-core server with Parallel Computing Toolbox
-if ~exist('use_parallel', 'var'), use_parallel = false; end
+if ~exist('use_parallel', 'var'), use_parallel = true; end
 if isempty(use_parallel_step1), use_parallel_step1 = use_parallel; end
 if isempty(use_parallel_step2), use_parallel_step2 = use_parallel; end
 if use_parallel
-    n_workers = 16;
+    n_workers = 20;
     delete(gcp('nocreate'));
     pool = gcp('nocreate');
     if isempty(pool)
@@ -193,7 +193,7 @@ if ~exist('scenarios_to_run', 'var'), scenarios_to_run = 1:12; end  % All regula
 
 % Step 2 method override: 'jaccard' (AABB, fast), 'mc_probability' (slow), 'both'
 % Set to 'jaccard' for AABB-only re-run (merge with MC results via merge_aabb_into_saltelli.py)
-if ~exist('consistency_method_override', 'var'), consistency_method_override = 'jaccard'; end
+if ~exist('consistency_method_override', 'var'), consistency_method_override = 'aabb_and_mc'; end
 %scenarios_to_run = 2:12;      % Skip scenario 1
 %   scenarios_to_run = [1, 3, 5];   % Run only scenarios 1, 3, and 5
 %scenarios_to_run = 1:12;  % Change this to control which scenarios run
@@ -226,8 +226,8 @@ if low_pre_pilot_mode
     zonotope_dir = fullfile(data_base, 'zonotopes_lowpre_pilot');
     results_dir = fullfile(data_base, 'measurements_lowpre_pilot');
 else
-    zonotope_dir = fullfile(data_base, 'zonotopes');
-    results_dir = fullfile(data_base, 'measurements_aabb_only');  % Separate folder for AABB-only output
+    zonotope_dir = fullfile(data_base, 'zonotopes_v6');
+    results_dir = fullfile(data_base, 'measurements_v6');
 end
 
 if exist('zonotope_dir_override', 'var') && ~isempty(zonotope_dir_override)
@@ -326,21 +326,33 @@ if run_step1
         
         scenarios_2d = {
             struct('id', 1, 'name', 'CAD Export Drift', 'type', 'Type A', ...
+                'upr_type', 'identity', ...
                 'source', conZonotope([100; 50], [2.0 0; 0 2.0], [], []), ...
                 'target', conZonotope([100.3; 50.3], [2.1 0; 0 2.1], [], []));
-            
+
             struct('id', 2, 'name', 'MBSE Version Mismatch', 'type', 'Type B', ...
+                'upr_type', 'parametric', ...
                 'source', conZonotope([50; 25], [1.5 0; 0 1.5], [], []), ...
                 'target', conZonotope([50; 25], [1.8 0; 0 1.8], [], []));
-            
+
             struct('id', 3, 'name', 'Documentation Sync', 'type', 'Type B', ...
+                'upr_type', 'structural', ...
                 'source', conZonotope([75; 40], [2.0 0; 0 2.0], [], []), ...
                 'target', conZonotope([75.5; 40.5], [2.0 0; 0 2.0], [], []));
-            
+
             struct('id', 4, 'name', 'Control Design Conflict', 'type', 'Type C', ...
+                'upr_type', 'parametric', ...
                 'source', conZonotope([60; 30], [1.8 0; 0 1.8], [], []), ...
                 'target', conZonotope([60.8; 30.8], [1.5 0; 0 1.5], [], []));
         };
+
+        % Assign UPR mappings (affine F, f) — matches causal_engine.py create_convide_scenarios()
+        a2d = 5 * pi / 180;
+        R2d = [cos(a2d), -sin(a2d); sin(a2d), cos(a2d)];
+        scenarios_2d{1}.mapping = struct('F', {eye(2)},              'f', {zeros(2,1)});   % S1: identity
+        scenarios_2d{2}.mapping = struct('F', {diag([0.97, 1.04])},  'f', {zeros(2,1)});  % S2: diagonal scaling
+        scenarios_2d{3}.mapping = struct('F', {eye(2)},              'f', {[0.5; 0.3]});  % S3: offset only
+        scenarios_2d{4}.mapping = struct('F', {R2d},                 'f', {zeros(2,1)});  % S4: 2D rotation 5°
 
             base_scenarios_2d = scenarios_2d;
 
@@ -419,21 +431,33 @@ if run_step1
         
         scenarios_3d = {
             struct('id', 5, 'name', 'Sensor Calibration Drift', 'type', 'Type A', ...
+                'upr_type', 'identity_bidir', ...
                 'source', conZonotope([100; 50; 25], diag([2.5, 2.5, 1.2]), [], []), ...
                 'target', conZonotope([100.5; 50.5; 25.5], diag([2.6, 2.6, 1.3]), [], []));
-            
+
             struct('id', 6, 'name', 'Requirements Ambiguity', 'type', 'Type D', ...
+                'upr_type', 'structural', ...
                 'source', conZonotope([80; 40; 20], diag([2.0, 2.0, 1.0]), [], []), ...
                 'target', conZonotope([80; 40; 20], diag([2.5, 2.5, 1.2]), [], []));
-            
+
             struct('id', 7, 'name', 'Test Configuration Mismatch', 'type', 'Type B', ...
+                'upr_type', 'guarded', ...
                 'source', conZonotope([70; 35; 18], diag([2.2, 2.2, 1.1]), [], []), ...
                 'target', conZonotope([70.4; 35.4; 18.4], diag([2.2, 2.2, 1.1]), [], []));
-            
+
             struct('id', 8, 'name', 'Simulation Numerical Error', 'type', 'Type A', ...
+                'upr_type', 'parametric', ...
                 'source', conZonotope([90; 45; 22], diag([2.5, 2.5, 1.3]), [], []), ...
                 'target', conZonotope([90.6; 45.6; 22.6], diag([2.2, 2.2, 1.1]), [], []));
         };
+
+        % Assign UPR mappings — matches causal_engine.py create_convide_scenarios()
+        a3d = 5 * pi / 180;
+        R3d = [cos(a3d), -sin(a3d), 0; sin(a3d), cos(a3d), 0; 0, 0, 1];
+        scenarios_3d{1}.mapping = struct('F', {eye(3)},                    'f', {zeros(3,1)});          % S5: identity
+        scenarios_3d{2}.mapping = struct('F', {diag([0.95, 1.05, 0.98])}, 'f', {zeros(3,1)});          % S6: diagonal scaling
+        scenarios_3d{3}.mapping = struct('F', {eye(3)},                    'f', {[0.3; -0.2; 0.1]});   % S7: offset only
+        scenarios_3d{4}.mapping = struct('F', {R3d},                       'f', {zeros(3,1)});          % S8: 3D rotation 5° (xy plane)
 
             base_scenarios_3d = scenarios_3d;
 
@@ -512,21 +536,35 @@ if run_step1
         
         scenarios_4d = {
             struct('id', 9, 'name', 'Multi-Physics Coupling Error', 'type', 'Type C', ...
+                'upr_type', 'identity', ...
                 'source', conZonotope([100; 50; 25; 12], diag([3.0, 3.0, 1.5, 0.75]), [], []), ...
                 'target', conZonotope([100.5; 50.5; 25.5; 12.5], diag([3.1, 3.1, 1.6, 0.8]), [], []));
-            
+
             struct('id', 10, 'name', 'Interface Specification Gap', 'type', 'Type D', ...
+                'upr_type', 'disambiguation', ...
                 'source', conZonotope([85; 42; 21; 10], diag([2.5, 2.5, 1.2, 0.6]), [], []), ...
                 'target', conZonotope([85; 42; 21; 10], diag([3.0, 3.0, 1.5, 0.75]), [], []));
-            
+
             struct('id', 11, 'name', 'Parameter Estimation Bias', 'type', 'Type A', ...
+                'upr_type', 'constraint_based', ...
                 'source', conZonotope([95; 48; 24; 11], diag([2.8, 2.8, 1.4, 0.7]), [], []), ...
                 'target', conZonotope([95.4; 48.4; 24.4; 11.4], diag([2.8, 2.8, 1.4, 0.7]), [], []));
-            
+
             struct('id', 12, 'name', 'Traceability Link Inconsistency', 'type', 'Type B', ...
+                'upr_type', 'parametric', ...
                 'source', conZonotope([75; 38; 19; 9], diag([2.5, 2.5, 1.2, 0.6]), [], []), ...
                 'target', conZonotope([75.6; 38.6; 19.6; 9.6], diag([2.2, 2.2, 1.1, 0.55]), [], []));
         };
+
+        % Assign UPR mappings — matches causal_engine.py create_convide_scenarios()
+        a4d = 5 * pi / 180;
+        b4d = 3 * pi / 180;
+        R4d = [cos(a4d), -sin(a4d), 0, 0; sin(a4d), cos(a4d), 0, 0; ...
+               0, 0, cos(b4d), -sin(b4d); 0, 0, sin(b4d), cos(b4d)];
+        scenarios_4d{1}.mapping = struct('F', {eye(4)},                           'f', {zeros(4,1)});          % S9: identity
+        scenarios_4d{2}.mapping = struct('F', {diag([0.96, 1.03, 0.99, 1.02])},  'f', {zeros(4,1)});          % S10: diagonal scaling
+        scenarios_4d{3}.mapping = struct('F', {eye(4)},                           'f', {[0.4; -0.3; 0.2; -0.1]});  % S11: offset only
+        scenarios_4d{4}.mapping = struct('F', {R4d},                              'f', {zeros(4,1)});          % S12: 4D coupled rotation (5°, 3°)
 
             base_scenarios_4d = scenarios_4d;
 
@@ -620,9 +658,9 @@ if run_step2
         consistency_opts.mc_samples = low_pre_pilot_mc_samples;
         consistency_opts.sampling_method = 'sobol';
     else
-        consistency_opts.method = 'both';           % MC Probability + MC Jaccard (AABB Jaccard always included)
+        consistency_opts.method = 'aabb_and_mc';    % AABB Jaccard + MC Probability (includes MFMC)
         consistency_opts.mc_samples = 1000;          % Default sample budget
-        consistency_opts.sampling_method = {'sobol', 'halton', 'lhs', 'random'};  % ALL QMC methods for comparison
+        consistency_opts.sampling_method = {'sobol'};  % Sobol QMC (matches Saltelli sampling scheme)
     end
     consistency_opts.verbose = true;
     consistency_opts.use_parallel = use_parallel_step2;

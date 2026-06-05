@@ -6,7 +6,7 @@
 
 ```matlab
 % Navigate to folder
-cd('C:\Users\johan_rvnnln\OneDrive\Dokumente\MATLAB\MyCORA\Causality_Uncertainty_Inconsistency')
+cd('/path/to/repo')
 
 % Run setup
 setup_causal_framework
@@ -246,7 +246,7 @@ causal_inference_results/
 @software{causal_uncertainty_inconsistency,
   title = {Causal Inference Framework for Uncertainty-Inconsistency Analysis},
   year = {2025},
-  url = {https://github.com/DE-TUM/CPS-Uncertainty-Propagation-Framework}
+  url = {[anonymized for review]}
 }
 ```
 

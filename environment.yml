@@ -1,0 +1,36 @@
+name: conda-plot
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ── Python ─────────────────────────────────────
+  - python=3.11
+
+  # ── Core numerical ─────────────────────────────
+  - numpy>=1.24,<2.0
+  - pandas>=1.5.0
+  - scipy>=1.10.0
+
+  # ── Visualisation ──────────────────────────────
+  - matplotlib>=3.6.0
+  - seaborn>=0.12.0
+
+  # ── Machine learning ───────────────────────────
+  - scikit-learn>=1.2.0
+  - pytorch>=2.1,<2.4
+
+  # ── Sensitivity analysis ───────────────────────
+  - salib>=1.4.0
+
+  # ── Utilities ─────────────────────────────────
+  - tqdm>=4.64.0
+  - pyyaml>=6.0
+
+  # pip needed for PyG
+  - pip
+
+  - pip:
+      # torch-geometric stack (installed via pip to match torch)
+      - torch-geometric

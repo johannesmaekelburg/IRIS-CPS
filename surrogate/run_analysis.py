@@ -69,7 +69,7 @@ DATA_DIRS = [
     _ROOT / "data" / "measurements_v6",
     _ROOT / "data" / "measurements_cps_v6",
 ]
-MODEL_PATH = _ROOT / "surrogate" / "model.pt"
+MODEL_PATH = _ROOT / "product_transformer_2d3d" / "product_transformer_exact.pt"
 
 # ── V2 model registry (populated lazily so surrogate.models_v2 is optional) ──
 _V2_MODEL_CLASS_NAMES: set[str] = set()
@@ -95,21 +95,21 @@ C_AABB = "#c45b2c"
 C_SURR = "#5e3c99"   # surrogate — purple
 
 # ── Figure style ──────────────────────────────────────────────────────────────
-FS_TITLE  = 10
-FS_LABEL  = 9
-FS_TICK   = 7.5
-FS_LEGEND = 8
-FS_ANNOT  = 7
+FS_TITLE  = 12
+FS_LABEL  = 11
+FS_TICK   = 10
+FS_LEGEND = 7
+FS_ANNOT  = 8
 LW_MAIN   = 1.8
 LW_GRID   = 0.55
 ALPHA_BAND = 0.18
 SPINE_COLOR = "#555555"
 
 plt.rcParams.update({
-    "font.family": "serif", "font.size": 9,
-    "axes.titlesize": 9, "axes.labelsize": 9,
-    "xtick.labelsize": 8, "ytick.labelsize": 8,
-    "legend.fontsize": 8, "figure.dpi": 150,
+    "font.family": "serif", "font.size": 11,
+    "axes.titlesize": 12, "axes.labelsize": 11,
+    "xtick.labelsize": 10, "ytick.labelsize": 10,
+    "legend.fontsize": 7, "figure.dpi": 150,
     "savefig.dpi": 300, "savefig.bbox": "tight",
 })
 
@@ -305,15 +305,93 @@ def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None, files=None):
         Explicit file list (overrides data_dirs glob). Use to restrict to
         specific scenario files (e.g. val split only).
     """
-    # Try to import domain utilities from src/analysis
-    try:
-        _SRC_ANALYSIS = _ROOT / "src" / "analysis"
-        sys.path.insert(0, str(_SRC_ANALYSIS))
-        from domain_utils import get_scenario_domain, DOMAIN_SHORT, DOMAIN_ORDER
-    except ImportError:
-        def get_scenario_domain(d): return d.get("dataset_source", "Unknown") or "Unknown"
-        DOMAIN_SHORT = {}
-        DOMAIN_ORDER = []
+    # Try to import domain utilities from src/analysis (multiple path candidates)
+    _domain_utils_loaded = False
+    for _candidate in [
+        _ROOT / "src" / "analysis",
+        _ROOT / "src",
+        Path(__file__).resolve().parent.parent / "src" / "analysis",
+    ]:
+        try:
+            sys.path.insert(0, str(_candidate))
+            from domain_utils import get_scenario_domain, DOMAIN_SHORT, DOMAIN_ORDER
+            _domain_utils_loaded = True
+            break
+        except ImportError:
+            continue
+
+    if not _domain_utils_loaded:
+        # Inline fallback — correct domain names without any import dependency
+        _SRC2DOM_FB = {
+            "automotive_full":             "Automotive",
+            "building_hvac_full":          "Building HVAC",
+            "industrial_robot_full":       "Industrial Robot",
+            "medical_device_full":         "Medical Device",
+            "railway_full":                "Railway",
+            "satellite_aerospace_full":    "Satellite/Aerospace",
+            "smart_grid_full":             "Smart Grid",
+            "water_chemical_process_full": "Water/Chemical",
+            "wind_turbine_full":           "Wind Turbine",
+        }
+        _CONVIDE_FB = {
+            "cad export drift":                "CAD Export Drift",
+            "mbse version mismatch":           "MBSE Mismatch",
+            "documentation sync":              "Doc. Sync",
+            "control design conflict":         "Ctrl. Conflict",
+            "sensor calibration drift":        "Sensor Drift",
+            "requirements ambiguity":          "Req. Ambiguity",
+            "test configuration mismatch":     "Config Mismatch",
+            "simulation numerical error":      "Sim. Error",
+            "multi-physics coupling error":    "Phys. Coupling",
+            "interface specification gap":     "Spec. Gap",
+            "parameter estimation bias":       "Param. Bias",
+            "traceability link inconsistency": "Traceability",
+        }
+
+        def get_scenario_domain(d):
+            import re as _re
+            src = (d.get("dataset_source") or "").strip()
+            if src:
+                stem = Path(src).stem.lower()
+                for key, label in _SRC2DOM_FB.items():
+                    if stem.startswith(key.lower()):
+                        return label
+            desc = (d.get("scenario_description") or "").strip()
+            if desc:
+                # CPS: "Building HVAC - ..."
+                for label in _SRC2DOM_FB.values():
+                    if desc.lower().startswith(label.lower()):
+                        return label
+                # CONVIDE: "CAD Export Drift (low-pre)"
+                desc_clean = _re.sub(r'\(.*?\)', '', desc).strip().lower()
+                for key, label in _CONVIDE_FB.items():
+                    if key in desc_clean:
+                        return label
+            # Try nested experiments
+            for exp in (d.get("experiments") or []):
+                result = get_scenario_domain(exp)
+                if result != "Unknown":
+                    return result
+            return "Unknown"
+
+        DOMAIN_SHORT = {
+            "Automotive": "Auto", "Building HVAC": "HVAC",
+            "Industrial Robot": "Robot", "Medical Device": "Medical",
+            "Railway": "Rail", "Satellite/Aerospace": "Space",
+            "Smart Grid": "Grid", "Water/Chemical": "Water",
+            "Wind Turbine": "Wind", "CAD Export Drift": "CAD Drift",
+            "MBSE Mismatch": "MBSE", "Doc. Sync": "Doc",
+            "Ctrl. Conflict": "Ctrl", "Sensor Drift": "Sensor",
+            "Req. Ambiguity": "Req.", "Config Mismatch": "Config",
+            "Sim. Error": "Sim", "Phys. Coupling": "Physics",
+            "Spec. Gap": "Spec", "Param. Bias": "Param",
+            "Traceability": "Trace", "Unknown": "?",
+        }
+        DOMAIN_ORDER = [
+            "Automotive", "Building HVAC", "Industrial Robot", "Medical Device",
+            "Railway", "Satellite/Aerospace", "Smart Grid", "Water/Chemical",
+            "Wind Turbine",
+        ]
 
     if files is not None:
         all_files = list(files)
@@ -2803,7 +2881,8 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
                          gamma: float = 0.5,
                          n_grid: int = 80,
                          sc_a: int = None,
-                         sc_b: list = None):
+                         sc_b: list = None,
+                         prefer_domains: list = None):
     """Curated paper-ready landscape figures (2 panels).
 
     panel_a — 2D response surface (scale vs center):
@@ -2815,7 +2894,8 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
         Three different scenarios, Surrogate I surface + gamma plane.
         If sc_b is given (list of ints), uses those scenario ids in order;
         otherwise picks the 3 most-data scenarios from different domains,
-        excluding panel_a's.
+        excluding panel_a's.  prefer_domains (list of str) biases auto-selection
+        to include those domain names when possible.
     """
     try:
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -2842,6 +2922,19 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
     for sc in sobol_scenarios:
         rows   = sc["rows"]              if isinstance(sc, dict) else sc
         domain = sc.get("domain", "Unknown") if isinstance(sc, dict) else "Unknown"
+        # Load short description from the source JSON file (one-time, for title)
+        sc_desc = ""
+        _jf = sc.get("json_file", "") if isinstance(sc, dict) else ""
+        if _jf:
+            try:
+                import json as _json
+                _raw = _json.load(open(_jf))
+                _full = _raw.get("scenario_description", "")
+                # Strip domain prefix ("Building HVAC - Motor Cooling" → "Motor Cooling")
+                _sep = " - "
+                sc_desc = _full.split(_sep, 1)[1].strip() if _sep in _full else _full
+            except Exception:
+                pass
         xs, ys, mcs, sus = [], [], [], []
         for r in rows:
             fval = r.get(fixed_param)
@@ -2856,7 +2949,8 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
                 mcs.append(float(r["i_theta"])); sus.append(float(r["i_surr"]))
             except (KeyError, TypeError, ValueError):
                 continue
-        sc_slices.append({"domain": domain, "x": xs, "y": ys, "mc": mcs, "surr": sus,
+        sc_slices.append({"domain": domain, "sc_desc": sc_desc,
+                           "x": xs, "y": ys, "mc": mcs, "surr": sus,
                            "scenario_id": sc.get("scenario_id", -1) if isinstance(sc, dict) else -1})
 
     # ── Panel A: 2D surface (MC vs Surrogate), best single scenario ──────────
@@ -2879,10 +2973,13 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
         CMAP_AB = "RdYlBu_r"   # same colormap for both panels
         LEVELS  = np.linspace(0, 1, 38)   # ~40% fewer contour lines
 
-        fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0), sharey=True)
+        fig, axes = plt.subplots(1, 2, figsize=(7.16, 3.8), sharey=True)
+        _a_domain = best["domain"]
+        _a_desc   = best.get("sc_desc", "")
+        cf_last = None
         for ax, zvals, title in [
-            (axes[0], best["mc"],   rf"MC $I_\theta$  [{best['domain']}]"),
-            (axes[1], best["surr"], rf"Surrogate $\hat{{I}}$  [{best['domain']}]"),
+            (axes[0], best["mc"],   rf"MC $I_\theta$  [{_a_domain}]"),
+            (axes[1], best["surr"], rf"Surrogate $\hat{{I}}$  [{_a_domain}]"),
         ]:
             ZZ = _interp_surf(pts, np.array(zvals), XX, YY)
             cf = ax.contourf(XX, YY, ZZ, levels=LEVELS, cmap=CMAP_AB,
@@ -2891,19 +2988,23 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
                        colors=["#111"], linewidths=[2.8], linestyles=["--"])
             ax.scatter(best["x"], best["y"], s=3, color="k",
                        alpha=0.15, linewidths=0, rasterized=True)
-            fig.colorbar(cf, ax=ax, shrink=0.85, label=r"$I(\theta)$")
             ax.set_xlabel(meta_x["label"], fontsize=FS_LABEL)
-            ax.set_ylabel(meta_y["label"], fontsize=FS_LABEL)
-            ax.set_title(title, fontsize=FS_TITLE)
+            ax.set_title(title, fontsize=FS_TITLE, pad=4)
             ax.set_xlim(meta_x["lo"], meta_x["hi"])
             ax.set_ylim(meta_y["lo"], meta_y["hi"])
             ax.spines[["top", "right"]].set_visible(False)
-
-        fig.text(0.5, 0.01, f"Fixed: {slice_desc}",
-                 ha="center", fontsize=7.5, color="#555")
-        fig.tight_layout(rect=[0, 0.03, 1, 1])
+            cf_last = cf
+        axes[0].set_ylabel(meta_y["label"], fontsize=FS_LABEL)
+        if _a_desc:
+            fig.suptitle(_a_desc, fontsize=FS_TITLE - 0.5, y=0.99)
+        # Place colorbar in its own axes so both panels keep equal width
+        fig.subplots_adjust(left=0.08, right=0.88, top=0.86, bottom=0.12, wspace=0.08)
+        cbar_ax = fig.add_axes([0.90, 0.12, 0.018, 0.81])
+        cb = fig.colorbar(cf_last, cax=cbar_ax)
+        cb.set_label(r"$I(\theta)$", fontsize=FS_LABEL)
+        cb.ax.tick_params(labelsize=FS_TICK)
         for ext in ("png", "pdf"):
-            fig.savefig(out_dir / f"paper_landscape_a.{ext}", dpi=300, bbox_inches="tight")
+            fig.savefig(out_dir / f"paper_landscape_a.{ext}", dpi=300)
         plt.close(fig)
         print("  Saved: paper_landscape_a.png/pdf  (2D MC vs Surrogate)")
     else:
@@ -2942,14 +3043,33 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
         if best:
             seen_doms.add(best["domain"])
         picks = []
+        _prefer = list(prefer_domains) if prefer_domains else []
+
+        # First pass: fill preferred domains (best scenario per preferred domain)
+        if _prefer:
+            for dom in _prefer:
+                if len(picks) >= 3:
+                    break
+                best_for_dom = max(
+                    (s for s in sc_slices
+                     if s["domain"] == dom and len(s["x"]) >= 30
+                     and s is not best and s["domain"] not in seen_doms),
+                    key=lambda s: len(s["x"]),
+                    default=None,
+                )
+                if best_for_dom is not None:
+                    picks.append(best_for_dom)
+                    seen_doms.add(dom)
+
+        # Second pass: fill remaining slots from all domains by data count
         for sc in sorted(sc_slices, key=lambda s: len(s["x"]), reverse=True):
+            if len(picks) >= 3:
+                break
             if len(sc["x"]) < 30 or sc is best:
                 continue
-            if sc["domain"] not in seen_doms or len(picks) < 3:
+            if sc["domain"] not in seen_doms:
                 picks.append(sc)
                 seen_doms.add(sc["domain"])
-            if len(picks) == 3:
-                break
 
     if not picks:
         print("  SKIP panel_b: no scenarios with sufficient data")
@@ -2960,7 +3080,7 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
               f"domain='{sc['domain']}'  N={len(sc['x'])} pts")
 
     n_cols = len(picks)
-    fig = plt.figure(figsize=(n_cols * 4.6 + 1.2, 4.8))
+    fig = plt.figure(figsize=(11.0, 3.2))
     surf_last = None
 
     xi = np.linspace(meta_x["lo"], meta_x["hi"], n_grid // 2 + 10)
@@ -2989,31 +3109,38 @@ def plot_paper_landscape(sobol_scenarios: list, out_dir: Path,
         ax.set_xlim(meta_x["lo"], meta_x["hi"])
         ax.set_ylim(meta_y["lo"], meta_y["hi"])
         ax.set_zlim(0, 1)
-        ax.set_xlabel(meta_x["label"], fontsize=7.5, labelpad=3)
-        ax.set_ylabel(meta_y["label"], fontsize=7.5, labelpad=3)
-        ax.set_zlabel(r"$\hat{I}$",   fontsize=7.5, labelpad=3)
-        ax.set_title(sc["domain"], fontsize=FS_TITLE + 0.5, pad=5)
-        ax.tick_params(labelsize=6.5, pad=1)
-        # Slightly higher elevation reduces distortion and improves readability
+        ax.set_xlabel(meta_x["label"], fontsize=8, labelpad=3)
+        ax.set_ylabel(meta_y["label"], fontsize=8, labelpad=3)
+        # Remove z-label from individual plots — colorbar carries it
+        ax.set_zticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_zticklabels(["0", "", "0.5", "", "1"], fontsize=7)
+        _title = sc["domain"]
+        if sc.get("sc_desc"):
+            _title += f"\n{sc['sc_desc']}"
+        ax.set_title(_title, fontsize=8, pad=-12, linespacing=1.3)
+        ax.tick_params(labelsize=7, pad=1)
+        # Fixed 0.5 spacing on scale axis; sparse ticks on center and z
+        ax.xaxis.set_major_locator(plt.MultipleLocator(0.5))
+        ax.yaxis.set_major_locator(plt.MaxNLocator(4))
         ax.view_init(elev=28, azim=-48)
         try:
-            ax.set_box_aspect([1.6, 0.7, 1.0])
+            ax.set_box_aspect([1.6, 0.7, 0.75])
         except AttributeError:
             pass
         surf_last = surf
 
     if surf_last is not None:
-        cbar_ax = fig.add_axes([0.93, 0.18, 0.015, 0.64])
-        cb = fig.colorbar(surf_last, cax=cbar_ax)
-        cb.set_label(r"$\hat{I}$ (Surrogate)", fontsize=FS_LABEL)
-        cb.set_ticks([0.0, gamma, 1.0])
-        cb.set_ticklabels(["0", rf"$\gamma$={gamma}", "1"], fontsize=FS_TICK)
+        # Vertical colorbar on the far right — clear of all 3D z-axes
+        cbar_ax = fig.add_axes([0.91, 0.18, 0.020, 0.68])
+        cb = fig.colorbar(surf_last, cax=cbar_ax, orientation="vertical")
+        cb.set_label(r"$\hat{I}$", fontsize=9)
+        cb.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        cb.ax.tick_params(labelsize=7)
         cb.ax.axhline(gamma, color="#333", lw=1.4, ls="--")
 
-    fig.text(0.5, 0.005, f"Fixed: {slice_desc}  |  γ={gamma} (dashed contour)",
-             ha="center", fontsize=7.5, color="#555")
-    fig.subplots_adjust(left=0.02, right=0.92,
-                        top=0.94, bottom=0.07, wspace=0.04)
+    # right=0.88 leaves a clear gap between the rightmost 3D z-axis and colorbar
+    fig.subplots_adjust(left=0.02, right=0.88,
+                        top=0.82, bottom=0.08, wspace=0.02)
     for ext in ("png", "pdf"):
         fig.savefig(out_dir / f"paper_landscape_b.{ext}", dpi=300)
     plt.close(fig)
@@ -4847,13 +4974,17 @@ def main(args):
     if want("paper_landscape"):
         _sc_b = [int(x) for x in args.landscape_b.split(",")] \
                 if args.landscape_b else None
+        # Preferred domain order for panel_b auto-selection (no --landscape-b given)
+        _prefer_b = ["Satellite/Aerospace", "Building HVAC", "Medical Device"]
         q3.mkdir(parents=True, exist_ok=True)
         plot_paper_landscape(sobol_scenarios, q3, gamma=args.gamma,
-                             sc_a=args.landscape_a, sc_b=_sc_b)
+                             sc_a=args.landscape_a, sc_b=_sc_b,
+                             prefer_domains=_prefer_b)
         # Also written to Q2 — primary MC-vs-Surrogate visual for RQ2
         q2.mkdir(parents=True, exist_ok=True)
         plot_paper_landscape(sobol_scenarios, q2, gamma=args.gamma,
-                             sc_a=args.landscape_a, sc_b=_sc_b)
+                             sc_a=args.landscape_a, sc_b=_sc_b,
+                             prefer_domains=_prefer_b)
 
     # ── Q4 ────────────────────────────────────────────────────────────────────
     if want("counterfactual"):

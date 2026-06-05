@@ -27,7 +27,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -156,6 +156,32 @@ def contains_points_batch(Z: Zonotope, X: np.ndarray) -> np.ndarray:
     for i in candidate_idx:
         result[i] = contains_point(Z, X[i])
     return result
+
+
+def zonotopes_intersect(Z1: Zonotope, Z2: Zonotope) -> bool:
+    """Return True iff two zonotopes have a non-empty intersection.
+
+    This solves the feasibility problem
+
+        Z1.c + Z1.G * xi1 = Z2.c + Z2.G * xi2,
+        xi1 in [-1, 1]^{p1}, xi2 in [-1, 1]^{p2}
+
+    via a linear program.  It matches the exact intersection-gating semantics
+    used by the MATLAB MFMC implementation.
+    """
+    p1 = Z1.n_generators
+    p2 = Z2.n_generators
+    A_eq = np.hstack([Z1.G, -Z2.G])
+    b_eq = Z2.c - Z1.c
+    res = linprog(
+        c=np.zeros(p1 + p2),
+        A_eq=A_eq,
+        b_eq=b_eq,
+        bounds=[(-1.0, 1.0)] * (p1 + p2),
+        method="highs",
+        options={"presolve": True, "time_limit": 1.0},
+    )
+    return bool(res.success and res.status == 0)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +352,7 @@ class Scenario:
     F: np.ndarray      # mapping matrix
     f: np.ndarray      # mapping offset
     name: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
     dim: int = field(init=False)
 
     def __post_init__(self):
@@ -335,191 +362,697 @@ class Scenario:
 def create_convide_scenarios() -> List[Scenario]:
     """Reproduce the 12 CONVIDE scenarios from generate_convide_twostep.m.
 
-    All use identity mapping F=I, f=0 (no distortion baseline).
-    Zonotopes have diagonal generators and no polynomial / constraint terms.
+    Each scenario has a physically motivated affine UPR mapping (F, f)
+    representing sensor calibration, coordinate transforms, or unit conversions.
+    Zonotopes have diagonal generators; no polynomial / constraint terms.
+
+    UPR mapping types used:
+      - Identity (F=I, f=0): direct constraint check
+      - Diagonal scaling (F=diag(s), f=0): per-axis gain factor
+      - Diagonal + offset (F=diag(s), f≠0): sensor bias + gain
+      - Rotation (2D: 5°; 3D: 5° in xy; 4D: 5° in xy & yz): coordinate transform
     """
     scenarios: list[Scenario] = []
 
-    def _s(sid, name, c_src, g_diag_src, c_tgt, g_diag_tgt):
+    def _rot2(deg: float) -> np.ndarray:
+        θ = np.radians(deg)
+        return np.array([[np.cos(θ), -np.sin(θ)],
+                         [np.sin(θ),  np.cos(θ)]])
+
+    def _rot3(deg_xy: float) -> np.ndarray:
+        θ = np.radians(deg_xy)
+        R = np.eye(3)
+        R[:2, :2] = [[np.cos(θ), -np.sin(θ)], [np.sin(θ), np.cos(θ)]]
+        return R
+
+    def _rot4(deg_xy: float, deg_yz: float) -> np.ndarray:
+        R = np.eye(4)
+        θ1 = np.radians(deg_xy)
+        R[0, 0] = np.cos(θ1); R[0, 1] = -np.sin(θ1)
+        R[1, 0] = np.sin(θ1); R[1, 1] =  np.cos(θ1)
+        θ2 = np.radians(deg_yz)
+        Ry = np.eye(4)
+        Ry[1, 1] = np.cos(θ2); Ry[1, 2] = -np.sin(θ2)
+        Ry[2, 1] = np.sin(θ2); Ry[2, 2] =  np.cos(θ2)
+        return Ry @ R
+
+    def _s(sid, name, c_src, g_diag_src, c_tgt, g_diag_tgt, F=None, f=None,
+           upr_type="parametric"):
         d = len(c_src)
+        F_ = np.eye(d) if F is None else np.asarray(F, dtype=float)
+        f_ = np.zeros(d) if f is None else np.asarray(f, dtype=float)
         return Scenario(
-            source=Zonotope(np.array(c_src), np.diag(g_diag_src)),
-            target=Zonotope(np.array(c_tgt), np.diag(g_diag_tgt)),
-            F=np.eye(d),
-            f=np.zeros(d),
+            source=Zonotope(np.array(c_src, dtype=float), np.diag(g_diag_src)),
+            target=Zonotope(np.array(c_tgt, dtype=float), np.diag(g_diag_tgt)),
+            F=F_,
+            f=f_,
             name=f"S{sid}: {name}",
+            metadata={"upr_type": upr_type, "dataset_kind": "convide"},
         )
 
-    # 2D
-    scenarios.append(_s(1,  "CAD Export Drift",           [100, 50],     [2.0, 2.0],     [100.3, 50.3],     [2.1, 2.1]))
-    scenarios.append(_s(2,  "MBSE Version Mismatch",      [50, 25],      [1.5, 1.5],     [50, 25],          [1.8, 1.8]))
-    scenarios.append(_s(3,  "Documentation Sync",         [75, 40],      [2.0, 2.0],     [75.5, 40.5],      [2.0, 2.0]))
-    scenarios.append(_s(4,  "Control Design Conflict",    [60, 30],      [1.8, 1.8],     [60.8, 30.8],      [1.5, 1.5]))
+    # ── 2-D scenarios ─────────────────────────────────────────────────────────
+    # S1: identity — direct CAD tolerance check
+    scenarios.append(_s(1,  "CAD Export Drift",
+        [100, 50], [2.0, 2.0], [100.3, 50.3], [2.1, 2.1],
+        upr_type="identity"))
 
-    # 3D
-    scenarios.append(_s(5,  "Sensor Calibration Drift",   [100, 50, 25], [2.5, 2.5, 1.2], [100.5, 50.5, 25.5], [2.6, 2.6, 1.3]))
-    scenarios.append(_s(6,  "Requirements Ambiguity",     [80, 40, 20],  [2.0, 2.0, 1.0], [80, 40, 20],         [2.5, 2.5, 1.2]))
-    scenarios.append(_s(7,  "Test Config Mismatch",       [70, 35, 18],  [2.2, 2.2, 1.1], [70.4, 35.4, 18.4],   [2.2, 2.2, 1.1]))
-    scenarios.append(_s(8,  "Simulation Numerical Error",  [90, 45, 22], [2.5, 2.5, 1.3], [90.6, 45.6, 22.6],   [2.2, 2.2, 1.1]))
+    # S2: parametric — tool/sensor axis gain (x: 0.97, y: 1.04)
+    scenarios.append(_s(2,  "MBSE Version Mismatch",
+        [50, 25], [1.5, 1.5], [50, 25], [1.8, 1.8],
+        F=np.diag([0.97, 1.04]), f=np.zeros(2),
+        upr_type="parametric"))
 
-    # 4D
-    scenarios.append(_s(9,  "Multi-Physics Coupling",     [100, 50, 25, 12], [3.0, 3.0, 1.5, 0.75], [100.5, 50.5, 25.5, 12.5], [3.1, 3.1, 1.6, 0.8]))
-    scenarios.append(_s(10, "Interface Spec Gap",          [85, 42, 21, 10],  [2.5, 2.5, 1.2, 0.6],  [85, 42, 21, 10],          [3.0, 3.0, 1.5, 0.75]))
-    scenarios.append(_s(11, "Parameter Estimation Bias",   [90, 45, 22, 11],  [2.8, 2.8, 1.4, 0.7],  [90.5, 45.5, 22.5, 11.5], [2.9, 2.9, 1.5, 0.75]))
-    scenarios.append(_s(12, "Cross-Domain Integration",    [95, 47, 24, 12],  [3.0, 3.0, 1.5, 0.75], [95.8, 47.8, 24.8, 12.8], [2.5, 2.5, 1.2, 0.6]))
+    # S3: structural — measurement bias as sum of tool + systematic offset components
+    scenarios.append(_s(3,  "Documentation Sync",
+        [75, 40], [2.0, 2.0], [75.5, 40.5], [2.0, 2.0],
+        F=np.diag([1.0, 1.0]), f=np.array([0.5, 0.3]),
+        upr_type="structural"))
+
+    # S4: parametric — 5° coordinate frame rotation
+    scenarios.append(_s(4,  "Control Design Conflict",
+        [60, 30], [1.8, 1.8], [60.8, 30.8], [1.5, 1.5],
+        F=_rot2(5.0), f=np.zeros(2),
+        upr_type="parametric"))
+
+    # ── 3-D scenarios ─────────────────────────────────────────────────────────
+    # S5: identity_bidir — sensor couples both model outputs (bidirectional)
+    scenarios.append(_s(5,  "Sensor Calibration Drift",
+        [100, 50, 25], [2.5, 2.5, 1.2], [100.5, 50.5, 25.5], [2.6, 2.6, 1.3],
+        upr_type="identity_bidir"))
+
+    # S6: structural — per-axis sensor gain decomposed into axis-independent components
+    scenarios.append(_s(6,  "Requirements Ambiguity",
+        [80, 40, 20], [2.0, 2.0, 1.0], [80, 40, 20], [2.5, 2.5, 1.2],
+        F=np.diag([0.95, 1.05, 0.98]), f=np.zeros(3),
+        upr_type="structural"))
+
+    # S7: guarded — bias offset fires only when configuration guard is active
+    scenarios.append(_s(7,  "Test Config Mismatch",
+        [70, 35, 18], [2.2, 2.2, 1.1], [70.4, 35.4, 18.4], [2.2, 2.2, 1.1],
+        F=np.diag([1.0, 1.0, 1.0]), f=np.array([0.3, -0.2, 0.1]),
+        upr_type="guarded"))
+
+    # S8: parametric — 5° attitude rotation
+    scenarios.append(_s(8,  "Simulation Numerical Error",
+        [90, 45, 22], [2.5, 2.5, 1.3], [90.6, 45.6, 22.6], [2.2, 2.2, 1.1],
+        F=_rot3(5.0), f=np.zeros(3),
+        upr_type="parametric"))
+
+    # ── 4-D scenarios ─────────────────────────────────────────────────────────
+    # S9: identity — multi-physics direct coupling
+    scenarios.append(_s(9,  "Multi-Physics Coupling",
+        [100, 50, 25, 12], [3.0, 3.0, 1.5, 0.75],
+        [100.5, 50.5, 25.5, 12.5], [3.1, 3.1, 1.6, 0.8],
+        upr_type="identity"))
+
+    # S10: disambiguation — interface specification has multiple candidate gain versions
+    scenarios.append(_s(10, "Interface Spec Gap",
+        [85, 42, 21, 10], [2.5, 2.5, 1.2, 0.6],
+        [85, 42, 21, 10], [3.0, 3.0, 1.5, 0.75],
+        F=np.diag([0.96, 1.03, 0.99, 1.02]), f=np.zeros(4),
+        upr_type="disambiguation"))
+
+    # S11: constraint_based — parameter offset represents constraint boundary shift
+    scenarios.append(_s(11, "Parameter Estimation Bias",
+        [90, 45, 22, 11], [2.8, 2.8, 1.4, 0.7],
+        [90.5, 45.5, 22.5, 11.5], [2.9, 2.9, 1.5, 0.75],
+        F=np.diag([1.0, 1.0, 1.0, 1.0]), f=np.array([0.4, -0.3, 0.2, -0.1]),
+        upr_type="constraint_based"))
+
+    # S12: parametric — 4-D coupled rotation (cross-domain coordinate transform)
+    scenarios.append(_s(12, "Cross-Domain Integration",
+        [95, 47, 24, 12], [3.0, 3.0, 1.5, 0.75],
+        [95.8, 47.8, 24.8, 12.8], [2.5, 2.5, 1.2, 0.6],
+        F=_rot4(5.0, 3.0), f=np.zeros(4),
+        upr_type="parametric"))
+
+    return scenarios
+
+
+def _extract_real_scalar_zonotope(element: dict) -> tuple[float, float]:
+    """Return (center, scalar generator) from a 1-D real constrained zonotope."""
+    zono = element.get("uncertainty", {}).get("zonotope")
+    if not isinstance(zono, dict):
+        raise ValueError(f"Element '{element.get('id')}' has no zonotope entry.")
+    if zono.get("type") != "constrained_zonotope" or zono.get("domain") != "real":
+        raise ValueError(
+            f"Element '{element.get('id')}' is not a real constrained zonotope."
+        )
+
+    center = float(zono["center"])
+    generators = zono.get("G", [])
+    if not generators:
+        raise ValueError(f"Element '{element.get('id')}' has empty generator list.")
+    return center, float(generators[0])
+
+
+def _extract_scalar_zonotope_flexible(element: dict) -> tuple[float, float]:
+    """Return (center, |generator|) from a 1-D zonotope element.
+
+    More permissive than _extract_real_scalar_zonotope — accepts any
+    zonotope type / domain as long as 'center' and 'G' are present.
+    Used for coupled 2-element entries whose domain field is not 'real'.
+    """
+    zono = element.get("uncertainty", {}).get("zonotope")
+    if not isinstance(zono, dict):
+        raise ValueError(f"Element '{element.get('id')}' has no zonotope entry.")
+    center = float(zono["center"])
+    generators = zono.get("G", [])
+    if not generators:
+        raise ValueError(f"Element '{element.get('id')}' has empty generator list.")
+    return center, abs(float(generators[0]))
+
+
+def _derive_target_from_fixed_value(
+    m2_element: dict, src_g: float, operator: str
+) -> tuple[float, float]:
+    """Synthesise a target zonotope from a fixed_value threshold (1-D only).
+
+    Kept for reference but superseded by _derive_target_nd for multi-dim
+    scenarios.  Uses 25 % overlap rule.
+    """
+    fv = float(m2_element["fixed_value"])
+    tgt_g = abs(src_g)
+    if operator == ">=":
+        tgt_c = fv + 0.25 * tgt_g
+    else:
+        tgt_c = fv - 0.25 * tgt_g
+    return tgt_c, tgt_g
+
+
+def _derive_target_nd(
+    src_c: float, src_g: float, n_dims: int, dim_index: int, operator: str
+) -> tuple[float, float]:
+    """Synthesise a target zonotope dimension targeting I ≈ 0.5 for an n-D scenario.
+
+    The 25 % overlap rule (designed for 1-D) gives P(consistent per dim) ≈ 0.75,
+    so joint P for n=2 is only 0.56 at best — but with real dataset geometries
+    the actual joint P collapses to near zero (I ≈ 1.0).
+
+    This rule instead targets P(consistent per dim) = 0.5^(1/n), so the
+    joint probability equals 0.5 → I ≈ 0.5 at the base geometry:
+
+      P_per_dim = 0.5^(1/n_dims)          e.g. 0.707 for n=2
+      offset    = 2 * src_g * (1 − P)     e.g. 0.586 * src_g for n=2
+
+    The target is shifted by `offset` away from the source centre in the
+    direction that creates partial overlap:
+
+      ≤  (source should be below target):  tgt_c = src_c + offset
+      ≥  (source should be above target):  tgt_c = src_c − offset
+
+    Physical fixed_value thresholds are intentionally ignored — only source
+    geometry is used — because fv and src are often in different units for
+    parametric UPR entries.
+
+    Returns (tgt_center, tgt_generator).  tgt_g = src_g (equal width).
+    """
+    p_per_dim = 0.5 ** (1.0 / max(n_dims, 1))
+    offset = 2.0 * abs(src_g) * (1.0 - p_per_dim)
+    tgt_g = abs(src_g)
+    if operator == ">=":
+        tgt_c = src_c - offset
+    else:  # <= or anything else
+        tgt_c = src_c + offset
+    return tgt_c, tgt_g
+
+
+def _build_coupled_2d_scenario(
+    entry: dict,
+    domain_label: str,
+    json_path: "Path",
+    cps_idx: int,
+) -> "Optional[Scenario]":
+    """Build a 2-D Scenario from a coupled 2-element M1 dataset entry.
+
+    These are the 9th entries in each domain JSON file — physically coupled
+    variable pairs (e.g. X/Y positioning errors, temperature+CO2) that
+    already represent a 2-D scenario directly, rather than being formed by
+    pairing two independent 1-D entries.
+
+    Source zonotope: diagonal 2-D, each element contributes one generator.
+    Target zonotope: derived from fixed requirement thresholds via the same
+    25%-overlap rule used for the sequential-pair scenarios.
+
+    Handles two target layouts:
+      - 2 fixed values + 2 relations: one ≤/≥ constraint per dimension.
+      - 1 fixed value  + 1 relation : combined constraint (e.g. radial);
+        approximated as an axis-aligned square inscribed in the tolerance.
+
+    Returns None and is silently skipped on any extraction failure.
+    """
+    try:
+        m1 = _find_model(entry, "M1")
+        m2 = _find_model(entry, "M2")
+    except ValueError:
+        return None
+
+    elems_m1 = m1.get("elements", [])
+    elems_m2 = m2.get("elements", [])
+    crs       = entry.get("consistency_relations", [])
+
+    if len(elems_m1) != 2:
+        return None
+
+    # ── Source zonotope ──────────────────────────────────────────────────────
+    try:
+        src_c1, src_g1 = _extract_scalar_zonotope_flexible(elems_m1[0])
+        src_c2, src_g2 = _extract_scalar_zonotope_flexible(elems_m1[1])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+    source_center     = np.array([src_c1, src_c2], dtype=float)
+    source_generators = np.diag([src_g1, src_g2])
+
+    # ── Target zonotope ──────────────────────────────────────────────────────
+    # Use the n-D aware overlap rule so that joint P(consistent) ≈ 0.5
+    # → I ≈ 0.5 at base geometry, with good variance under interventions.
+    # Physical fixed_value thresholds are ignored (they are in different
+    # units for parametric UPR entries and cannot be used directly).
+    cr0_op = crs[0].get("operator", "<=") if crs else "<="
+    cr1_op = crs[1].get("operator", "<=") if len(crs) > 1 else cr0_op
+
+    if len(elems_m1) == 2:
+        tc1, tg1 = _derive_target_nd(src_c1, src_g1, n_dims=2, dim_index=0, operator=cr0_op)
+        tc2, tg2 = _derive_target_nd(src_c2, src_g2, n_dims=2, dim_index=1, operator=cr1_op)
+        target_center     = np.array([tc1, tc2], dtype=float)
+        target_generators = np.diag([tg1, tg2])
+    else:
+        return None  # unsupported layout
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    name1 = _compact_cps_label(elems_m1[0].get("name", "Dim1"), domain_label)
+    name2 = _compact_cps_label(elems_m1[1].get("name", "Dim2"), domain_label)
+    scenario_name = f"CPS{cps_idx}: {domain_label} - {name1} & {name2} [coupled]"
+
+    metadata = {
+        "dataset_kind":       "cps_uncertainty_dataset",
+        "dataset_file":       json_path.name,
+        "scenario_id":        entry.get("scenario_id"),
+        "scenario_name":      entry.get("name"),
+        "coupled":            True,
+        "upr_type":           "constraint_based",
+        "upr_params":         {"n_relations": len(crs)},
+        "domain_label":       domain_label,
+        "causality_type":     "constraint_based",
+        "relation_types":     [cr.get("upr_type", "constraint_based") for cr in crs],
+        "relation_operators": [cr.get("operator", "<=") for cr in crs],
+    }
+
+    return Scenario(
+        source=Zonotope(source_center, source_generators),
+        target=Zonotope(target_center, target_generators),
+        F=np.eye(2),
+        f=np.zeros(2),
+        name=scenario_name,
+        metadata=metadata,
+    )
+
+
+def _find_model(scenario: dict, model_id: str) -> dict:
+    for model in scenario.get("models", []):
+        if model.get("id") == model_id:
+            return model
+    raise ValueError(f"Scenario '{scenario.get('scenario_id')}' is missing model {model_id}.")
+
+
+def _compact_cps_label(name: str, domain_label: str) -> str:
+    label = name.strip()
+    for prefix in (
+        f"{domain_label} - ",
+        f"{domain_label} ? ",
+        f"{domain_label}: ",
+    ):
+        if label.startswith(prefix):
+            return label[len(prefix):].strip()
+    return label
+
+
+def _pair_cps_relation_type(*relations: dict) -> str:
+    kinds = [str(rel.get("upr_type", "")).strip() for rel in relations if rel]
+    kinds = [kind for kind in kinds if kind]
+    if not kinds:
+        return "CPS"
+    if len(set(kinds)) == 1:
+        return kinds[0]
+    return "+".join(kinds)
+
+
+def _load_cps_paired_scenarios_from_dataset() -> List[Scenario]:
+    """Build up to 72 2-D CPS scenarios from the raw JSON dataset.
+
+    Per domain (9 domains total), three passes are performed:
+
+    Pass 1 — original 8 single-variable entries (indices 0–7), paired as
+      (0,1), (2,3), (4,5), (6,7)  →  4 scenarios per domain = 36 total
+      (S13–S48).  M2 zonotopes are pre-computed in the full dataset file.
+
+    Pass 2 — coupled 2-D entry (index 8 in the full file), one per domain
+      →  up to 9 more scenarios (S49–S57).  M1 has 2 elements.
+
+    Pass 3 — new single-variable entries (indices 9–14 of the full file),
+      paired as (9,10), (11,12), (13,14)  →  3 scenarios per domain = 27
+      total (S58–S84).  M2 has only a fixed_value; target zonotope is
+      synthesised using the 25 % overlap rule.  Entry 15 is unpaired and
+      skipped.
+
+    Index stability:
+      The original CPS1–36 (S13–S48) indices are fixed — new passes only
+      append to the end of the list.
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    # Pass 1 & 2 use the original dataset (pre-computed M2 zonotopes, stable CPS1–45).
+    orig_dir = project_root / "data" / "CPS-uncertainty-dataset"
+    files = sorted(orig_dir.glob("*_full.json"))
+    if not files:
+        raise FileNotFoundError(f"No CPS dataset files found in: {orig_dir}")
+    # Pass 3 uses the expanded dataset (new entries 9–14 per domain).
+    new_dir = project_root / "data" / "CPS-uncertainty-dataset-full"
+    new_files = sorted(new_dir.glob("*_full.json"))
+
+    scenarios: list[Scenario] = []
+    cps_idx = 1
+
+    for json_path in files:
+        with open(json_path, encoding="utf-8") as fh:
+            domain_data = json.load(fh)
+
+        domain_scenarios = []
+        for entry in domain_data:
+            try:
+                m1 = _find_model(entry, "M1")
+                m2 = _find_model(entry, "M2")
+                if len(m1.get("elements", [])) != 1 or len(m2.get("elements", [])) != 1:
+                    continue
+                src_c, src_g = _extract_scalar_zonotope_flexible(m1["elements"][0])
+            except (ValueError, KeyError, TypeError):
+                continue
+
+            m2_elem = m2["elements"][0]
+            relation = (entry.get("consistency_relations") or [{}])[0]
+
+            # Use pre-computed M2 zonotope when available; otherwise synthesise
+            # from fixed_value using the 25 % overlap rule.
+            try:
+                tgt_c, tgt_g = _extract_scalar_zonotope_flexible(m2_elem)
+            except (ValueError, KeyError, TypeError):
+                fv = m2_elem.get("fixed_value")
+                if fv is None:
+                    continue
+                op = relation.get("operator", "<=")
+                tgt_c, tgt_g = _derive_target_from_fixed_value(m2_elem, src_g, op)
+
+            domain_scenarios.append({
+                "raw": entry,
+                "source_center": src_c,
+                "source_generator": src_g,
+                "target_center": tgt_c,
+                "target_generator": tgt_g,
+                "relation": relation,
+            })
+
+        if len(domain_scenarios) < 8:
+            raise ValueError(
+                f"Expected at least 8 single-variable scenarios in {json_path.name}, "
+                f"found {len(domain_scenarios)}."
+            )
+
+        domain_label = str(domain_data[0].get("name", json_path.stem)).split(" - ")[0].strip()
+        selected = domain_scenarios[:8]
+        for pair_start in range(0, 8, 2):
+            left = selected[pair_start]
+            right = selected[pair_start + 1]
+
+            source_center = np.array([left["source_center"], right["source_center"]], dtype=float)
+            source_generators = np.diag([left["source_generator"], right["source_generator"]])
+            target_center = np.array([left["target_center"], right["target_center"]], dtype=float)
+            target_generators = np.diag([left["target_generator"], right["target_generator"]])
+
+            # Build block-diagonal F, f and UPR-type metadata from per-relation fields.
+            def _mapping_scalars(rel: dict) -> tuple[float, float]:
+                m = rel.get("mapping", {})
+                return float(m.get("scale", 1.0)), float(m.get("offset", 0.0))
+
+            sl, ol = _mapping_scalars(left["relation"])
+            sr, or_ = _mapping_scalars(right["relation"])
+            F_2d = np.diag([sl, sr])
+            f_2d = np.array([ol, or_])
+
+            # UPR type — both relations in a pair share the same type
+            upr_type_l = str(left["relation"].get("upr_type", "parametric")).strip()
+            upr_type_r = str(right["relation"].get("upr_type", "parametric")).strip()
+            paired_upr_type = (
+                upr_type_l if upr_type_l == upr_type_r else f"{upr_type_l}+{upr_type_r}"
+            )
+
+            # Type-specific parameters for the 2-D paired scenario
+            upr_params: dict = {}
+
+            if "constraint_based" in paired_upr_type:
+                # Constraint bounds: [upper_bound_l, upper_bound_r]
+                def _constraint_bound(rel: dict) -> float:
+                    cp = rel.get("constraint_params", {})
+                    return float(cp.get("bound", 1.0))
+                upr_params["constraint_bound"] = [
+                    _constraint_bound(left["relation"]),
+                    _constraint_bound(right["relation"]),
+                ]
+                upr_params["constraint_direction"] = "leq"
+
+            if "structural" in paired_upr_type:
+                upr_params["structural_components_l"] = left["relation"].get("structural_params", {})
+                upr_params["structural_components_r"] = right["relation"].get("structural_params", {})
+
+            if "guarded" in paired_upr_type:
+                upr_params["guard_params_l"] = left["relation"].get("guard_params", {})
+                upr_params["guard_params_r"] = right["relation"].get("guard_params", {})
+                upr_params["p_guard"] = float(
+                    left["relation"].get("guard_params", {}).get("p_guard", 0.8)
+                )
+
+            if "disambiguation" in paired_upr_type:
+                upr_params["alternatives_l"] = (
+                    left["relation"].get("disambiguation_params", {}).get("alternatives", [])
+                )
+                upr_params["alternatives_r"] = (
+                    right["relation"].get("disambiguation_params", {}).get("alternatives", [])
+                )
+
+            if left["relation"].get("bidir") or right["relation"].get("bidir"):
+                upr_params["bidir"] = True
+
+            left_name = _compact_cps_label(left["raw"].get("name", "Scenario A"), domain_label)
+            right_name = _compact_cps_label(right["raw"].get("name", "Scenario B"), domain_label)
+            relation_type = _pair_cps_relation_type(left["relation"], right["relation"])
+            scenario_name = f"CPS{cps_idx}: {domain_label} - {left_name} & {right_name}"
+
+            metadata = {
+                "dataset_kind": "cps_uncertainty_dataset",
+                "dataset_file": json_path.name,
+                "paired_scenario_ids": [
+                    left["raw"].get("scenario_id"),
+                    right["raw"].get("scenario_id"),
+                ],
+                "paired_scenario_names": [
+                    left["raw"].get("name"),
+                    right["raw"].get("name"),
+                ],
+                "consistency_relations": [
+                    left["relation"],
+                    right["relation"],
+                ],
+                "relation_types": [
+                    left["relation"].get("upr_type"),
+                    right["relation"].get("upr_type"),
+                ],
+                "relation_operators": [
+                    left["relation"].get("operator"),
+                    right["relation"].get("operator"),
+                ],
+                "mapping_scales": [sl, sr],
+                "mapping_offsets": [ol, or_],
+                "domain_label": domain_label,
+                "causality_type": relation_type,
+                "upr_type": paired_upr_type,
+                "upr_params": upr_params,
+                "dataset_kind": "cps_uncertainty_dataset",
+            }
+
+            scenarios.append(
+                Scenario(
+                    source=Zonotope(source_center, source_generators),
+                    target=Zonotope(target_center, target_generators),
+                    F=F_2d,
+                    f=f_2d,
+                    name=scenario_name,
+                    metadata=metadata,
+                )
+            )
+            cps_idx += 1
+
+    # ── Second pass: coupled 2-D entries (index 8 per domain) ────────────────
+    # Done after all sequential pairs so that the original CPS1–36 indices
+    # (and therefore S13–S48 in create_all_scenarios) remain stable.
+    for json_path in files:
+        with open(json_path, encoding="utf-8") as fh:
+            domain_data = json.load(fh)
+        domain_label = str(domain_data[0].get("name", json_path.stem)).split(" - ")[0].strip()
+
+        for entry in domain_data:
+            m1_check = next(
+                (m for m in entry.get("models", []) if m.get("id") == "M1"), None
+            )
+            if m1_check is None or len(m1_check.get("elements", [])) != 2:
+                continue
+            coupled = _build_coupled_2d_scenario(
+                entry, domain_label, json_path, cps_idx
+            )
+            if coupled is not None:
+                scenarios.append(coupled)
+                cps_idx += 1
+
+    # ── Third pass: new single-variable entries (indices 9–14 per domain) ────
+    # The expanded dataset (*_full.json in CPS-uncertainty-dataset-full) contains
+    # 7 additional single-variable entries per domain (indices 9–15).  We pair
+    # them as (9,10), (11,12), (13,14) → 3 pairs per domain = 27 new scenarios
+    # (CPS46–72, S58–S84).  Entry 15 is unpaired and skipped.
+    # Target zonotopes are synthesised via _derive_target_from_fixed_value.
+    # Skipped entirely if the expanded dataset is not present.
+    for json_path in new_files:
+        with open(json_path, encoding="utf-8") as fh:
+            domain_data = json.load(fh)
+        domain_label = str(domain_data[0].get("name", json_path.stem)).split(" - ")[0].strip()
+
+        # Collect only the NEW single-variable entries (indices 9+ in the full
+        # dataset).  Entries 0–8 are handled by Pass 1 (old dataset) and Pass 2
+        # (coupled entry 8).  We use the list index to skip them unconditionally
+        # so that pre-computed M2 zonotopes written by populate_m2_zonotopes.py
+        # are correctly read for the new entries without re-processing old ones.
+        new_entries: list[dict] = []
+        for _entry_idx, entry in enumerate(domain_data):
+            if _entry_idx < 9:
+                continue  # old entries handled by Pass 1 / Pass 2
+            m1 = next((m for m in entry.get("models", []) if m.get("id") == "M1"), None)
+            m2 = next((m for m in entry.get("models", []) if m.get("id") == "M2"), None)
+            if m1 is None or m2 is None:
+                continue
+            if len(m1.get("elements", [])) != 1 or len(m2.get("elements", [])) != 1:
+                continue
+            m2_elem = m2["elements"][0]
+            try:
+                src_c, src_g = _extract_scalar_zonotope_flexible(m1["elements"][0])
+            except (ValueError, KeyError, TypeError):
+                continue
+            cr = (entry.get("consistency_relations") or [{}])[0]
+            op = cr.get("operator", "<=")
+            # Use pre-computed M2 zonotope when available (written by
+            # populate_m2_zonotopes.py); otherwise synthesise on the fly.
+            try:
+                tgt_c, tgt_g = _extract_scalar_zonotope_flexible(m2_elem)
+            except (ValueError, KeyError, TypeError):
+                fv = m2_elem.get("fixed_value")
+                if fv is None or not isinstance(fv, (int, float)):
+                    continue
+                tgt_c, tgt_g = _derive_target_nd(src_c, src_g, n_dims=2, dim_index=0, operator=op)
+            new_entries.append({
+                "raw": entry,
+                "source_center": src_c,
+                "source_generator": src_g,
+                "target_center": tgt_c,
+                "target_generator": tgt_g,
+                "relation": cr,
+            })
+
+        # Pair sequentially: (0,1), (2,3), (4,5) — skip any trailing unpaired entry.
+        for pair_start in range(0, len(new_entries) - 1, 2):
+            left = new_entries[pair_start]
+            right = new_entries[pair_start + 1]
+
+            source_center = np.array(
+                [left["source_center"], right["source_center"]], dtype=float
+            )
+            source_generators = np.diag(
+                [left["source_generator"], right["source_generator"]]
+            )
+            target_center = np.array(
+                [left["target_center"], right["target_center"]], dtype=float
+            )
+            target_generators = np.diag(
+                [left["target_generator"], right["target_generator"]]
+            )
+
+            def _mapping_scalars_new(rel: dict) -> tuple[float, float]:
+                m = rel.get("mapping", {})
+                return float(m.get("scale", 1.0)), float(m.get("offset", 0.0))
+
+            sl, ol = _mapping_scalars_new(left["relation"])
+            sr, or_ = _mapping_scalars_new(right["relation"])
+            F_2d = np.diag([sl, sr])
+            f_2d = np.array([ol, or_])
+
+            upr_type_l = str(left["relation"].get("upr_type", "parametric")).strip()
+            upr_type_r = str(right["relation"].get("upr_type", "parametric")).strip()
+            paired_upr_type = (
+                upr_type_l if upr_type_l == upr_type_r else f"{upr_type_l}+{upr_type_r}"
+            )
+
+            left_name = _compact_cps_label(left["raw"].get("name", "Scenario A"), domain_label)
+            right_name = _compact_cps_label(right["raw"].get("name", "Scenario B"), domain_label)
+            scenario_name = f"CPS{cps_idx}: {domain_label} - {left_name} & {right_name}"
+
+            metadata = {
+                "dataset_kind": "cps_uncertainty_dataset",
+                "dataset_file": json_path.name,
+                "paired_scenario_ids": [
+                    left["raw"].get("scenario_id"),
+                    right["raw"].get("scenario_id"),
+                ],
+                "paired_scenario_names": [
+                    left["raw"].get("name"),
+                    right["raw"].get("name"),
+                ],
+                "consistency_relations": [
+                    left["relation"],
+                    right["relation"],
+                ],
+                "relation_types": [
+                    left["relation"].get("upr_type"),
+                    right["relation"].get("upr_type"),
+                ],
+                "relation_operators": [
+                    left["relation"].get("operator"),
+                    right["relation"].get("operator"),
+                ],
+                "mapping_scales": [sl, sr],
+                "mapping_offsets": [ol, or_],
+                "domain_label": domain_label,
+                "upr_type": paired_upr_type,
+                "upr_params": {},
+                "target_derived": True,  # M2 zonotope was synthesised, not pre-computed
+            }
+
+            scenarios.append(
+                Scenario(
+                    source=Zonotope(source_center, source_generators),
+                    target=Zonotope(target_center, target_generators),
+                    F=F_2d,
+                    f=f_2d,
+                    name=scenario_name,
+                    metadata=metadata,
+                )
+            )
+            cps_idx += 1
 
     return scenarios
 
 
 def create_cps_scenarios() -> List[Scenario]:
-    """Reproduce the 36 CPS-domain scenarios from generate_cps_domains_twostep.m.
-
-    All scenarios are 2-D with diagonal generators (cpz2d) and identity F/f.
-    Nine domains x 4 scenarios: Automotive, HVAC, Robot, Medical,
-    Railway, Satellite, SmartGrid, Water/Chemical, WindTurbine.
-    """
-    scenarios: list[Scenario] = []
-
-    def _s(sid, name, c_src, g_src, c_tgt, g_tgt):
-        return Scenario(
-            source=Zonotope(np.array(c_src), np.diag(g_src)),
-            target=Zonotope(np.array(c_tgt), np.diag(g_tgt)),
-            F=np.eye(2),
-            f=np.zeros(2),
-            name=f"CPS{sid}: {name}",
-        )
-
-    # ── Domain 1: Automotive ──────────────────────────────────────────────────
-    scenarios.append(_s( 1, "Automotive – Motor & Winding Temperature",
-                         [106.688,    101.592],  [8.0,    8.232],
-                         [102.0,       96.768],  [8.0,    8.232]))
-    scenarios.append(_s( 2, "Automotive – Battery Capacity & Clutch Delay",
-                         [ 57.360,     78.790],  [5.7,   15.0],
-                         [ 60.700,     70.000],  [5.7,   15.0]))
-    scenarios.append(_s( 3, "Automotive – Suspension Travel & Belt Force",
-                         [172.962,   3240.339],  [17.0,  627.2],
-                         [163.0,     2872.800],  [17.0,  627.2]))
-    scenarios.append(_s( 4, "Automotive – Brake Response & Thermal Coupling",
-                         [147.580,    101.592],  [30.0,   8.232],
-                         [130.000,     96.768],  [30.0,   8.232]))
-
-    # ── Domain 2: Building HVAC ───────────────────────────────────────────────
-    scenarios.append(_s( 5, "HVAC – Room Temperature & CO2",
-                         [ 23.172,    923.410],  [2.0,   185.0],
-                         [ 22.000,    815.000],  [2.0,   185.0]))
-    scenarios.append(_s( 6, "HVAC – Chiller COP & Pipe Pressure Drop",
-                         [  4.1246, 21068.500],  [0.784, 2250.0],
-                         [  4.5840, 19750.000],  [0.784, 2250.0]))
-    scenarios.append(_s( 7, "HVAC – Facade U-Value & Sprinkler Flow",
-                         [  0.18551,   84.140],  [0.035,   10.0],
-                         [  0.16500,   90.000],  [0.035,   10.0]))
-    scenarios.append(_s( 8, "HVAC – Elevator Load & BMS Latency",
-                         [ 23.4475,    16.481],  [3.75,    8.5],
-                         [ 21.2500,    11.500],  [3.75,    8.5]))
-
-    # ── Domain 3: Industrial Robot ────────────────────────────────────────────
-    scenarios.append(_s( 9, "Robot – TCP Position Error & Wrist Torque",
-                         [  0.12566,   51.688],  [0.0588,  8.0],
-                         [  0.09120,   47.000],  [0.0588,  8.0]))
-    scenarios.append(_s(10, "Robot – Contact Force & Cycle Time",
-                         [ 94.475,     15.2548], [37.5,    1.8],
-                         [ 72.500,     14.2000], [37.5,    1.8]))
-    scenarios.append(_s(11, "Robot – Weld Heat Input & Vision Calibration",
-                         [  0.60032,    0.16754],[0.12,   0.0784],
-                         [  0.53000,    0.12160],[0.12,   0.0784]))
-    scenarios.append(_s(12, "Robot – End-Effector Mass & Bus Jitter",
-                         [  4.8344,     6.688],  [0.4,    8.0],
-                         [  4.6000,     2.000],  [0.4,    8.0]))
-
-    # ── Domain 4: Medical Device ──────────────────────────────────────────────
-    scenarios.append(_s(13, "Medical – Insulin Dose & Ventilator Pressure",
-                         [  5.3344,    27.160],  [0.4,    6.86],
-                         [  5.1000,    23.140],  [0.4,    6.86]))
-    scenarios.append(_s(14, "Medical – Pacemaker Sensing & Infusion Pressure",
-                         [  6.7040,   271.020],  [4.116,  70.0],
-                         [  9.1160,   230.000],  [4.116,  70.0]))
-    scenarios.append(_s(15, "Medical – Defibrillator Energy & Radiation Dose",
-                         [193.790,     59.217],  [15.0,   2.94],
-                         [185.000,     60.940],  [15.0,   2.94]))
-    scenarios.append(_s(16, "Medical – Surgical Force & Drug Concentration",
-                         [  2.5032,    15.728],  [1.2,    5.488],
-                         [  1.8000,    12.512],  [1.2,    5.488]))
-
-    # ── Domain 5: Railway ─────────────────────────────────────────────────────
-    scenarios.append(_s(17, "Railway – Braking Distance & Axle Load",
-                         [946.180,    160.032],  [130.0,  12.0],
-                         [870.000,    153.000],  [130.0,  12.0]))
-    scenarios.append(_s(18, "Railway – Pantograph Force & GNSS Error",
-                         [151.020,      4.2697], [70.0,   1.764],
-                         [110.000,      3.2360], [70.0,   1.764]))
-    scenarios.append(_s(19, "Railway – Door Gap & Signalling Latency",
-                         [ 83.440,    417.200],  [40.0,  200.0],
-                         [ 60.000,    300.000],  [40.0,  200.0]))
-    scenarios.append(_s(20, "Railway – Traction Energy & Switch Heating",
-                         [ 31.9165,  2234.400],  [7.448, 400.0],
-                         [ 27.5520,  2000.000],  [7.448, 400.0]))
-
-    # ── Domain 6: Satellite Aerospace ────────────────────────────────────────
-    scenarios.append(_s(21, "Satellite – Attitude Error & Battery DoD",
-                         [  4.5131,    37.102],  [1.176,  7.0],
-                         [  3.8240,    33.000],  [1.176,  7.0]))
-    scenarios.append(_s(22, "Satellite – Panel Temperature & Propellant Mass",
-                         [ 85.032,     41.097],  [12.0,   2.65],
-                         [ 78.000,     42.650],  [12.0,   2.65]))
-    scenarios.append(_s(23, "Satellite – Downlink Rate & Reaction Wheel Torque",
-                         [ 23.408,     20.932],  [8.232,  2.25],
-                         [ 28.232,     22.250],  [8.232,  2.25]))
-    scenarios.append(_s(24, "Satellite – Natural Frequency & RAM Usage",
-                         [ 31.1385,    51.688],  [2.75,   8.0],
-                         [ 32.7500,    47.000],  [2.75,   8.0]))
-
-    # ── Domain 7: Smart Grid ──────────────────────────────────────────────────
-    scenarios.append(_s(25, "SmartGrid – Frequency Nadir & Transformer Load",
-                         [ 49.1035,   363.485],  [0.25,  88.2],
-                         [ 49.2500,   311.800],  [0.25,  88.2]))
-    scenarios.append(_s(26, "SmartGrid – Bus Voltage & Battery SOC",
-                         [  1.0793,    23.519],  [0.05,   8.5],
-                         [  1.0500,    28.500],  [0.05,   8.5]))
-    scenarios.append(_s(27, "SmartGrid – Relay Time & Demand Response",
-                         [ 72.548,     41.492],  [18.0,  15.68],
-                         [ 62.000,     50.680],  [18.0,  15.68]))
-    scenarios.append(_s(28, "SmartGrid – Cable Ampacity & Meter Latency",
-                         [412.420,     23.790],  [30.0,  15.0],
-                         [430.000,     15.000],  [30.0,  15.0]))
-
-    # ── Domain 8: Water / Chemical Process ───────────────────────────────────
-    scenarios.append(_s(29, "Water – Tank Level & Inlet Flow (SWaT)",
-                         [879.907,      0.65525],[290.08, 0.375],
-                         [709.920,      0.87500],[290.08, 0.375]))
-    scenarios.append(_s(30, "Water – UF Pressure Drop & Chlorine Conc. (SWaT)",
-                         [ 33.790,      0.29737],[15.0,  0.2352],
-                         [ 25.000,      0.43520],[15.0,  0.2352]))
-    scenarios.append(_s(31, "Chemical – Reactor Temp & Separator Pressure (TEP)",
-                         [122.153,     52.005],  [1.8032, 1.1956],
-                         [121.097,     51.304],  [1.8032, 1.1956]))
-    scenarios.append(_s(32, "Chemical – Distillation Temp & Actuator Pressure",
-                         [ 80.039,      5.716],  [3.528,  0.686],
-                         [ 77.972,      5.314],  [3.528,  0.686]))
-
-    # ── Domain 9: Wind Turbine ────────────────────────────────────────────────
-    scenarios.append(_s(33, "WindTurbine – Blade Fatigue & Nacelle Vibration",
-                         [2146059.2,    3.9411], [352800.0, 1.35],
-                         [2352800.0,    3.1500], [352800.0, 1.35]))
-    scenarios.append(_s(34, "WindTurbine – Tower Deflection & Power Deviation",
-                         [  0.54825,   -3.3771], [0.125,  3.92],
-                         [  0.47500,   -1.0800], [0.125,  3.92]))
-    scenarios.append(_s(35, "WindTurbine – Pitch Response & Gearbox Oil Temp",
-                         [  4.4618,    71.688],  [1.3,    8.0],
-                         [  3.7000,    67.000],  [1.3,    8.0]))
-    scenarios.append(_s(36, "WindTurbine – Foundation Settlement & SCADA Latency",
-                         [  2.5131,    84.475],  [1.176, 37.5],
-                         [  1.8240,    62.500],  [1.176, 37.5]))
-
-    return scenarios
+    """Build up to 72 CPS scenarios: 36 sequential-pair + 9 coupled + 27 new-pair."""
+    return _load_cps_paired_scenarios_from_dataset()
 
 
 def create_all_scenarios() -> List[Scenario]:
-    """Return all 48 scenarios: 12 CONVIDE + 36 CPS."""
+    """Return all scenarios: 12 CONVIDE + up to 72 CPS (up to 84 total)."""
     return create_convide_scenarios() + create_cps_scenarios()
 
 

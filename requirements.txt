@@ -1,19 +1,36 @@
-# Python Dependencies for Sensitivity Analysis Framework
+# Python 3.11 — tested environment for the full analysis pipeline
+# (Python 3.14 has numpy/torch incompatibilities with the surrogate data)
+#
+# Setup:
+#   python3.11 -m venv .venv311
+#   .venv311\Scripts\activate
+#   pip install -r requirements.txt
+#
+# torch-geometric must be installed separately (version must match torch):
+#   pip install torch-geometric
+#   pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.2.0+cpu.html
+#   (replace +cpu with +cu118 or +cu121 if you have a GPU)
 
-# Core numerical and data manipulation
-numpy>=1.20.0
-pandas>=1.3.0
+# ── Core numerical ──────────────────────────────────────────────────────────
+numpy>=1.24,<2.0           # 1.26.x recommended; <2.0 avoids format incompatibilities
+                            # with surrogate NPZ files saved on the server
+pandas>=1.5.0
+scipy>=1.10.0
 
-# Visualization
-matplotlib>=3.4.0
-seaborn>=0.11.0
+# ── Visualisation ───────────────────────────────────────────────────────────
+matplotlib>=3.6.0
+seaborn>=0.12.0
 
-# Machine Learning (surrogate models for sensitivity analysis)
-scikit-learn>=1.0.0
+# ── Machine learning ────────────────────────────────────────────────────────
+scikit-learn>=1.2.0
+torch>=2.1.0,<2.4.0        # 2.2.x or 2.3.x are stable with torch-geometric
 
-# Statistical utilities
-scipy>=1.7.0
+# torch-geometric: install manually after torch (see header above)
+# torch-geometric>=2.4.0
 
-# Sensitivity analysis (Sobol indices)
+# ── Sensitivity analysis ────────────────────────────────────────────────────
 SALib>=1.4.0
 
+# ── Utilities ───────────────────────────────────────────────────────────────
+tqdm>=4.64.0
+pyyaml>=6.0

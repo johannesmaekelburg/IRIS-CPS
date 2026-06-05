@@ -9,7 +9,7 @@ fprintf('========================================\n\n');
 
 %% Setup paths
 causality_root = fileparts(fileparts(mfilename('fullpath')));
-src_path = fullfile(causality_root, 'src');
+src_path = fullfile(causality_root, 'src', 'matlab');
 addpath(src_path);
 
 cps_framework_path = fullfile(fileparts(causality_root), 'CPS-Uncertainty-Propagation-Framework');
@@ -89,7 +89,7 @@ sample_data = load(sample_file);
 fprintf('Sample zonotope file contents:\n');
 fprintf('  exp_id: %d\n', sample_data.exp_id);
 fprintf('  intervention_type: %s\n', sample_data.intervention_type);
-fprintf('  param_value: %.1f\n', sample_data.param_value);
+fprintf('  intervention_value: %.1f\n', sample_data.intervention_value);
 fprintf('  Has Z_source_pre: %d\n', isfield(sample_data, 'Z_source_pre'));
 fprintf('  Has Z_target: %d\n', isfield(sample_data, 'Z_target'));
 fprintf('  Has Z_propagated: %d\n\n', isfield(sample_data, 'Z_propagated'));
@@ -171,8 +171,12 @@ fprintf('  Method: %s\n', mc_json.consistency_method);
 fprintf('  MC samples: %d\n', mc_json.mc_samples);
 fprintf('  Sample experiment 1:\n');
 exp1_m = mc_json.experiments(1);
-fprintf('    Pre-state MC prob: %.4f\n', exp1_m.pre_state.inconsistency.mc_probability);
-fprintf('    Post-state MC prob: %.4f\n\n', exp1_m.post_state.inconsistency.mc_probability);
+if isfield(exp1_m.pre_state.inconsistency, 'I_theta')
+    fprintf('    Pre-state I_theta: %.4f\n', exp1_m.pre_state.inconsistency.I_theta);
+    fprintf('    Post-state I_theta: %.4f\n\n', exp1_m.post_state.inconsistency.I_theta);
+else
+    fprintf('    (I_theta field not found - check saved fields)\n\n');
+end
 
 %% Performance summary
 fprintf('========================================\n');

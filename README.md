@@ -136,6 +136,23 @@ python -m surrogate.train_compare \
     --holdout measurements_v6/results_scenario_7.json --run_id ablations_2d3d
 ```
 
+#### Attention and generator coupling
+
+Self-attention is applied before the per-dimension factors, each
+factor depends on the full configuration, hence the product head is not an
+independence assumption but a context-dependent factorization. The figure below
+shows the effect: controlling for the inconsistency level , the **no-attention** ablation's error grows with the
+correlation intervention ρ_u (off-diagonal generator coupling), while the
+**full** model does not. In other words, self-attention provides the
+cross-dimension coupling that the per-dimension product factorization omits;
+the gap widens ≈4× over the ρ_u range in the decision-relevant band.
+
+![Surrogate error vs. generator coupling](results/coupling/error_vs_coupling.png)
+
+```bash
+python -m surrogate.coupling_experiment --bins 6
+```
+
 ### Step 3 — Python: Generate Combined Figures
 
 ```bash

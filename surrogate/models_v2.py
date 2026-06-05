@@ -465,6 +465,26 @@ class ProductSetTransformerExact(ProductSetTransformer):
         return (-torch.expm1(log_consistent)).clamp(0.0, 1.0)
 
 
+class ProductSetTransformerNoGlobal(ProductSetTransformerExact):
+    """Ablation of PST-Exact: drop the global containment factor p_g.
+
+    Identical encoder + per-dim product head, but the output omits the
+    global bias term, so I = 1 - prod_i p_i (pure per-dimension noisy-AND).
+    The global_bias submodule is inherited but never used in the graph.
+    """
+
+    def forward(self, per_dim, mask, global_feats):
+        x = self.project(per_dim)
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        logit = self.dim_head(x).squeeze(-1)               # (B, D)
+        log_p = F.logsigmoid(logit)                        # (B, D), <= 0
+        log_consistent = (log_p * mask).sum(dim=1)         # (B,)  no global term
+
+        return (-torch.expm1(log_consistent)).clamp(0.0, 1.0)
+
+
 MODEL_REGISTRY = {
     "deepsets_v2": DeepSetsV2,
     "flat_mlp": FlatMLP,
@@ -472,6 +492,12 @@ MODEL_REGISTRY = {
     "set_transformer": SmallSetTransformer,
     "product_transformer": ProductSetTransformer,
     "product_transformer_exact": ProductSetTransformerExact,
+    # ── Architectural ablations of product_transformer_exact ──
+    # (1) drop the global containment factor p_g  → I = 1 - prod_i p_i
+    "pst_exact_no_pg": ProductSetTransformerNoGlobal,
+    # (2) remove self-attention (DeepSets-like): per-dim head on projected
+    #     features, no cross-dimension mixing; product head + p_g kept.
+    "pst_exact_no_attn": partial(ProductSetTransformerExact, n_layers=0),
     "direction_probe": DirectionProbeNet,
     # Size-matched to product_transformer_exact (~9.4k params) for a
     # capacity-controlled comparison: wider per-direction MLP + more probes.

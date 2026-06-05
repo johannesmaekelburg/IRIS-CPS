@@ -318,6 +318,21 @@ class CounterfactualResult:
 # Batched optimizer
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _build_optim(params, name: str, lr: float):
+    """Map an optimizer name to a torch optimizer (for HPO over optimizer type)."""
+    name = (name or "adam").lower()
+    if name == "adam":
+        return torch.optim.Adam(params, lr=lr)
+    if name == "sgd":
+        return torch.optim.SGD(params, lr=lr)
+    if name in ("momentum", "sgd_momentum"):
+        return torch.optim.SGD(params, lr=lr, momentum=0.9)
+    if name == "nesterov":
+        return torch.optim.SGD(params, lr=lr, momentum=0.9, nesterov=True)
+    if name == "rmsprop":
+        return torch.optim.RMSprop(params, lr=lr)
+    raise ValueError(f"unknown optimizer {name!r}")
+
 class BatchedCounterfactualOptimizer:
     """Vectorised projected-gradient optimizer for the DeepSets surrogate.
 
@@ -359,6 +374,8 @@ class BatchedCounterfactualOptimizer:
         escalation_freq: int = 50,
         n_restarts:   int   = 4,
         device:       torch.device = torch.device("cpu"),
+        optimizer:    str   = "adam",
+        objective:    str   = "repair",
     ):
         self.model        = model
         self.model.eval()
@@ -376,6 +393,10 @@ class BatchedCounterfactualOptimizer:
         self.escalation_freq = escalation_freq
         self.n_restarts      = n_restarts
         self.device          = device
+        self.optimizer       = optimizer
+        # "repair"      : argmin ||theta-theta*||  s.t. I<=gamma  (nearest consistent)
+        # "consistency" : argmin I(theta)          ignoring distance (most consistent)
+        self.objective       = objective
 
         self.lb   = _THETA_LB.to(device)
         self.ub   = _THETA_UB.to(device)
@@ -425,7 +446,7 @@ class BatchedCounterfactualOptimizer:
         lam = torch.full((B,), self.lambda_init,
                          dtype=torch.float32, device=self.device)
 
-        opt = torch.optim.Adam([theta], lr=self.lr)
+        opt = _build_optim([theta], self.optimizer, self.lr)
 
         # Tracking best feasible solution per sample
         best_theta = theta.detach().clone()                    # (B, 3)
@@ -447,8 +468,11 @@ class BatchedCounterfactualOptimizer:
             i_hat = self.model(pd, mask, gf)   # (B,)
 
             dist_sq = ((theta - ts_ref) / self.span).pow(2).sum(dim=1)  # (B,)
-            penalty = torch.clamp(i_hat - self.gamma, min=0.0).pow(2)   # (B,)
-            loss    = (dist_sq + lam * penalty).sum()
+            if self.objective == "consistency":
+                loss = i_hat.sum()                       # minimise I, ignore distance
+            else:
+                penalty = torch.clamp(i_hat - self.gamma, min=0.0).pow(2)   # (B,)
+                loss    = (dist_sq + lam * penalty).sum()
             loss.backward()
             opt.step()
 
@@ -458,11 +482,15 @@ class BatchedCounterfactualOptimizer:
                 i_val   = i_hat.detach()       # (B,)
                 d_val   = dist_sq.detach().sqrt()  # (B,)
 
-                # Update best feasible (surrogate ≤ γ preferred; else best i)
-                feasible = i_val <= self.gamma
-                improved_feas = feasible & (d_val < best_dist)
-                improved_inf  = ~feasible & ~(best_i <= self.gamma) & (i_val < best_i)
-                improved = improved_feas | improved_inf
+                if self.objective == "consistency":
+                    # Best = lowest surrogate I seen so far (distance is irrelevant)
+                    improved = i_val < best_i
+                else:
+                    # Update best feasible (surrogate ≤ γ preferred; else best i)
+                    feasible = i_val <= self.gamma
+                    improved_feas = feasible & (d_val < best_dist)
+                    improved_inf  = ~feasible & ~(best_i <= self.gamma) & (i_val < best_i)
+                    improved = improved_feas | improved_inf
 
                 best_theta[improved] = theta.detach()[improved]
                 best_dist[improved]  = d_val[improved]
@@ -493,19 +521,31 @@ class BatchedCounterfactualOptimizer:
 
         elapsed = time.perf_counter() - t0
 
+        # Expose per-query restart candidates (theta + surrogate I) so callers can
+        # verify EACH restart with a true oracle and select by ground truth.
+        self.last_candidates = [
+            (best_theta_np[q * R:(q + 1) * R].copy(),
+             i_prime_all[q * R:(q + 1) * R].copy())
+            for q in range(Q)
+        ]
+
         results = []
         for q in range(Q):
             start = q * R
             block = slice(start, start + R)
 
-            # Prefer converged results; among those take smallest distance
-            conv_mask = i_prime_all[block] <= self.gamma
-            if conv_mask.any():
-                dists_block = best_dist_np[block].copy()
-                dists_block[~conv_mask] = float("inf")
-                best_r = int(np.argmin(dists_block))
-            else:
+            if self.objective == "consistency":
+                # Pick the most-consistent restart (lowest I), distance irrelevant
                 best_r = int(np.argmin(i_prime_all[block]))
+            else:
+                # Prefer converged results; among those take smallest distance
+                conv_mask = i_prime_all[block] <= self.gamma
+                if conv_mask.any():
+                    dists_block = best_dist_np[block].copy()
+                    dists_block[~conv_mask] = float("inf")
+                    best_r = int(np.argmin(dists_block))
+                else:
+                    best_r = int(np.argmin(i_prime_all[block]))
 
             idx          = start + best_r
             th_prime     = best_theta_np[idx]

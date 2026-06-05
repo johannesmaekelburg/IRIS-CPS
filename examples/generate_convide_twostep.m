@@ -76,34 +76,11 @@ end
 src_path = fullfile(fileparts(fileparts(mfilename('fullpath'))), 'src', 'matlab');
 addpath(src_path);
 
-% Detect CPS framework path - works on both Windows and Linux
-script_dir = fileparts(mfilename('fullpath'));
+script_dir   = fileparts(mfilename('fullpath'));
 project_root = fileparts(script_dir);  % Go up from examples/ to project root
-myCORA_dir = fileparts(project_root);  % Go up from Causality_Uncertainty_Inconsistency/ to MyCORA/
-cps_framework_path = fullfile(myCORA_dir, 'CPS-Uncertainty-Propagation-Framework');
 
 fprintf('Detected paths:\n');
 fprintf('  Project root: %s\n', project_root);
-fprintf('  CPS framework: %s\n', cps_framework_path);
-fprintf('  CPS exists: %d\n\n', exist(cps_framework_path, 'dir') == 7);
-
-addpath(genpath(fullfile(cps_framework_path, 'src')));
-
-consistency_addon_path = fullfile(cps_framework_path, 'addons', 'consistency_scoring');
-if exist(fullfile(consistency_addon_path, 'init_consistency_scoring.m'), 'file')
-    addpath(consistency_addon_path);
-    addpath(fullfile(consistency_addon_path, 'methods'));
-else
-    fprintf('ERROR: Consistency scoring addon not found!\n');
-    fprintf('Expected CPS framework at: %s\n', cps_framework_path);
-    fprintf('Looking for addon at: %s\n', consistency_addon_path);
-    fprintf('Expected file: %s\n\n', fullfile(consistency_addon_path, 'init_consistency_scoring.m'));
-    fprintf('Please check:\n');
-    fprintf('  1. CPS-Uncertainty-Propagation-Framework exists at: %s\n', cps_framework_path);
-    fprintf('  2. The addon exists at: addons/consistency_scoring/\n');
-    fprintf('  3. Required functions: score_jaccard.m, score_mc_probability.m, score_jaccard_mc.m\n\n');
-    error('Consistency scoring addon required but not found.');
-end
 
 fprintf('========================================\n');
 if use_saltelli_mode

@@ -64,18 +64,8 @@ scenarios_to_run = 1:72;
 %% ═══════════════════════════════════════════════════════════════
 script_dir   = fileparts(mfilename('fullpath'));
 project_root = fileparts(script_dir);
-myCORA_dir   = fileparts(project_root);
-cps_fw_path  = fullfile(myCORA_dir, 'CPS-Uncertainty-Propagation-Framework');
 
 addpath(fullfile(project_root, 'src', 'matlab'));
-addpath(genpath(fullfile(cps_fw_path, 'src')));
-
-addon_path = fullfile(cps_fw_path, 'addons', 'consistency_scoring');
-if ~exist(fullfile(addon_path, 'init_consistency_scoring.m'), 'file')
-    error('Consistency scoring addon not found at: %s', addon_path);
-end
-addpath(addon_path);
-addpath(fullfile(addon_path, 'methods'));
 
 %% Output directories
 data_base    = fullfile(project_root, 'data');

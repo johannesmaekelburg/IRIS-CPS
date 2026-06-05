@@ -1,27 +1,24 @@
-# DeepSets Surrogate for Zonotope Inconsistency Estimation
+# Neural Surrogate for Zonotope Inconsistency Estimation
 
-A lightweight neural surrogate (~1 250 parameters) that estimates the
-inconsistency score `I(theta)` between two constrained zonotopes without
-running Monte-Carlo sampling.  Used to answer RQ1–RQ4 in the ICDM paper.
+A lightweight neural surrogate that estimates the inconsistency score
+`I(theta)` between two constrained zonotopes without running Monte-Carlo
+sampling.  Used to answer RQ1–RQ4 in the ICDM paper.
 
-## Architecture
+## Architectures
 
-**DeepSets** over zonotope dimensions, followed by a global MLP:
+Several interchangeable architectures are provided in `models_v2.py`
+(`MODEL_REGISTRY`); the deployed model is `product_transformer_exact`.
+Select one or more with `--models` and they train and evaluate on the same
+data split:
 
+```bash
+python -m surrogate.train_compare --models product_transformer_exact
+python -m surrogate.train_compare --models product_transformer_exact set_transformer deepsets_v2 flat_mlp
 ```
-For each dimension i:
-    feats_i = [delta_c_i, ||G1_i||, ||G2_i||, cos(G1_i, G2_i)]  (normalised)
-    e_i     = phi(feats_i)          # shared MLP  4 -> 16 -> 16
 
-aggregate   = sum_i(e_i * mask_i)   # masked sum-pool
-output      = sigmoid(rho([aggregate, global_feats]))  # MLP 26 -> 32 -> 1
-```
-
-`global_feats` (10-dim): log volume ratio, normalised centre distance,
-8-class UPR-type one-hot encoding.
-
-Supports zonotope dimensions d in {2, 3, 4}.  Smaller dimensions are
-zero-padded with a boolean mask.
+All variants take the same per-dimension + global feature input, support
+zonotope dimensions d in {2, 3, 4} (smaller dimensions are zero-padded with a
+boolean mask), and output `I(theta)` in [0, 1].
 
 ## Requirements
 
@@ -73,7 +70,7 @@ python -m surrogate.run_analysis
 | `--plots` | all | Comma-separated plot names or `q1`/`q2`/`q3`/`q4` |
 | `--gamma` | 0.5 | Inconsistency threshold |
 
-### Q4 counterfactual figures for specific scenarios
+### Q4 consistency-recourse figures for specific scenarios
 
 ```bash
 python -m surrogate.run_pipeline --skip_train --skip_evaluate \
@@ -81,8 +78,8 @@ python -m surrogate.run_pipeline --skip_train --skip_evaluate \
 ```
 
 Generates `results/paper_figures/Q4_counterfactual/q4_scenario_{id}.png/pdf`
-for each requested scenario — a 2-panel figure with the minimal-repair
-landscape and all repair trajectories coloured by dominant parameter.
+for each requested scenario — a 2-panel figure with the minimal-recourse
+landscape and all recourse trajectories coloured by dominant parameter.
 
 ### Skip training (use existing checkpoint)
 
@@ -119,28 +116,27 @@ results/paper_figures/
 
 ## Checkpoint
 
-`surrogate/model.pt` contains the pre-trained weights (8 KB).
-Load it directly:
+Load any trained checkpoint with `load_checkpoint`, which reconstructs the
+correct architecture from the saved `model_name`:
 
 ```python
-import torch
-from surrogate.model import DeepSetsZonotope
+from surrogate.models_v2 import load_checkpoint
 
-ckpt  = torch.load("surrogate/model.pt", map_location="cpu")
-model = DeepSetsZonotope(**{k: ckpt["args"][k]
-                            for k in ("phi_hidden", "rho_hidden")})
-model.load_state_dict(ckpt["model_state"])
-model.eval()
+model = load_checkpoint(
+    "results/runs/joint_2d3d_exact/product_transformer_exact.pt")
+# eval-mode model; call model(per_dim, mask, global_feats)
 ```
 
 ## Module overview
 
 | File | Purpose |
 |------|---------|
-| `model.py` | `DeepSetsZonotope` network definition |
-| `dataset.py` | `ZonotopeDataset` — reads `results_scenario_*.json` |
-| `train.py` | Training loop with inductive scenario split |
-| `evaluate.py` | Evaluation vs AABB and MFMC baselines |
-| `counterfactual.py` | Batched gradient-based counterfactual search |
+| `models_v2.py` | Surrogate architectures + `MODEL_REGISTRY`, `load_checkpoint` |
+| `dataset_v2.py` | `ZonotopeDatasetV2` — reads `results_scenario_*.json` |
+| `train_compare.py` | Train/compare architectures on a shared data split |
+| `evaluate.py` | Evaluation vs AABB, MC, and MFMC baselines |
+| `counterfactual.py` | Batched gradient-based consistency recourse |
+| `repair_benchmark.py` | Consistency-recourse benchmark (surrogate vs. CMA-ES/FD) |
+| `plot_repair.py` | Recourse figures (Pareto, trajectory) |
 | `run_analysis.py` | All RQ1–RQ4 paper figures |
 | `run_pipeline.py` | End-to-end entry point |

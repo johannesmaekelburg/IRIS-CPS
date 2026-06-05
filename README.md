@@ -1,145 +1,144 @@
-# Causal Inference: Uncertainty → Inconsistency
+# Estimating Inconsistency Response Surfaces under Uncertainty in Cyber-Physical System Development
 
-A framework for analyzing the causal relationship between uncertainty and inconsistency in cyber-physical systems using interventional experiments.
+Code accompanying the paper *"Estimating Inconsistency Response Surfaces under Uncertainty in Cyber-Physical System Development"*.
 
-## Purpose
+Zonotope-based reachability tools can fail silently when input uncertainty grows too large. This framework maps that failure causally: using Pearl's do-calculus and three intervention types (widen, shrink, correlate), it quantifies how uncertainty causes inconsistency in constrained polynomial zonotope propagation via the global inconsistency metric I(θ), and learns a surrogate response surface over the parameter space.
 
-This project investigates whether and how uncertainty causes inconsistency in constrained polynomial zonotope propagation. Using Pearl's do-calculus and intervention types (widen, shrink, correlate), the framework quantifies causal effects via the global inconsistency metric I(θ). 
+## Features
 
-**Current Features:**
-- 12 CONVIDE scenarios (4×2D, 4×3D, 4×4D) with engineering applications
+- CONVIDE scenarios (2D, 3D, 4D) covering automotive, aerospace, robotics, and other CPS domains
 - Global inconsistency metric I(θ) with Monte Carlo estimation
-- Causal effects, local sensitivity, robustness margins
+- Causal effects, local sensitivity, and robustness margins
 - Sobol variance-based sensitivity indices
-- Multi-fidelity Monte Carlo (AABB low-fidelity + MC high-fidelity)
-- Learned surrogate data generation pipeline (for GNN-based inconsistency prediction)
+- DeepSets surrogate model for fast I(θ) prediction
+- Pre-trained models for 2D/3D and 4D scenarios (no retraining needed for evaluation)
+
+## Repository Structure
+
+```
+src/
+  causal_engine.py              # Python reimplementation of the MATLAB experiment engine
+  run_combined_figures.py       # Generate combined paper figures (2D/3D + 4D models)
+  matlab/
+    causal_experiment_engine_twostep.m   # Core MATLAB experiment engine
+    global_inconsistency.m               # I(θ) computation
+surrogate/                      # DeepSets surrogate model code
+examples/                       # MATLAB data generation scripts
+data/
+  measurements_v6/              # CONVIDE training measurements
+  measurements_cps_v6/          # CPS domain training measurements
+  measurements_cps_full/        # Full CPS measurements
+  CPS-uncertainty-dataset/      # CPS uncertainty scenario definitions
+  CPS-uncertainty-dataset-full/
+  synthetic_v6/                 # Synthetic training data
+  zonotopes/                    # Zonotope geometry data
+product_transformer_2d3d/       # Pre-trained surrogate (2D + 3D scenarios)
+product_transformer_4d_real/    # Pre-trained surrogate (4D scenarios)
+results/
+  combined/                     # Final paper tables and figures
+  eval_2d3d/                    # 2D/3D model evaluation results
+  eval_4d/                      # 4D model evaluation results
+docs/                           # Extended documentation
+tests/
+```
+
+## Data
+
+All datasets are hosted on Figshare and are not tracked in this repository:
+
+**[https://doi.org/10.6084/m9.figshare.32407989](https://doi.org/10.6084/m9.figshare.32407989)**
+
+Download and extract the archive into the `data/` directory before running any scripts. The expected folder structure is described in [FRAMEWORK_OVERVIEW.md](docs/FRAMEWORK_OVERVIEW.md).
 
 ## Usage
 
-### MATLAB: Generate CONVIDE Data
+### Step 1 — MATLAB: Generate Data
+
+From the MATLAB root, run all scenarios in one call:
+
 ```matlab
-% Navigate to examples folder
-cd examples
-
-% Generate CONVIDE scenarios with I_theta metric
-generate_convide_examples
+run_all_scenarios
 ```
 
-### Python: Sensitivity Analysis
-```bash
-# Analyze combined 2D+3D data (all 8 scenarios)
-python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity --param param_value --threshold 0.5
+Or generate individual scenario sets:
 
-# Analyze 2D only (scenarios 1-4)
-python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+```matlab
+generate_convide_twostep          % CONVIDE 2D / 3D / 4D scenarios
+generate_cps_domains_twostep      % CPS engineering domain scenarios
+generate_synthetic_v6_twostep     % Synthetic data
 ```
 
-**Outputs:** 6 files including causal effects, local sensitivity, robustness margins, Sobol indices, surrogate model, and summary JSON.
+These scripts depend on:
+- [CORA Toolbox](https://tumcps.github.io/CORA/)
+- CPS-Uncertainty-Propagation-Framework *(link anonymized for review)*
 
-**Available Datasets:**
-- `convide_with_I_theta/`: 2D scenarios (1-4) - CAD drift, MBSE mismatch, etc.
-- `convide_balanced/`: 2D+3D scenarios (1-8) - Complete engineering scenarios
+The core MATLAB engine lives in `src/matlab/` and is added to the path automatically by the example scripts.
 
-### Learned Surrogate: Data Generation
+### Step 2 — Python: Surrogate Model
 
-The `src/learned_surrogate/` module generates training data for a GNN-based surrogate that predicts I(θ) directly from zonotope geometry, replacing expensive MC sampling at inference time.
+**Option A — Use pre-trained models (recommended for evaluation)**
 
-**Pretraining data** (scenario-independent, teaches zonotope geometry):
-- `volume` — random zonotopes → interval hull volume
-- `containment` — random zonotopes + test points → in/out (LP-based)
-- `pairwise_aabb` — random zonotope pairs → AABB Jaccard overlap
-- `affine_map` — source + affine map → target (learns UPR propagation)
+Pre-trained checkpoints are included in the repo:
+- `product_transformer_2d3d/product_transformer_exact.pt` — 2D + 3D scenarios
+- `product_transformer_4d_real/product_transformer_exact.pt` — 4D scenarios
 
-**Training data** (per-scenario, high-fidelity targets):
-- Samples θ from parameter bounds, computes I(θ) via MC probability
-- Also stores free AABB estimates for multi-fidelity training
-- Stores post-intervention zonotope features for direct GNN input
+Skip to Step 3 to generate figures directly from these checkpoints.
+
+**Option B — Train from scratch**
 
 ```bash
-cd src
+# Install dependencies
+pip install -r requirements.txt
 
-# Generate everything for all 12 scenarios
-python learned_surrogate/generate_data.py --tasks all --scenario all
+# Train on measurements_v6 + measurements_cps_v6
+python -m surrogate.train
 
-# Just training data for scenario 4
-python learned_surrogate/generate_data.py --tasks train --scenario 4
+# Evaluate against AABB, MC, and MFMC baselines
+python -m surrogate.evaluate
 
-# Just specific pretraining objectives
-python learned_surrogate/generate_data.py --tasks pretrain_volume pretrain_pairwise_aabb
-
-# High-fidelity run for one scenario
-python learned_surrogate/generate_data.py --tasks train --scenario 8 \
-    --n_train 20000 --mc_samples 5000
+# Or run the full pipeline (train → evaluate → plot) in one command
+python -m surrogate.run_pipeline
 ```
 
-Output structure:
-```
-data/surrogate/
-  meta.json
-  pretrain/
-    volume.npz, containment.npz, pairwise_aabb.npz, affine_map.npz
-  scenario_S01_CAD_Export_Drift/
-    meta.json                     # scenario geometry (source, target, F, f)
-    train_inconsistency.npz       # theta, I_mc, I_aabb, zonotope features
-  ...
-```
+Training uses `data/measurements_v6/` and `data/measurements_cps_v6/` by default.
+The trained checkpoint is saved to `surrogate/model.pt`.
 
-Use `--overwrite` to regenerate existing files; without it, existing outputs are skipped (resume-friendly).
-
-### Learned Surrogate: Training
-
-Train a GINE-based GNN to predict I(θ) from zonotope graph structure. Supports self-supervised pretraining on geometry tasks followed by supervised fine-tuning.
+### Step 3 — Python: Generate Combined Figures
 
 ```bash
-# 1. Generate training data (5k pretrain samples, 2k per scenario, 1k MC samples)
-.venv/bin/python -m src.learned_surrogate.generate_data \
-    --tasks all --scenario all \
-    --n_pretrain 5000 --n_train 2000 --mc_samples 1000 \
-    --output_dir data/surrogate
-
-# 2. Train (pretrain + fine-tune) with default config
-.venv/bin/python -m src.learned_surrogate.train \
-    --config configs/surrogate_default.yaml
-
-# Fine-tune only from a pretrained checkpoint
-.venv/bin/python -m src.learned_surrogate.train \
-    --config configs/surrogate_default.yaml \
-    --finetune_only --checkpoint results/surrogate/pretrained_backbone.pt
-
-# Pretrain only (no fine-tuning)
-.venv/bin/python -m src.learned_surrogate.train \
-    --config configs/surrogate_default.yaml --pretrain_only
+python src/run_combined_figures.py \
+    --model-2d3d product_transformer_2d3d/product_transformer_exact.pt \
+    --model-4d   product_transformer_4d_real/product_transformer_exact.pt \
+    --scenarios-2d3d 69 32 36 3 25 42 1 57 62 51 58 7 \
+    --scenarios-4d   9 202 216 232 251 256 291 296 304 315 317 \
+    --output results/combined
 ```
 
-All hyperparameters (pretraining tasks, train/test scenario splits, architecture, learning rates, etc.) are controlled via the YAML config — see `configs/surrogate_default.yaml` for all options.
+For a quick smoke test:
 
-Output:
-```
-results/surrogate/
-  pretrained_backbone.pt   # backbone weights after pretraining
-  best_model.pt            # best fine-tuned model (by val MSE)
-  results.json             # final metrics + per-scenario test breakdown
+```bash
+python src/run_combined_figures.py \
+    --model-2d3d product_transformer_2d3d/product_transformer_exact.pt \
+    --model-4d   product_transformer_4d_real/product_transformer_exact.pt \
+    --max-samples 20000 --max-scenarios 5
 ```
 
 ## Requirements
 
 **MATLAB (R2021a+)**:
-- CORA Toolbox: https://tumcps.github.io/CORA/
-- CPS-Uncertainty-Propagation-Framework: https://github.com/DE-TUM/CPS-Uncertainty-Propagation-Framework
+- [CORA Toolbox](https://tumcps.github.io/CORA/)
+- CPS-Uncertainty-Propagation-Framework *(link anonymized for review)*
 
 **Python (3.8+)**:
 ```bash
 pip install -r requirements.txt
 ```
 
-Main packages: `numpy`, `scipy`, `matplotlib`, `pandas`, `seaborn`, `scikit-learn`
+Main packages: `numpy`, `scipy`, `torch`, `matplotlib`, `pandas`, `scikit-learn`
 
+## Documentation
 
-Core documentation in `docs/`:
-- [QUICKSTART.md](docs/QUICKSTART.md) - Getting started guide with basic commands
+- [QUICKSTART.md](docs/QUICKSTART.md) - Getting started guide
 - [METHODOLOGY.md](docs/METHODOLOGY.md) - Theoretical foundation and I(θ) metric
 - [FRAMEWORK_OVERVIEW.md](docs/FRAMEWORK_OVERVIEW.md) - System architecture and data flow
-- [CONVIDE_SCENARIOS.md](docs/CONVIDE_SCENARIOS.md) - 8 engineering scenarios explained
-- [SENSITIVITY_ANALYSIS_PLOTS.md](docs/SENSITIVITY_ANALYSIS_PLOTS.md) - Complete guide to analysis outputstecture and theory
-- [CONVIDE_SCENARIOS.md](docs/CONVIDE_SCENARIOS.md) - Engineering scenarios
-- [QUICKSTART.md](docs/QUICKSTART.md) - Getting started guide
+- [CONVIDE_SCENARIOS.md](docs/CONVIDE_SCENARIOS.md) - Engineering scenarios explained

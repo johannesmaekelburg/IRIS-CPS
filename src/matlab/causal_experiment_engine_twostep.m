@@ -38,8 +38,8 @@ classdef causal_experiment_engine_twostep
         UNCERTAINTY_INTERVENTIONS = {'widen', 'shrink', 'shift', 'rotate', 'correlate'};
         
         % Consistency scoring methods
-        CONSISTENCY_METHODS = {'jaccard', 'jaccard_mc', 'mc_probability', 'both'};
-        DEFAULT_METHOD = 'both';
+        CONSISTENCY_METHODS = {'jaccard', 'jaccard_mc', 'mc_probability', 'both', 'aabb_and_mc'};
+        DEFAULT_METHOD = 'aabb_and_mc';  % AABB Jaccard + MC Probability (includes MFMC) — no jaccard_mc
         DEFAULT_MC_SAMPLES = 2000;
         DEFAULT_SAMPLING_METHOD = 'sobol';  % 'random', 'sobol', 'halton', 'lhs'
     end
@@ -93,21 +93,21 @@ classdef causal_experiment_engine_twostep
             zonotope_data = {};
             exp_count = 0;
             
-            % Create baseline scenario
-            mapping_strength = 5.0;
-            if isfield(scenario_def, 'mapping_strength') && ~isempty(scenario_def.mapping_strength)
-                mapping_strength = scenario_def.mapping_strength;
-            end
-            baseline_scenario = causal_experiment_engine_twostep.create_baseline_scenario(...
-                length(scenario_def.source.c), mapping_strength);
+            % Build baseline scenario from scenario_def (use provided mapping, not random F)
+            baseline_scenario = struct();
             baseline_scenario.source = scenario_def.source;
             baseline_scenario.target = scenario_def.target;
-            % Re-align translation so propagated source center == target center.
-            % Without this, the random F applied to large centers (e.g. 100)
-            % causes O(0.01*100)=1 unit noise in the propagated center, which
-            % swamps the small source-target difference controlled by center_alpha.
-            baseline_scenario.mapping.f = scenario_def.target.c - ...
-                baseline_scenario.mapping.F * scenario_def.source.c;
+            if isfield(scenario_def, 'mapping') && isstruct(scenario_def.mapping) && ...
+                    isfield(scenario_def.mapping, 'F')
+                % Use the mapping provided by the scenario definition (CPS dataset or CONVIDE)
+                baseline_scenario.mapping = scenario_def.mapping;
+            else
+                % Fall back to identity mapping aligned to source/target centers
+                dim = length(scenario_def.source.c);
+                F   = eye(dim);
+                f   = scenario_def.target.c - F * scenario_def.source.c;
+                baseline_scenario.mapping = struct('F', F, 'f', f);
+            end
             
             % Flatten experiments for optional parallelization
             experiments = [];
@@ -200,6 +200,24 @@ classdef causal_experiment_engine_twostep
                     zono_data.scenario_name = scenario_name;
                     zono_data.scenario_description = scenario_def.name;
                     zono_data.causality_type = scenario_def.type;
+                    if isfield(scenario_def, 'dataset_source')
+                        zono_data.dataset_source = scenario_def.dataset_source;
+                    end
+                    if isfield(scenario_def, 'paired_scenario_ids')
+                        zono_data.paired_scenario_ids = scenario_def.paired_scenario_ids;
+                    end
+                    if isfield(scenario_def, 'paired_scenario_names')
+                        zono_data.paired_scenario_names = scenario_def.paired_scenario_names;
+                    end
+                    if isfield(scenario_def, 'consistency_relations')
+                        zono_data.consistency_relations = scenario_def.consistency_relations;
+                    end
+                    if isfield(scenario_def, 'relation_types')
+                        zono_data.relation_types = scenario_def.relation_types;
+                    end
+                    if isfield(scenario_def, 'relation_operators')
+                        zono_data.relation_operators = scenario_def.relation_operators;
+                    end
                     zono_data.intervention_type = exp.intervention_type;
                     zono_data.repeat_idx = exp.repeat_idx;
                     
@@ -225,6 +243,15 @@ classdef causal_experiment_engine_twostep
                     % Store mapping
                     zono_data.mapping_F = F;
                     zono_data.mapping_f = f;
+                    % Store UPR type and params (for type-specific propagation in Step 2)
+                    if isfield(scenario_def, 'upr_type')
+                        zono_data.upr_type   = scenario_def.upr_type;
+                    else
+                        zono_data.upr_type   = 'parametric';
+                    end
+                    if isfield(scenario_def, 'upr_params')
+                        zono_data.upr_params = scenario_def.upr_params;
+                    end
                     
                     % Save to file (use -fromstruct for parfor compatibility)
                     filename = sprintf('zonotopes_%s_exp%04d.mat', scenario_name, exp_id);
@@ -301,6 +328,24 @@ classdef causal_experiment_engine_twostep
                     zono_data.scenario_name = scenario_name;
                     zono_data.scenario_description = scenario_def.name;
                     zono_data.causality_type = scenario_def.type;
+                    if isfield(scenario_def, 'dataset_source')
+                        zono_data.dataset_source = scenario_def.dataset_source;
+                    end
+                    if isfield(scenario_def, 'paired_scenario_ids')
+                        zono_data.paired_scenario_ids = scenario_def.paired_scenario_ids;
+                    end
+                    if isfield(scenario_def, 'paired_scenario_names')
+                        zono_data.paired_scenario_names = scenario_def.paired_scenario_names;
+                    end
+                    if isfield(scenario_def, 'consistency_relations')
+                        zono_data.consistency_relations = scenario_def.consistency_relations;
+                    end
+                    if isfield(scenario_def, 'relation_types')
+                        zono_data.relation_types = scenario_def.relation_types;
+                    end
+                    if isfield(scenario_def, 'relation_operators')
+                        zono_data.relation_operators = scenario_def.relation_operators;
+                    end
                     zono_data.intervention_type = exp.intervention_type;
                     zono_data.repeat_idx = exp.repeat_idx;
                     
@@ -325,6 +370,15 @@ classdef causal_experiment_engine_twostep
                     % Store mapping
                     zono_data.mapping_F = F;
                     zono_data.mapping_f = f;
+                    % Store UPR type and params (for type-specific propagation in Step 2)
+                    if isfield(scenario_def, 'upr_type')
+                        zono_data.upr_type   = scenario_def.upr_type;
+                    else
+                        zono_data.upr_type   = 'parametric';
+                    end
+                    if isfield(scenario_def, 'upr_params')
+                        zono_data.upr_params = scenario_def.upr_params;
+                    end
                     
                     % Save to file
                     filename = sprintf('zonotopes_%s_exp%04d.mat', scenario_name, exp_id);
@@ -521,16 +575,20 @@ classdef causal_experiment_engine_twostep
                     pre_scenario.source = zono_data.Z_source_pre;
                     pre_scenario.target = zono_data.Z_target;
                     pre_scenario.mapping = struct('F', zono_data.mapping_F, 'f', zono_data.mapping_f);
-                    
+                    if isfield(zono_data, 'upr_type'),   pre_scenario.upr_type   = zono_data.upr_type;   end
+                    if isfield(zono_data, 'upr_params'), pre_scenario.upr_params = zono_data.upr_params; end
+
                     pre_state = causal_experiment_engine_twostep.measure_state(...
                         pre_scenario, consistency_options);
-                    
+
                     % Measure post-intervention state
                     post_scenario = struct();
                     post_scenario.source = zono_data.Z_source_post;
                     post_scenario.target = zono_data.Z_target;
                     post_scenario.mapping = struct('F', zono_data.mapping_F, 'f', zono_data.mapping_f);
-                    
+                    if isfield(zono_data, 'upr_type'),   post_scenario.upr_type   = zono_data.upr_type;   end
+                    if isfield(zono_data, 'upr_params'), post_scenario.upr_params = zono_data.upr_params; end
+
                     post_state = causal_experiment_engine_twostep.measure_state(...
                         post_scenario, consistency_options);
                     
@@ -544,6 +602,24 @@ classdef causal_experiment_engine_twostep
                     result.scenario_type = zono_data.scenario_name;
                     result.scenario_description = zono_data.scenario_description;
                     result.causality_type = zono_data.causality_type;
+                    if isfield(zono_data, 'dataset_source')
+                        result.dataset_source = zono_data.dataset_source;
+                    end
+                    if isfield(zono_data, 'paired_scenario_ids')
+                        result.paired_scenario_ids = zono_data.paired_scenario_ids;
+                    end
+                    if isfield(zono_data, 'paired_scenario_names')
+                        result.paired_scenario_names = zono_data.paired_scenario_names;
+                    end
+                    if isfield(zono_data, 'consistency_relations')
+                        result.consistency_relations = zono_data.consistency_relations;
+                    end
+                    if isfield(zono_data, 'relation_types')
+                        result.relation_types = zono_data.relation_types;
+                    end
+                    if isfield(zono_data, 'relation_operators')
+                        result.relation_operators = zono_data.relation_operators;
+                    end
                     result.intervention_type = zono_data.intervention_type;
                     result.intervention_direction = 'forward';
                     
@@ -640,6 +716,24 @@ classdef causal_experiment_engine_twostep
                         result.scenario_type = zono_data.scenario_name;
                         result.scenario_description = zono_data.scenario_description;
                         result.causality_type = zono_data.causality_type;
+                        if isfield(zono_data, 'dataset_source')
+                            result.dataset_source = zono_data.dataset_source;
+                        end
+                        if isfield(zono_data, 'paired_scenario_ids')
+                            result.paired_scenario_ids = zono_data.paired_scenario_ids;
+                        end
+                        if isfield(zono_data, 'paired_scenario_names')
+                            result.paired_scenario_names = zono_data.paired_scenario_names;
+                        end
+                        if isfield(zono_data, 'consistency_relations')
+                            result.consistency_relations = zono_data.consistency_relations;
+                        end
+                        if isfield(zono_data, 'relation_types')
+                            result.relation_types = zono_data.relation_types;
+                        end
+                        if isfield(zono_data, 'relation_operators')
+                            result.relation_operators = zono_data.relation_operators;
+                        end
                         result.intervention_type = zono_data.intervention_type;
                         result.intervention_direction = 'forward';
                         
@@ -683,6 +777,24 @@ classdef causal_experiment_engine_twostep
                 metadata.scenario_name = scenario_name;
                 metadata.scenario_description = zonotope_index.scenario_def.name;
                 metadata.causality_type = zonotope_index.scenario_def.type;
+                if isfield(zonotope_index.scenario_def, 'dataset_source')
+                    metadata.dataset_source = zonotope_index.scenario_def.dataset_source;
+                end
+                if isfield(zonotope_index.scenario_def, 'paired_scenario_ids')
+                    metadata.paired_scenario_ids = zonotope_index.scenario_def.paired_scenario_ids;
+                end
+                if isfield(zonotope_index.scenario_def, 'paired_scenario_names')
+                    metadata.paired_scenario_names = zonotope_index.scenario_def.paired_scenario_names;
+                end
+                if isfield(zonotope_index.scenario_def, 'consistency_relations')
+                    metadata.consistency_relations = zonotope_index.scenario_def.consistency_relations;
+                end
+                if isfield(zonotope_index.scenario_def, 'relation_types')
+                    metadata.relation_types = zonotope_index.scenario_def.relation_types;
+                end
+                if isfield(zonotope_index.scenario_def, 'relation_operators')
+                    metadata.relation_operators = zonotope_index.scenario_def.relation_operators;
+                end
                 metadata.consistency_method = consistency_options.method;
                 metadata.mc_samples = consistency_options.mc_samples;
                 metadata.use_nonuniform_inner = consistency_options.use_nonuniform_inner;
@@ -772,8 +884,9 @@ classdef causal_experiment_engine_twostep
                 state.uncertainty.source_volume = causal_experiment_engine_twostep.compute_volume(Z_src);
                 state.uncertainty.source_radius = causal_experiment_engine_twostep.compute_radius(Z_src);
                 state.uncertainty.source_center = Z_src.c;
+                state.uncertainty.source_generators = Z_src.G;  % needed for GNN inference
                 state.uncertainty.source_n_generators = size(Z_src.G, 2);
-                
+
                 % Correlation measure
                 if size(Z_src.G, 2) > 1
                     state.uncertainty.source_correlation = ...
@@ -782,13 +895,14 @@ classdef causal_experiment_engine_twostep
                     state.uncertainty.source_correlation = 0;
                 end
             end
-            
+
             % Target uncertainty
             if isfield(scenario, 'target') && isobject(scenario.target)
                 Z_tgt = scenario.target;
                 state.uncertainty.target_volume = causal_experiment_engine_twostep.compute_volume(Z_tgt);
                 state.uncertainty.target_radius = causal_experiment_engine_twostep.compute_radius(Z_tgt);
                 state.uncertainty.target_center = Z_tgt.c;
+                state.uncertainty.target_generators = Z_tgt.G;  % needed for GNN inference
                 state.uncertainty.target_n_generators = size(Z_tgt.G, 2);
             end
             
@@ -804,7 +918,44 @@ classdef causal_experiment_engine_twostep
                 try
                     F = scenario.mapping.F;
                     f = scenario.mapping.f;
-                    Z_propagated = CS_Types.affineMap_cPZ(scenario.source, F, f);
+
+                    % ── UPR-type-specific propagation ──────────────────────────
+                    upr_type = '';
+                    if isfield(scenario, 'upr_type')
+                        upr_type = lower(strtrim(char(string(scenario.upr_type))));
+                    end
+
+                    % For constraint_based: clip source to the safety bound
+                    % before propagating (σ(x) = x if g(x) ≤ 0, else ∅).
+                    % We use an interval-hull clip: conservative but exact in 1-D.
+                    Z_source_eff = scenario.source;
+                    if strcmp(upr_type, 'constraint_based') && ...
+                            isfield(scenario, 'upr_params') && ...
+                            isfield(scenario.upr_params, 'constraint_bound')
+                        try
+                            bounds = double(scenario.upr_params.constraint_bound);
+                            dim    = length(bounds);
+                            I_src  = interval(Z_source_eff);
+                            lo_src = infimum(I_src);
+                            hi_src = supremum(I_src);
+                            hi_clipped = min(hi_src, bounds(:));
+                            % If the source already violates the bound entirely,
+                            % the propagated set is empty → use a degenerate zonotope.
+                            if any(lo_src > hi_clipped)
+                                % Empty set: degenerate point outside target
+                                c_empty = bounds(:) + 1e6 * ones(dim, 1);
+                                Z_source_eff = conZonotope(c_empty, zeros(dim,1), [], []);
+                            else
+                                c_clip = (lo_src + hi_clipped) / 2;
+                                G_clip = diag((hi_clipped - lo_src) / 2);
+                                Z_source_eff = conZonotope(c_clip, G_clip, [], []);
+                            end
+                        catch
+                            % Fall back to unclipped source on error
+                        end
+                    end
+
+                    Z_propagated = CS_Types.affineMap_cPZ(Z_source_eff, F, f);
                     
                     state.inconsistency.propagation_success = true;
                     state.inconsistency.propagated_volume = ...
@@ -818,7 +969,7 @@ classdef causal_experiment_engine_twostep
                         method = lower(options.method);
                         
                         % === JACCARD METHOD (AABB) ===
-                        if strcmp(method, 'jaccard') || strcmp(method, 'both')
+                        if strcmp(method, 'jaccard') || strcmp(method, 'both') || strcmp(method, 'aabb_and_mc')
                             try
                                 F_identity = eye(size(scenario.target.c, 1));
                                 f_identity = zeros(size(scenario.target.c, 1), 1);
@@ -888,7 +1039,7 @@ classdef causal_experiment_engine_twostep
                         end
                         
                         % === MONTE CARLO PROBABILITY METHOD (Multi-set with QMC) ===
-                        if strcmp(method, 'mc_probability') || strcmp(method, 'both')
+                        if strcmp(method, 'mc_probability') || strcmp(method, 'both') || strcmp(method, 'aabb_and_mc')
                             sampling_methods = options.sampling_method;
                             for sm_idx = 1:length(sampling_methods)
                                 samp_method = sampling_methods{sm_idx};
@@ -919,24 +1070,91 @@ classdef causal_experiment_engine_twostep
                                     state.inconsistency.(['mc_standard_error' field_suffix]) = mc_details.standard_error;
                                     state.inconsistency.(['mc_ci95_lower' field_suffix]) = mc_details.ci95_lower;
                                     state.inconsistency.(['mc_ci95_upper' field_suffix]) = mc_details.ci95_upper;
-                                    % Within-theta MFMC corrected estimate
-                                    if isfield(mc_details, 'I_MF') && ~isnan(mc_details.I_MF)
-                                        state.inconsistency.(['I_MF_' samp_method]) = mc_details.I_MF;
-                                    end
-                                    % Convergence curve: running mean at every 100-sample checkpoint
-                                    if isfield(mc_details, 'consistent_flags') && ~isempty(mc_details.consistent_flags)
-                                        flags_arr = double(mc_details.consistent_flags);
-                                        N_total   = length(flags_arr);
-                                        step      = 100;
-                                        chk_pts   = step:step:N_total;
-                                        if isempty(chk_pts) || chk_pts(end) < N_total
-                                            chk_pts(end+1) = N_total;
+                                    % MFMC corrected estimate:
+                                    %  - No intersection: I_MF = 1.0 exactly (certain inconsistency,
+                                    %    AABB already proves the sets are disjoint).
+                                    %  - Intersection + valid I_MF: use MFMC estimate.
+                                    %  - Intersection + NaN I_MF: fall back to plain MC.
+                                    has_intersection = false;
+                                    if isfield(state.inconsistency, 'has_intersection')
+                                        hi = state.inconsistency.has_intersection;
+                                        if islogical(hi)
+                                            has_intersection = hi;
+                                        elseif isnumeric(hi)
+                                            has_intersection = (hi ~= 0);
                                         end
-                                        cum_sum = cumsum(flags_arr);
-                                        conv_curve = cum_sum(chk_pts) ./ chk_pts;
-                                        state.inconsistency.(['mc_convergence_' samp_method]) = conv_curve;
-                                        if ~isfield(state.inconsistency, 'mc_convergence_checkpoints')
-                                            state.inconsistency.mc_convergence_checkpoints = chk_pts;
+                                    end
+                                    if ~has_intersection
+                                        state.inconsistency.(['I_MF_' samp_method]) = 1.0;
+                                    elseif isfield(mc_details, 'I_MF') && ~isnan(mc_details.I_MF)
+                                        state.inconsistency.(['I_MF_' samp_method]) = mc_details.I_MF;
+                                    else
+                                        % Fallback: plain MC when MFMC correction is numerically invalid
+                                        state.inconsistency.(['I_MF_' samp_method]) = mc_details.p_inconsistent;
+                                    end
+                                    % Convergence curves: MC and MFMC with measured wall-clock timing
+                                    if isfield(mc_details, 'mc_convergence_checkpoints') && ...
+                                            ~isempty(mc_details.mc_convergence_checkpoints)
+                                        chk_pts = mc_details.mc_convergence_checkpoints;
+                                        state.inconsistency.mc_convergence_checkpoints              = chk_pts;
+                                        state.inconsistency.(['mc_convergence_'      samp_method])  = mc_details.mc_convergence_mc;
+                                        if has_intersection
+                                            state.inconsistency.(['mfmc_convergence_'    samp_method])  = mc_details.mc_convergence_mfmc;
+                                        end
+                                        state.inconsistency.(['mc_convergence_timing_' samp_method]) = mc_details.mc_convergence_timing_s;
+
+                                        % End-to-end MFMC runtime = AABB time + MC time
+                                        % at the first crossover checkpoint.
+                                        mfmc_total_s = NaN;
+                                        mfmc_mc_until_stop_s = NaN;
+                                        mfmc_stop_n = NaN;
+                                        try
+                                            mc_curve   = mc_details.mc_convergence_mc;
+                                            mfmc_curve = mc_details.mc_convergence_mfmc;
+                                            t_curve    = mc_details.mc_convergence_timing_s;
+                                            if ~isempty(mc_curve) && ~isempty(mfmc_curve) && ~isempty(t_curve)
+                                                target = mc_curve(end);
+                                                tol    = max(std(mc_curve), 1e-3);
+                                                crossed = find(abs(mfmc_curve - target) <= tol, 1, 'first');
+                                                if isempty(crossed)
+                                                    crossed = find(abs(mfmc_curve - target) <= 2 * tol, 1, 'first');
+                                                end
+                                                if ~isempty(crossed) && isfield(state.inconsistency, 'timing_jaccard_s')
+                                                    mfmc_mc_until_stop_s = t_curve(crossed);
+                                                    mfmc_stop_n = chk_pts(crossed);
+                                                    mfmc_total_s = state.inconsistency.timing_jaccard_s + mfmc_mc_until_stop_s;
+                                                end
+                                            end
+                                        catch
+                                            mfmc_total_s = NaN;
+                                            mfmc_mc_until_stop_s = NaN;
+                                            mfmc_stop_n = NaN;
+                                        end
+
+                                        if has_intersection && ~isnan(mfmc_total_s)
+                                            aabb_s = state.inconsistency.timing_jaccard_s;
+                                            state.inconsistency.(['timing_mfmc_' samp_method '_s'])  = mfmc_total_s;
+                                            state.inconsistency.(['timing_mfmc_' samp_method '_ms']) = 1000.0 * mfmc_total_s;
+                                            state.inconsistency.(['timing_mfmc_total_' samp_method '_s'])  = mfmc_total_s;
+                                            state.inconsistency.(['timing_mfmc_total_' samp_method '_ms']) = 1000.0 * mfmc_total_s;
+                                            state.inconsistency.(['timing_mfmc_aabb_' samp_method '_s'])   = aabb_s;
+                                            state.inconsistency.(['timing_mfmc_aabb_' samp_method '_ms'])  = 1000.0 * aabb_s;
+                                            state.inconsistency.(['timing_mfmc_mc_until_stop_' samp_method '_s'])  = mfmc_mc_until_stop_s;
+                                            state.inconsistency.(['timing_mfmc_mc_until_stop_' samp_method '_ms']) = 1000.0 * mfmc_mc_until_stop_s;
+                                            state.inconsistency.(['timing_mfmc_stop_samples_' samp_method]) = mfmc_stop_n;
+                                            if strcmp(samp_method, 'sobol')
+                                                state.inconsistency.timing_mfmc_s  = mfmc_total_s;
+                                                state.inconsistency.timing_mfmc_ms = 1000.0 * mfmc_total_s;
+                                                state.inconsistency.timing_I_MF_s  = mfmc_total_s;
+                                                state.inconsistency.timing_I_MF_ms = 1000.0 * mfmc_total_s;
+                                                state.inconsistency.timing_mfmc_total_s = mfmc_total_s;
+                                                state.inconsistency.timing_mfmc_total_ms = 1000.0 * mfmc_total_s;
+                                                state.inconsistency.timing_mfmc_aabb_s = aabb_s;
+                                                state.inconsistency.timing_mfmc_aabb_ms = 1000.0 * aabb_s;
+                                                state.inconsistency.timing_mfmc_mc_until_stop_s = mfmc_mc_until_stop_s;
+                                                state.inconsistency.timing_mfmc_mc_until_stop_ms = 1000.0 * mfmc_mc_until_stop_s;
+                                                state.inconsistency.timing_mfmc_stop_samples = mfmc_stop_n;
+                                            end
                                         end
                                     end
                                 catch ME
@@ -945,9 +1163,40 @@ classdef causal_experiment_engine_twostep
                                     state.inconsistency.(['mc_p_consistent_' samp_method]) = NaN;
                                     state.inconsistency.(['mc_p_inconsistent_' samp_method]) = NaN;
                                 end
+
+                                % === MFMC ADAPTIVE (same sampling method, fewer expensive samples) ===
+                                % Runs the containment loop with adaptive early stopping once the
+                                % MFMC SE drops below target_se.  Provides a real measured runtime
+                                % instead of a post-hoc crossover estimate.
+                                try
+                                    mfmc_opts = struct();
+                                    mfmc_opts.num_samples    = options.mc_samples;
+                                    mfmc_opts.sampling_method = samp_method;
+                                    mfmc_opts.return_details  = true;
+                                    mfmc_opts.verbose         = false;
+                                    mfmc_opts.use_mfmc        = true;
+                                    mfmc_opts.target_se       = 0.02;
+                                    if options.use_nonuniform_inner && ~isempty(fieldnames(options.inner_dist_params))
+                                        mfmc_opts.distribution = options.inner_dist_params;
+                                    end
+
+                                    t_mfmc_adaptive = tic;
+                                    [mfmc_adaptive_score, mfmc_adaptive_details] = score_mc_probability( ...
+                                        {Z_propagated, scenario.target}, mfmc_opts);
+                                    state.inconsistency.(['timing_mfmc_adaptive_' samp_method '_s']) = toc(t_mfmc_adaptive);
+
+                                    state.inconsistency.(['I_MF_adaptive_' samp_method])       = mfmc_adaptive_score;
+                                    state.inconsistency.(['mfmc_adaptive_n_used_' samp_method]) = mfmc_adaptive_details.n_used;
+                                    state.inconsistency.(['mfmc_adaptive_converged_' samp_method]) = ...
+                                        mfmc_adaptive_details.mfmc_adaptive_converged;
+                                catch ME
+                                    warning('MFMC adaptive scoring failed for %s: %s', samp_method, ME.message);
+                                    state.inconsistency.(['I_MF_adaptive_' samp_method])        = NaN;
+                                    state.inconsistency.(['mfmc_adaptive_n_used_' samp_method]) = NaN;
+                                end
                             end
                         end
-                        
+
                         % Distance between centers
                         try
                             state.inconsistency.center_distance = norm(...
@@ -1128,7 +1377,11 @@ classdef causal_experiment_engine_twostep
                         [], []);
                     
                 case 'shift'
-                    % Shift source center (relative shift: center * (1 + delta))
+                    % Shift source center by delta generator-widths per dimension.
+                    % new_center = c + delta * diag(G)
+                    % This is scale-invariant: delta=1 moves the center by exactly
+                    % one generator half-width, regardless of the center magnitude.
+                    % Supports zero-center scenarios and bidirectional shifts (delta < 0).
                     if isfield(params, 'center_delta')
                         shift_fraction = params.center_delta;
                     elseif isfield(params, 'shift')
@@ -1136,14 +1389,14 @@ classdef causal_experiment_engine_twostep
                     else
                         shift_fraction = params.delta;
                     end
-                    % Apply relative shift: new = old * (1 + shift_fraction)
-                    % This ensures consistent percentage shift across all dimensions and scenarios
+                    % Per-dimension generator widths (diagonal of G for box generators)
+                    gen_widths = diag(scenario.source.G);
                     if isscalar(shift_fraction)
-                        shift_vec = shift_fraction * ones(size(scenario.source.c));
+                        shift_vec = shift_fraction * gen_widths;
                     else
-                        shift_vec = shift_fraction;
+                        shift_vec = shift_fraction .* gen_widths;
                     end
-                    new_center = scenario.source.c .* (1 + shift_vec);
+                    new_center = scenario.source.c + shift_vec;
                     scenario_modified.source = conZonotope(...
                         new_center, ...
                         scenario.source.G, ...
@@ -1218,7 +1471,7 @@ classdef causal_experiment_engine_twostep
             % Notes:
             %   - Interventions are applied in order: scale → shift → correlation
             %   - scale_factor < 1 = shrink, > 1 = widen
-            %   - center_delta is a scalar fraction for relative shift
+            %   - center_delta is shift in generator-width units: new_c = c + delta*diag(G)
             %   - correlation_strength ∈ [0,1]
             
             if nargin < 4
@@ -1365,9 +1618,12 @@ classdef causal_experiment_engine_twostep
             %
             % New fields added to each experiment's post_state.inconsistency:
             %   I_MF_sobol, I_MF_halton, I_MF_lhs, I_MF_random  (where data exists)
+            %   timing_mfmc_sobol_s, timing_mfmc_halton_s, ...
+            %   timing_mfmc_s, timing_mfmc_ms, timing_I_MF_s, timing_I_MF_ms
             %
             % New top-level block added to each scenario file:
-            %   mfmc_summary  ->  alpha, rho, rho_sq, variance_reduction, mu_AABB
+            %   mfmc_summary  ->  alpha, rho, rho_sq, variance_reduction, mu_AABB,
+            %                     timing_s, timing_ms, timing_per_experiment_s, timing_per_experiment_ms
             %
             % The original I_MC_* values are preserved unchanged.
             %
@@ -1441,12 +1697,22 @@ classdef causal_experiment_engine_twostep
                         else
                             inc = exps(i).post_state.inconsistency;
                         end
-                        % Only mark as valid when jaccard_index is a real number.
-                        % Non-intersecting experiments (null jaccard) are excluded
+                        % Only mark as valid when a true intersection exists and
+                        % jaccard_index is a real number.
+                        % Non-intersecting experiments are excluded
                         % from MFMC estimation — the control-variate assumption
                         % requires gradation in I_AABB, which is absent when all
                         % non-intersecting cases are collapsed to 0.
-                        if isfield(inc, 'jaccard_index') && ...
+                        has_intersection = false;
+                        if isfield(inc, 'has_intersection')
+                            hi = inc.has_intersection;
+                            if islogical(hi)
+                                has_intersection = hi;
+                            elseif isnumeric(hi)
+                                has_intersection = (hi ~= 0);
+                            end
+                        end
+                        if has_intersection && isfield(inc, 'jaccard_index') && ...
                            ~isempty(inc.jaccard_index) && ...
                            isnumeric(inc.jaccard_index) && ...
                            ~isnan(inc.jaccard_index)
@@ -1471,13 +1737,17 @@ classdef causal_experiment_engine_twostep
                 mfmc_summary = struct();
                 mfmc_summary.computed_at = char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss'));
                 I_MF = NaN(n_exp, length(SAMPLING_METHODS));
+                primary_method = 'sobol';
 
                 for m = 1:length(SAMPLING_METHODS)
+                    method_name   = SAMPLING_METHODS{m};
                     mc           = I_MC(:, m);
                     % Restrict estimation to intersecting experiments
                     intersecting = jaccard_valid & ~isnan(mc);
                     if sum(intersecting) < 3, continue; end
+                    min_abs_rho = 0.05;
 
+                    t_mfmc = tic;
                     aabb_v  = I_AABB(intersecting);
                     mc_v    = mc(intersecting);
                     mu_aabb = mean(aabb_v);
@@ -1490,6 +1760,11 @@ classdef causal_experiment_engine_twostep
 
                     alpha = cov_mc_aabb / var_aabb;
                     rho   = cov_mc_aabb / (std(mc_v) * std(aabb_v) + 1e-12);
+                    alpha_raw = alpha;
+                    correction_enabled = abs(rho) >= min_abs_rho;
+                    if ~correction_enabled
+                        alpha = 0.0;
+                    end
 
                     % Apply correction only to intersecting experiments
                     I_MF_m               = NaN(n_exp, 1);
@@ -1501,28 +1776,64 @@ classdef causal_experiment_engine_twostep
                     finite_mf          = I_MF_m(~isnan(I_MF_m));
                     var_mf             = var(finite_mf);
                     variance_reduction = 1.0 - var_mf / (var_mc + 1e-12);
+                    elapsed_s          = toc(t_mfmc);
+                    elapsed_ms         = 1000.0 * elapsed_s;
+                    per_exp_s          = elapsed_s / n_exp;
+                    per_exp_ms         = 1000.0 * per_exp_s;
 
                     s                    = struct();
                     s.alpha              = alpha;
+                    s.alpha_raw          = alpha_raw;
                     s.rho                = rho;
                     s.rho_sq             = rho^2;
                     s.variance_reduction = variance_reduction;
+                    s.correction_enabled = correction_enabled;
+                    s.min_abs_rho_for_correction = min_abs_rho;
                     s.mu_AABB            = mu_aabb;
                     s.n_intersecting     = sum(intersecting);
                     s.n_experiments      = n_exp;
-                    mfmc_summary.(SAMPLING_METHODS{m}) = s;
+                    s.timing_s           = elapsed_s;
+                    s.timing_ms          = elapsed_ms;
+                    s.timing_per_experiment_s  = per_exp_s;
+                    s.timing_per_experiment_ms = per_exp_ms;
+                    mfmc_summary.(method_name) = s;
                 end
 
                 % --- Augment each experiment with I_MF_* fields ---
                 for i = 1:n_exp
                     for m = 1:length(SAMPLING_METHODS)
+                        method_name = SAMPLING_METHODS{m};
                         if isnan(I_MF(i, m)), continue; end
-                        field = sprintf('I_MF_%s', SAMPLING_METHODS{m});
+                        field = sprintf('I_MF_%s', method_name);
                         try
                             if is_cell
                                 data.experiments{i}.post_state.inconsistency.(field) = I_MF(i, m);
+                                if isfield(mfmc_summary, method_name)
+                                    per_exp_s  = mfmc_summary.(method_name).timing_per_experiment_s;
+                                    per_exp_ms = mfmc_summary.(method_name).timing_per_experiment_ms;
+                                    data.experiments{i}.post_state.inconsistency.(sprintf('timing_mfmc_%s_s', method_name))  = per_exp_s;
+                                    data.experiments{i}.post_state.inconsistency.(sprintf('timing_mfmc_%s_ms', method_name)) = per_exp_ms;
+                                    if strcmp(method_name, primary_method)
+                                        data.experiments{i}.post_state.inconsistency.timing_mfmc_s  = per_exp_s;
+                                        data.experiments{i}.post_state.inconsistency.timing_mfmc_ms = per_exp_ms;
+                                        data.experiments{i}.post_state.inconsistency.timing_I_MF_s  = per_exp_s;
+                                        data.experiments{i}.post_state.inconsistency.timing_I_MF_ms = per_exp_ms;
+                                    end
+                                end
                             else
                                 data.experiments(i).post_state.inconsistency.(field) = I_MF(i, m);
+                                if isfield(mfmc_summary, method_name)
+                                    per_exp_s  = mfmc_summary.(method_name).timing_per_experiment_s;
+                                    per_exp_ms = mfmc_summary.(method_name).timing_per_experiment_ms;
+                                    data.experiments(i).post_state.inconsistency.(sprintf('timing_mfmc_%s_s', method_name))  = per_exp_s;
+                                    data.experiments(i).post_state.inconsistency.(sprintf('timing_mfmc_%s_ms', method_name)) = per_exp_ms;
+                                    if strcmp(method_name, primary_method)
+                                        data.experiments(i).post_state.inconsistency.timing_mfmc_s  = per_exp_s;
+                                        data.experiments(i).post_state.inconsistency.timing_mfmc_ms = per_exp_ms;
+                                        data.experiments(i).post_state.inconsistency.timing_I_MF_s  = per_exp_s;
+                                        data.experiments(i).post_state.inconsistency.timing_I_MF_ms = per_exp_ms;
+                                    end
+                                end
                             end
                         catch
                             % Skip if field cannot be set

@@ -103,6 +103,10 @@ For each experiment, we measure:
 - **Monte Carlo Probability**: `P(consistent) = mc_p_consistent`, `P(inconsistent) = mc_p_inconsistent`
   - Statistical estimation with 300 samples
   - Includes standard error and 95% confidence intervals
+  - **Inner sampling distribution** (optional extension, disabled by default): by default `score_mc_probability`
+    auto-fits a Gaussian centred on the union bounding box.  Set `use_nonuniform_inner = true` and supply
+    `inner_dist_params` (struct with `.mu`, `.Sigma`) to use an explicitly specified distribution instead,
+    e.g. fitted from real sensor data.  All baseline results use the default uniform-box Gaussian.
 - Emptiness: Boolean indicator of intersection failure (hard constraint violation)
 - Center distance: `||center(Z_propagated) - center(Z_old)||` (geometric separation independent of volume)
 - Volume ratio: Relative size of intersection (captures degree of agreement)

@@ -1,11 +1,11 @@
-# CONVIDE Scenarios - Engineering Applications
+# Engineering Scenarios - Engineering Applications
 
 **Last Updated**: February 9, 2026  
 **Status**: Production - 8 Scenarios Implemented (4 × 2D, 4 × 3D)
 
 ## Overview
 
-**CONVIDE** (CONstrained VIrtual DEvelopment) scenarios provide physically realistic engineering contexts for testing causal uncertainty-inconsistency relationships. Each scenario represents a real cyber-physical system with:
+**Engineering** (CONstrained VIrtual DEvelopment) scenarios provide physically realistic engineering contexts for testing causal uncertainty-inconsistency relationships. Each scenario represents a real cyber-physical system with:
 - Authentic propagation rules (UPRs)
 - Engineering-relevant constraints
 - Realistic uncertainty characteristics
@@ -18,7 +18,7 @@
 
 ```matlab
 scenario = struct();
-scenario.id = 'convide_2d_1';
+scenario.id = 'engineering_2d_1';
 scenario.name = 'Robot End-Effector Positioning';
 scenario.dimension = 2;
 scenario.family = 'forward';
@@ -193,12 +193,12 @@ correlation_strength = [0.0, 0.1, 0.2, ..., 0.999];
 ## Data Generation
 
 ```matlab
-% Generate all CONVIDE scenarios
-generate_convide_scenarios('output_dir', 'data/convide_2d_scenarios', ...
+% Generate all Engineering scenarios
+generate_engineering_scenarios('output_dir', 'data/engineering_2d_scenarios', ...
                            'dimensions', 2);
-generate_convide_scenarios('output_dir', 'data/convide_3d_scenarios', ...
+generate_engineering_scenarios('output_dir', 'data/engineering_3d_scenarios', ...
                            'dimensions', 3);
-generate_convide_scenarios('output_dir', 'data/convide_4d_scenarios', ...
+generate_engineering_scenarios('output_dir', 'data/engineering_4d_scenarios', ...
                            'dimensions', 4);
 ```
 
@@ -211,10 +211,10 @@ generate_convide_scenarios('output_dir', 'data/convide_4d_scenarios', ...
 ### Metadata Fields
 
 Each scenario includes:
-- `id`: Unique identifier (e.g., 'convide_2d_1')
+- `id`: Unique identifier (e.g., 'engineering_2d_1')
 - `name`: Human-readable description
 - `dimension`: 2, 3, or 4
-- `family`: 'forward' (all CONVIDE scenarios)
+- `family`: 'forward' (all Engineering scenarios)
 - `engineering_context`: Real-world application
 - `constraint_source`: Physical/safety constraint rationale
 - `uncertainty_sources`: List of physical uncertainty contributors
@@ -234,16 +234,16 @@ Each scenario includes:
 
 ```
 data/
-├── convide_with_I_theta/
-│   ├── results_convide_2d_scenario_1.json    # CAD Export Drift
-│   ├── results_convide_2d_scenario_2.json    # MBSE Version Mismatch
-│   ├── results_convide_2d_scenario_3.json    # Documentation Sync
-│   └── results_convide_2d_scenario_4.json    # Control Design Conflict
-└── convide_balanced/
-    ├── results_convide_3d_scenario_5.json    # IMU orientation (3D)
-    ├── results_convide_3d_scenario_6.json    # Multi-sensor fusion (3D)
-    ├── results_convide_3d_scenario_7.json    # Robotic welding (3D)
-    └── results_convide_3d_scenario_8.json    # Chemical reactor (3D)
+├── engineering_with_I_theta/
+│   ├── results_engineering_2d_scenario_1.json    # CAD Export Drift
+│   ├── results_engineering_2d_scenario_2.json    # MBSE Version Mismatch
+│   ├── results_engineering_2d_scenario_3.json    # Documentation Sync
+│   └── results_engineering_2d_scenario_4.json    # Control Design Conflict
+└── engineering_balanced/
+    ├── results_engineering_3d_scenario_5.json    # IMU orientation (3D)
+    ├── results_engineering_3d_scenario_6.json    # Multi-sensor fusion (3D)
+    ├── results_engineering_3d_scenario_7.json    # Robotic welding (3D)
+    └── results_engineering_3d_scenario_8.json    # Chemical reactor (3D)
 ```
 
 ### JSON Format
@@ -289,17 +289,17 @@ data/
 
 ### MATLAB: Generate Data
 ```matlab
-% Generate CONVIDE scenarios
-generate_convide_examples
+% Generate Engineering scenarios
+generate_engineering_examples
 ```
 
 ### Python: Sensitivity Analysis
 ```bash
 # Analyze 2D data
-python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_with_I_theta --output_dir results/sensitivity_2d --param param_value
 
 # Analyze 3D data
-python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_balanced --output_dir results/sensitivity_3d --param param_value
 ```
 
 ### Load and Inspect Results
@@ -307,7 +307,7 @@ python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir
 import json
 
 # Load data
-with open('data/convide_with_I_theta/results_convide_2d_scenario_1.json') as f:
+with open('data/engineering_with_I_theta/results_engineering_2d_scenario_1.json') as f:
     data = json.load(f)
 
 # Extract I_theta values
@@ -329,6 +329,6 @@ print(f'I_theta range: [{min(I_theta_values):.3f}, {max(I_theta_values):.3f}]')
 
 ## See Also
 
-- [examples/generate_convide_scenarios.m](../examples/generate_convide_scenarios.m) - Generation script
+- [examples/generate_engineering_scenarios.m](../examples/generate_engineering_scenarios.m) - Generation script
 - [FRAMEWORK_OVERVIEW.md](FRAMEWORK_OVERVIEW.md) - Overall framework
 - [METHODOLOGY.md](METHODOLOGY.md) - Experimental methodology

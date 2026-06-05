@@ -20,7 +20,7 @@ test_bidirectional_causality.m   % Comprehensive test of all intervention types
 Generate training data for neural surrogate models:
 
 ```matlab
-generate_convide_scenarios.m              % ✅ v1.1: CONVIDE benchmark (12 scenarios, ~1,680 experiments, bidirectional)
+generate_engineering_scenarios.m              % ✅ v1.1: Engineering benchmark (12 scenarios, ~1,680 experiments, bidirectional)
 generate_constrained_scenarios.m          % ✅ v2.1: Constrained scenarios (15 scenarios, ~30,000 experiments, bidirectional)  
 generate_extreme_scenarios.m              % ✅ v2.1: Extreme interventions (9 scenarios, ~2,000 experiments, bidirectional)
 ```
@@ -51,9 +51,9 @@ generate_3d_4d_test_data.m           % OLD: Merged into main generators
 
 ```
 ../data/
-├── convide_2d_scenarios/
-├── convide_3d_scenarios/
-├── convide_4d_scenarios/
+├── engineering_2d_scenarios/
+├── engineering_3d_scenarios/
+├── engineering_4d_scenarios/
 ├── constrained_2d_scenarios/
 ├── constrained_3d_scenarios/
 ├── constrained_4d_scenarios/
@@ -80,10 +80,10 @@ generate_3d_4d_test_data.m           % OLD: Merged into main generators
 
 ## Usage Examples
 
-### Generate CONVIDE data:
+### Generate Engineering data:
 ```matlab
 cd examples/
-run('generate_convide_scenarios.m')
+run('generate_engineering_scenarios.m')
 ```
 
 ### Quick demo:

@@ -99,7 +99,7 @@ classdef causal_experiment_engine_twostep
             baseline_scenario.target = scenario_def.target;
             if isfield(scenario_def, 'mapping') && isstruct(scenario_def.mapping) && ...
                     isfield(scenario_def.mapping, 'F')
-                % Use the mapping provided by the scenario definition (CPS dataset or CONVIDE)
+                % Use the mapping provided by the scenario definition (CPS dataset or Engineering)
                 baseline_scenario.mapping = scenario_def.mapping;
             else
                 % Fall back to identity mapping aligned to source/target centers
@@ -112,7 +112,7 @@ classdef causal_experiment_engine_twostep
             % Flatten experiments for optional parallelization
             experiments = [];
             
-            % Check if Saltelli mode (struct) or CONVIDE mode (cell array)
+            % Check if Saltelli mode (struct) or Engineering mode (cell array)
             if isstruct(interventions) && isfield(interventions, 'mode') && strcmp(interventions.mode, 'saltelli')
                 % SALTELLI MODE: Use compound interventions from samples
                 saltelli_samples = interventions.samples;
@@ -132,7 +132,7 @@ classdef causal_experiment_engine_twostep
                     end
                 end
             else
-                % CONVIDE MODE: Use discrete interventions
+                % ENGINEERING MODE: Use discrete interventions
                 for i = 1:length(interventions)
                     int = interventions{i};
                     for val_idx = 1:length(int.values)
@@ -174,7 +174,7 @@ classdef causal_experiment_engine_twostep
                         
                     exp = experiments(exp_id);
                     
-                    % Apply intervention (handle both CONVIDE and Saltelli modes)
+                    % Apply intervention (handle both Engineering and Saltelli modes)
                     if strcmp(exp.intervention_type, 'compound')
                         % SALTELLI MODE: Compound intervention
                         theta_vector = [exp.scale_factor, exp.center_delta, exp.correlation_strength];
@@ -182,7 +182,7 @@ classdef causal_experiment_engine_twostep
                         scenario_modified = causal_experiment_engine_twostep.apply_compound_intervention(...
                             baseline_scenario, theta_vector, param_names);
                     else
-                        % CONVIDE MODE: Discrete intervention
+                        % ENGINEERING MODE: Discrete intervention
                         params = struct(exp.param_name, exp.param_value);
                         scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
                             baseline_scenario, exp.intervention_type, params);
@@ -221,7 +221,7 @@ classdef causal_experiment_engine_twostep
                     zono_data.intervention_type = exp.intervention_type;
                     zono_data.repeat_idx = exp.repeat_idx;
                     
-                    % Store intervention parameters (different for CONVIDE vs Saltelli)
+                    % Store intervention parameters (different for Engineering vs Saltelli)
                     if strcmp(exp.intervention_type, 'compound')
                         zono_data.scale_factor = exp.scale_factor;
                         zono_data.center_delta = exp.center_delta;
@@ -265,7 +265,7 @@ classdef causal_experiment_engine_twostep
                     zono_metadata.intervention_type = exp.intervention_type;
                     zono_metadata.repeat_idx = exp.repeat_idx;
                     
-                    % Store intervention value (different for CONVIDE vs Saltelli) 
+                    % Store intervention value (different for Engineering vs Saltelli) 
                     if strcmp(exp.intervention_type, 'compound')
                         zono_metadata.scale_factor = exp.scale_factor;
                         zono_metadata.center_delta = exp.center_delta;
@@ -302,7 +302,7 @@ classdef causal_experiment_engine_twostep
                         fprintf('    Progress: %d/%d\n', exp_id, n_total);
                     end
                     
-                    % Apply intervention (handle both CONVIDE and Saltelli modes)
+                    % Apply intervention (handle both Engineering and Saltelli modes)
                     if strcmp(exp.intervention_type, 'compound')
                         % SALTELLI MODE: Compound intervention
                         theta_vector = [exp.scale_factor, exp.center_delta, exp.correlation_strength];
@@ -310,7 +310,7 @@ classdef causal_experiment_engine_twostep
                         scenario_modified = causal_experiment_engine_twostep.apply_compound_intervention(...
                             baseline_scenario, theta_vector, param_names);
                     else
-                        % CONVIDE MODE: Discrete intervention
+                        % ENGINEERING MODE: Discrete intervention
                         params = struct(exp.param_name, exp.param_value);
                         scenario_modified = causal_experiment_engine_twostep.apply_intervention(...
                             baseline_scenario, exp.intervention_type, params);
@@ -349,7 +349,7 @@ classdef causal_experiment_engine_twostep
                     zono_data.intervention_type = exp.intervention_type;
                     zono_data.repeat_idx = exp.repeat_idx;
                     
-                    % Store intervention parameters (different for CONVIDE vs Saltelli)
+                    % Store intervention parameters (different for Engineering vs Saltelli)
                     if strcmp(exp.intervention_type, 'compound')
                         zono_data.scale_factor = exp.scale_factor;
                         zono_data.center_delta = exp.center_delta;
@@ -392,7 +392,7 @@ classdef causal_experiment_engine_twostep
                     zono_metadata.intervention_type = exp.intervention_type;
                     zono_metadata.repeat_idx = exp.repeat_idx;
                     
-                    % Store intervention value (different for CONVIDE vs Saltelli)
+                    % Store intervention value (different for Engineering vs Saltelli)
                     if strcmp(exp.intervention_type, 'compound')
                         zono_metadata.scale_factor = exp.scale_factor;
                         zono_metadata.center_delta = exp.center_delta;
@@ -623,7 +623,7 @@ classdef causal_experiment_engine_twostep
                     result.intervention_type = zono_data.intervention_type;
                     result.intervention_direction = 'forward';
                     
-                    % Store intervention parameters (different for CONVIDE vs Saltelli)
+                    % Store intervention parameters (different for Engineering vs Saltelli)
                     if strcmp(zono_data.intervention_type, 'compound')
                         result.scale_factor = zono_data.scale_factor;
                         result.center_delta = zono_data.center_delta;
@@ -737,7 +737,7 @@ classdef causal_experiment_engine_twostep
                         result.intervention_type = zono_data.intervention_type;
                         result.intervention_direction = 'forward';
                         
-                        % Store intervention parameters (different for CONVIDE vs Saltelli)
+                        % Store intervention parameters (different for Engineering vs Saltelli)
                         if strcmp(zono_data.intervention_type, 'compound')
                             result.scale_factor = zono_data.scale_factor;
                             result.center_delta = zono_data.center_delta;

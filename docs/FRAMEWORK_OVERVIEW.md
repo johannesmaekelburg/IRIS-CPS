@@ -141,7 +141,7 @@ import subprocess
 # Analyze 2D data
 subprocess.run([
     'python', 'src/sensitivity_analysis.py',
-    '--data_dir', 'data/convide_with_I_theta',
+    '--data_dir', 'data/engineering_with_I_theta',
     '--output_dir', 'results/sensitivity_2d',
     '--param', 'param_value'
 ])
@@ -149,7 +149,7 @@ subprocess.run([
 # Analyze 3D data
 subprocess.run([
     'python', 'src/sensitivity_analysis.py',
-    '--data_dir', 'data/convide_balanced',
+    '--data_dir', 'data/engineering_balanced',
     '--output_dir', 'results/sensitivity_3d',
     '--param', 'param_value'
 ])
@@ -164,7 +164,7 @@ subprocess.run([
 ✅ **Graded Metrics**: Jaccard index for sensitivity analysis  
 ✅ **Multi-dimensional**: Supports 2D, 3D, 4D scenarios  
 ✅ **Hybrid Architecture**: MATLAB (computation) + Python (analysis)  
-✅ **Engineering Contexts**: CONVIDE scenarios from real applications  
+✅ **Engineering Contexts**: Engineering scenarios from real applications  
 
 ---
 
@@ -172,11 +172,11 @@ subprocess.run([
 
 ```
 src/causal_experiment_engine.m    - Core intervention & measurement engine
-examples/generate_convide_scenarios.m - CONVIDE engineering scenarios
+examples/generate_engineering_scenarios.m - Engineering engineering scenarios
 examples/demo_quick_start.m       - Quick demonstration
 src/causal_analysis.py            - Python statistical analysis
 models/                           - Trained neural encoders
-data/convide_*_scenarios/         - Generated experiment data
+data/engineering_*_scenarios/         - Generated experiment data
 ```
 
 ---
@@ -185,7 +185,7 @@ data/convide_*_scenarios/         - Generated experiment data
 
 ```matlab
 % 1. Load or create scenario
-scenario = load('data/convide_2d_scenarios/scenario_2d_1.mat');
+scenario = load('data/engineering_2d_scenarios/scenario_2d_1.mat');
 
 % 2. Run widen intervention sweep
 scales = logspace(log10(0.2), log10(20), 20);
@@ -247,13 +247,13 @@ delta = compute_delta(pre, post);
 
 ## Current Datasets
 
-**2D Scenarios** (`convide_with_I_theta/`):
+**2D Scenarios** (`engineering_with_I_theta/`):
 - Scenario 1: CAD Export Drift (Type A)
 - Scenario 2: MBSE Version Mismatch (Type B)
 - Scenario 3: Documentation Sync (Type B)
 - Scenario 4: Control Design Conflict (Type C)
 
-**3D Scenarios** (`convide_balanced/`):
+**3D Scenarios** (`engineering_balanced/`):
 - Scenario 5: IMU Orientation Estimation
 - Scenario 6: Multi-Sensor Fusion
 - Scenario 7: 3D Robotic Welding
@@ -271,7 +271,7 @@ delta = compute_delta(pre, post);
 
 - Pearl, J. (2009). *Causality: Models, Reasoning, and Inference*
 - Althoff, M. (2015). *CORA: Constrained Reachability Analysis*
-- Sharma, R. et al. (2023). *CONVIDE Engineering Scenarios*
+- Sharma, R. et al. (2023). *Engineering Engineering Scenarios*
 
 ---
 

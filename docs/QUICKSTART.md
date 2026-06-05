@@ -43,18 +43,18 @@ python causal_orchestrator.py
 
 ## Three Ways to Use
 
-### 1. MATLAB: Generate CONVIDE Data
+### 1. MATLAB: Generate Engineering Data
 
 ```matlab
 % Navigate to examples folder
 cd examples
 
-% Generate CONVIDE scenarios with I_theta metric
-generate_convide_examples
+% Generate Engineering scenarios with I_theta metric
+generate_engineering_examples
 
 % This creates:
-% - data/convide_with_I_theta/ (2D scenarios 1-4)
-% - data/convide_balanced/ (3D scenarios 5-8)
+% - data/engineering_with_I_theta/ (2D scenarios 1-4)
+% - data/engineering_balanced/ (3D scenarios 5-8)
 ```
 
 **Use when:** You need to generate experimental data with interventions
@@ -66,10 +66,10 @@ generate_convide_examples
 cd Causality_Uncertainty_Inconsistency
 
 # Analyze 2D data
-python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_with_I_theta --output_dir results/sensitivity_2d --param param_value
 
 # Analyze 3D data  
-python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_balanced --output_dir results/sensitivity_3d --param param_value
 ```
 
 **Outputs:**
@@ -77,7 +77,7 @@ python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir
 - Statistical analysis of causal effects
 - Delta metrics (delta_I_theta, delta_jaccard, delta_volume)
 
-**Use when:** You have generated CONVIDE data and want to analyze causality
+**Use when:** You have generated Engineering data and want to analyze causality
 
 ### 3. Data Inspection and Visualization
 
@@ -86,7 +86,7 @@ import json
 import matplotlib.pyplot as plt
 
 # Load data
-with open('data/convide_with_I_theta/results_convide_2d_scenario_1.json') as f:
+with open('data/engineering_with_I_theta/results_engineering_2d_scenario_1.json') as f:
     data = json.load(f)
 
 # Extract metrics
@@ -119,7 +119,7 @@ plt.show()
 
 ```bash
 # Run sensitivity analysis on 2D scenario 1 (CAD Export Drift)
-python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_with_I_theta --output_dir results/sensitivity_2d --param param_value
 ```
 
 **Expected Finding:**
@@ -140,8 +140,8 @@ Param Value | I_theta  | Jaccard  | Interpretation
 
 ```bash
 # Analyze both datasets
-python src/sensitivity_analysis.py --data_dir data/convide_with_I_theta --output_dir results/sensitivity_2d --param param_value
-python src/sensitivity_analysis.py --data_dir data/convide_balanced --output_dir results/sensitivity_3d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_with_I_theta --output_dir results/sensitivity_2d --param param_value
+python src/sensitivity_analysis.py --data_dir data/engineering_balanced --output_dir results/sensitivity_3d --param param_value
 
 # Compare results
 python -c "
@@ -149,12 +149,12 @@ import json
 import numpy as np
 
 # Load 2D results
-with open('data/convide_with_I_theta/results_convide_2d_scenario_1.json') as f:
+with open('data/engineering_with_I_theta/results_engineering_2d_scenario_1.json') as f:
     data_2d = json.load(f)
 I_theta_2d = [exp['pre_inconsistency']['I_theta'] for exp in data_2d['experiments']]
 
 # Load 3D results
-with open('data/convide_balanced/results_convide_3d_scenario_5.json') as f:
+with open('data/engineering_balanced/results_engineering_3d_scenario_5.json') as f:
     data_3d = json.load(f)
 I_theta_3d = [exp['pre_inconsistency']['I_theta'] for exp in data_3d['experiments']]
 

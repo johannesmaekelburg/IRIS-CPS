@@ -6,7 +6,7 @@ Zonotope-based reachability tools can fail silently when input uncertainty grows
 
 ## Features
 
-- CONVIDE scenarios (2D, 3D, 4D) covering automotive, aerospace, robotics, and other CPS domains
+- Engineering scenarios (2D, 3D, 4D) covering automotive, aerospace, robotics, and other CPS domains
 - Global inconsistency metric I(θ) with Monte Carlo and multi-fidelity (MFMC) estimation
 - Sobol variance-based sensitivity analysis
 - Neural surrogate for fast I(θ) prediction (several interchangeable architectures)
@@ -25,7 +25,7 @@ src/
 surrogate/                      # Neural surrogate: training, evaluation, recourse
 examples/                       # MATLAB data generation scripts
 data/
-  measurements_v6/              # CONVIDE training measurements
+  measurements_v6/              # Engineering training measurements
   measurements_cps_v6/          # CPS domain training measurements
   measurements_cps_full/        # Full CPS measurements
   CPS-uncertainty-dataset/      # CPS uncertainty scenario definitions
@@ -63,7 +63,7 @@ run_all_scenarios
 Or generate individual scenario sets:
 
 ```matlab
-generate_convide_twostep          % CONVIDE 2D / 3D / 4D scenarios
+generate_engineering_twostep          % Engineering 2D / 3D / 4D scenarios
 generate_cps_domains_twostep      % CPS engineering domain scenarios
 generate_synthetic_v6_twostep     % Synthetic data
 ```
@@ -207,4 +207,4 @@ Main packages: `numpy`, `scipy`, `torch`, `matplotlib`, `pandas`, `scikit-learn`
 - [QUICKSTART.md](docs/QUICKSTART.md) - Getting started guide
 - [METHODOLOGY.md](docs/METHODOLOGY.md) - Theoretical foundation and I(θ) metric
 - [FRAMEWORK_OVERVIEW.md](docs/FRAMEWORK_OVERVIEW.md) - System architecture and data flow
-- [CONVIDE_SCENARIOS.md](docs/CONVIDE_SCENARIOS.md) - Engineering scenarios explained
+- [Engineering_SCENARIOS.md](docs/Engineering_SCENARIOS.md) - Engineering scenarios explained

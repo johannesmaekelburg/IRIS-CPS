@@ -333,7 +333,7 @@ def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None, files=None):
             "water_chemical_process_full": "Water/Chemical",
             "wind_turbine_full":           "Wind Turbine",
         }
-        _CONVIDE_FB = {
+        _ENGINEERING_FB = {
             "cad export drift":                "CAD Export Drift",
             "mbse version mismatch":           "MBSE Mismatch",
             "documentation sync":              "Doc. Sync",
@@ -362,9 +362,9 @@ def _load_timing_and_sobol(data_dirs, acc, max_scenarios=None, files=None):
                 for label in _SRC2DOM_FB.values():
                     if desc.lower().startswith(label.lower()):
                         return label
-                # CONVIDE: "CAD Export Drift (low-pre)"
+                # Engineering: "CAD Export Drift (low-pre)"
                 desc_clean = _re.sub(r'\(.*?\)', '', desc).strip().lower()
-                for key, label in _CONVIDE_FB.items():
+                for key, label in _ENGINEERING_FB.items():
                     if key in desc_clean:
                         return label
             # Try nested experiments
@@ -854,7 +854,7 @@ def _per_scenario_accuracy(file_list, model, device, label_key="I_theta",
                 domain = exp0[key]; break
         if domain == "unknown":
             parent = Path(jf).parent.name
-            domain = "CPS" if "cps" in parent.lower() else "CONVIDE"
+            domain = "CPS" if "cps" in parent.lower() else "Engineering"
 
         preds, refs = [], []
         for exp in data["experiments"]:
@@ -3635,7 +3635,7 @@ def _cf_domain_short(domain: str) -> str:
         "mbse":                "MBSE",
         "sensor":              "Sensor",
         "systems engineering": "SysEng",
-        "convide":             "ConVIDe",
+        "engineering":             "ConVIDe",
     }
     low = domain.lower()
     for key, short in _MAP.items():

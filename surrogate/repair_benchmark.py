@@ -68,7 +68,7 @@ _UB = np.array([b[1] for b in PARAM_BOUNDS], dtype=np.float64)
 _SPAN = _UB - _LB
 
 # Paper evaluation set: HVAC (Fig 15) + the held-out joint_2d3d validation
-# scenarios. All are 2D CPS except scenario_7 (the 3D CONVIDE holdout); all route
+# scenarios. All are 2D CPS except scenario_7 (the 3D Engineering holdout); all route
 # to the 2d3d model. Scenarios with no moderate-inconsistency region simply yield
 # zero repair problems and are skipped.
 EVAL_SCENARIOS_2D3D = [
@@ -84,7 +84,7 @@ EVAL_SCENARIOS_2D3D = [
     "data/measurements_cps_v6/results_scenario_62.json",   # satellite aerospace
     "data/measurements_cps_v6/results_scenario_51.json",   # building HVAC
     "data/measurements_cps_v6/results_scenario_58.json",   # railway
-    "data/measurements_v6/results_scenario_7.json",        # CONVIDE 3D holdout
+    "data/measurements_v6/results_scenario_7.json",        # Engineering 3D holdout
 ]
 
 

@@ -35,7 +35,7 @@ UPR type classes (8)
     4 guarded
     5 constraint_based
     6 disambiguation
-    7 unknown          (CONVIDE scenarios or missing consistency_relations)
+    7 unknown          (Engineering scenarios or missing consistency_relations)
 """
 
 import json
@@ -220,7 +220,7 @@ class ZonotopeDataset(Dataset):
                             t = rel.get("upr_type", "unknown")
                             dominant_type = t
                     upr_onehot = _upr_onehot(dominant_type)
-                # else: CONVIDE or missing → all defaults (scale=1, offset=0, unknown)
+                # else: Engineering or missing → all defaults (scale=1, offset=0, unknown)
                 # --------------------------------------------------------------
 
                 per_dim, global_feats = _make_features(

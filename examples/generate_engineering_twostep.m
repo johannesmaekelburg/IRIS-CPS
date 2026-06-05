@@ -1,7 +1,7 @@
-% GENERATE CONVIDE SCENARIOS - TWO STEP WORKFLOW
+% GENERATE Engineering SCENARIOS - TWO STEP WORKFLOW
 %
 % This script supports two modes:
-%   1. CONVIDE Mode (use_saltelli_mode=false): Discrete interventions (widen, shrink, shift, correlate)
+%   1. Engineering Mode (use_saltelli_mode=false): Discrete interventions (widen, shrink, shift, correlate)
 %   2. Saltelli Mode (use_saltelli_mode=true): Continuous compound interventions for sensitivity analysis
 %
 % Two-step approach:
@@ -12,7 +12,7 @@
 %   - Try different consistency methods without regenerating zonotopes
 %   - Add new metrics later without redoing interventions
 %   - Faster iteration on analysis
-%   - Unified workflow for both CONVIDE and Saltelli experiments
+%   - Unified workflow for both Engineering and Saltelli experiments
 %
 % Version: 6.0 (Integrated Saltelli support)
 % Date: March 2026
@@ -42,7 +42,7 @@ if ~exist('low_pre_pilot_scenarios', 'var'), low_pre_pilot_scenarios = [1, 5, 9]
 if ~exist('low_pre_pilot_mc_samples', 'var'), low_pre_pilot_mc_samples = 300; end
 
 % Saltelli Sampling Mode (for sensitivity analysis)
-if ~exist('use_saltelli_mode', 'var'), use_saltelli_mode = true; end  % TRUE: Use Saltelli compound interventions, FALSE: Use discrete CONVIDE interventions
+if ~exist('use_saltelli_mode', 'var'), use_saltelli_mode = true; end  % TRUE: Use Saltelli compound interventions, FALSE: Use discrete Engineering interventions
 if ~exist('saltelli_samples_file', 'var'), saltelli_samples_file = fullfile(fileparts(fileparts(mfilename('fullpath'))), 'data', 'saltelli_samples_3param_v6.csv'); end  % Path to CSV file with Saltelli samples
 if ~exist('saltelli_params', 'var'), saltelli_params = {'scale_factor', 'center_delta', 'correlation_strength'}; end
 
@@ -88,9 +88,9 @@ if use_saltelli_mode
     fprintf('========================================\n');
     fprintf('Mode: Saltelli compound interventions\n');
 else
-    fprintf('TWO-STEP CONVIDE DATA GENERATION\n');
+    fprintf('TWO-STEP Engineering DATA GENERATION\n');
     fprintf('========================================\n');
-    fprintf('Mode: CONVIDE discrete interventions\n');
+    fprintf('Mode: Engineering discrete interventions\n');
 end
 fprintf('Step 1: Generate zonotopes (run_step1=%d)\n', run_step1);
 fprintf('Step 2: Compute consistency (run_step2=%d)\n', run_step2);
@@ -259,7 +259,7 @@ if use_saltelli_mode
     interventions = struct('mode', 'saltelli', 'samples', saltelli_data, 'params', {saltelli_params});
     fprintf('  ✓ Loaded %d compound interventions\n\n', height(saltelli_data));
 else
-    % CONVIDE Mode: Use discrete intervention values
+    % Engineering Mode: Use discrete intervention values
     if low_pre_pilot_mode
         % Minimal intervention set for quick baseline check (identity-like).
         interventions = {
@@ -323,7 +323,7 @@ if run_step1
                 'target', conZonotope([60.8; 30.8], [1.5 0; 0 1.5], [], []));
         };
 
-        % Assign UPR mappings (affine F, f) — matches causal_engine.py create_convide_scenarios()
+        % Assign UPR mappings (affine F, f) — matches causal_engine.py create_engineering_scenarios()
         a2d = 5 * pi / 180;
         R2d = [cos(a2d), -sin(a2d); sin(a2d), cos(a2d)];
         scenarios_2d{1}.mapping = struct('F', {eye(2)},              'f', {zeros(2,1)});   % S1: identity
@@ -428,7 +428,7 @@ if run_step1
                 'target', conZonotope([90.6; 45.6; 22.6], diag([2.2, 2.2, 1.1]), [], []));
         };
 
-        % Assign UPR mappings — matches causal_engine.py create_convide_scenarios()
+        % Assign UPR mappings — matches causal_engine.py create_engineering_scenarios()
         a3d = 5 * pi / 180;
         R3d = [cos(a3d), -sin(a3d), 0; sin(a3d), cos(a3d), 0; 0, 0, 1];
         scenarios_3d{1}.mapping = struct('F', {eye(3)},                    'f', {zeros(3,1)});          % S5: identity
@@ -533,7 +533,7 @@ if run_step1
                 'target', conZonotope([75.6; 38.6; 19.6; 9.6], diag([2.2, 2.2, 1.1, 0.55]), [], []));
         };
 
-        % Assign UPR mappings — matches causal_engine.py create_convide_scenarios()
+        % Assign UPR mappings — matches causal_engine.py create_engineering_scenarios()
         a4d = 5 * pi / 180;
         b4d = 3 * pi / 180;
         R4d = [cos(a4d), -sin(a4d), 0, 0; sin(a4d), cos(a4d), 0, 0; ...

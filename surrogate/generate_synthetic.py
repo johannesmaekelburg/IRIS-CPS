@@ -147,7 +147,7 @@ class ScenarioConfig:
 def create_generators(rng, dim, n_gens, gen_type):
     """Create a generator matrix G of shape (dim, n_gens).
 
-    Calibrated to real CONVIDE 3D/4D data: near-diagonal with
+    Calibrated to real Engineering 3D/4D data: near-diagonal with
     diag_ratio≈0.93, gen_scale p50≈2.2, p95≈6.5.
     """
     scales = np.exp(rng.uniform(np.log(0.4), np.log(7.0), size=dim))
@@ -212,7 +212,7 @@ def create_scenario_geometry(rng, cfg: ScenarioConfig):
     G_prop = F @ G_src
 
     # ── Target generators: derived from propagated source ──
-    # Real CONVIDE data: target aligned with source, width_ratio mean≈1.5 std≈0.85
+    # Real Engineering data: target aligned with source, width_ratio mean≈1.5 std≈0.85
     n_tgt = cfg.n_gens_tgt
     G_tgt = G_prop[:, :n_tgt].copy()
 
@@ -432,7 +432,7 @@ def build_scenario_configs(
     configs = []
     idx = 1
 
-    # Real CONVIDE 3D/4D: diag_ratio=0.93 → mostly near_diagonal
+    # Real Engineering 3D/4D: diag_ratio=0.93 → mostly near_diagonal
     gen_types = ["near_diagonal"] * 70 + ["diagonal"] * 25 + ["dense"] * 5
     # Real data: almost all identity UPR
     f_types = ["identity"] * 90 + ["near_identity"] * 10

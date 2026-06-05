@@ -591,7 +591,7 @@ def plot_combined_sobol_by_domain(sobol_a: list, sobol_b: list,
     separated by a bold horizontal rule.
 
     domain_remap_b: optional dict mapping domain names in sobol_b to a merged
-        label, e.g. {"Phys. Coupling": "CONVIDE", "Spec. Gap": "CONVIDE"}.
+        label, e.g. {"Phys. Coupling": "Engineering", "Spec. Gap": "Engineering"}.
         All records whose domain maps to the same target are pooled together.
     """
     if not sobol_a and not sobol_b:
@@ -1099,7 +1099,7 @@ def plot_auroc_ap_by_domain(acc_a: dict, domain_a: np.ndarray,
 
     print(f"\n[Separated] AUROC / AP by domain (gamma={threshold})...")
 
-    # Apply domain remapping for model B (e.g. merge 4D CONVIDE → "Engineering")
+    # Apply domain remapping for model B (e.g. merge 4D Engineering → "Engineering")
     if domain_remap_b and len(domain_b):
         domain_b = np.array([domain_remap_b.get(d, d) for d in domain_b])
 
@@ -1244,7 +1244,7 @@ def plot_pr_curves(acc_a: dict, domain_a: np.ndarray,
     domain_a_arr = np.asarray(domain_a) if not isinstance(domain_a, np.ndarray) else domain_a
     domain_b_arr = np.asarray(domain_b) if not isinstance(domain_b, np.ndarray) else domain_b
 
-    # Apply domain remapping for model B (e.g. merge 4D CONVIDE → "Engineering")
+    # Apply domain remapping for model B (e.g. merge 4D Engineering → "Engineering")
     if domain_remap_b and len(domain_b_arr):
         domain_b_arr = np.array([domain_remap_b.get(d, d) for d in domain_b_arr])
 
@@ -2359,8 +2359,8 @@ Plot names (--plots):
     def want(name):
         return name in requested
 
-    # Shared remap: merge all 4D CONVIDE domain labels into "Engineering"
-    _convide_4d_remap = {
+    # Shared remap: merge all 4D Engineering domain labels into "Engineering"
+    _engineering_4d_remap = {
         "Phys. Coupling": "Engineering",
         "Spec. Gap":      "Engineering",
         "Param. Bias":    "Engineering",
@@ -2408,7 +2408,7 @@ Plot names (--plots):
             domain_short_b=db["domain_short"],
             domain_order_a=da["domain_order"],
             domain_order_b=db["domain_order"],
-            domain_remap_b=_convide_4d_remap,
+            domain_remap_b=_engineering_4d_remap,
         )
 
     if want("sensitivity_compare"):
@@ -2448,7 +2448,7 @@ Plot names (--plots):
             domain_short_b=db["domain_short"],
             domain_order_a=da["domain_order"],
             domain_order_b=db["domain_order"],
-            domain_remap_b=_convide_4d_remap,
+            domain_remap_b=_engineering_4d_remap,
         )
 
     if want("pr_curves"):
@@ -2460,7 +2460,7 @@ Plot names (--plots):
             domain_short_b=db["domain_short"],
             domain_order_a=da["domain_order"],
             domain_order_b=db["domain_order"],
-            domain_remap_b=_convide_4d_remap,
+            domain_remap_b=_engineering_4d_remap,
         )
 
     if want("table_acc_by_dim"):

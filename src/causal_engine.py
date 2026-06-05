@@ -359,8 +359,8 @@ class Scenario:
         self.dim = self.source.dim
 
 
-def create_convide_scenarios() -> List[Scenario]:
-    """Reproduce the 12 CONVIDE scenarios from generate_convide_twostep.m.
+def create_engineering_scenarios() -> List[Scenario]:
+    """Reproduce the 12 Engineering scenarios from generate_engineering_twostep.m.
 
     Each scenario has a physically motivated affine UPR mapping (F, f)
     representing sensor calibration, coordinate transforms, or unit conversions.
@@ -407,7 +407,7 @@ def create_convide_scenarios() -> List[Scenario]:
             F=F_,
             f=f_,
             name=f"S{sid}: {name}",
-            metadata={"upr_type": upr_type, "dataset_kind": "convide"},
+            metadata={"upr_type": upr_type, "dataset_kind": "engineering"},
         )
 
     # ── 2-D scenarios ─────────────────────────────────────────────────────────
@@ -1052,8 +1052,8 @@ def create_cps_scenarios() -> List[Scenario]:
 
 
 def create_all_scenarios() -> List[Scenario]:
-    """Return all scenarios: 12 CONVIDE + up to 72 CPS (up to 84 total)."""
-    return create_convide_scenarios() + create_cps_scenarios()
+    """Return all scenarios: 12 Engineering + up to 72 CPS (up to 84 total)."""
+    return create_engineering_scenarios() + create_cps_scenarios()
 
 
 # ---------------------------------------------------------------------------
@@ -2566,7 +2566,7 @@ def main():
     out_dir = Path(args.output_dir) if args.output_dir else \
         Path("results") / f"causal_engine_{timestamp}"
 
-    scenarios = create_convide_scenarios()
+    scenarios = create_engineering_scenarios()
     scenario = scenarios[args.scenario - 1]
 
     if args.convergence_test:

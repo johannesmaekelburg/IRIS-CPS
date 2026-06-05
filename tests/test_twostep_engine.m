@@ -203,4 +203,4 @@ fprintf('  ✓ Step 2: Consistency computed from saved zonotopes\n');
 fprintf('  ✓ Re-measurement: Different methods without regenerating\n');
 fprintf('  ✓ Results: JSON files created with correct structure\n\n');
 fprintf('You can now use this workflow for your experiments!\n');
-fprintf('See: examples/generate_convide_twostep.m\n\n');
+fprintf('See: examples/generate_engineering_twostep.m\n\n');

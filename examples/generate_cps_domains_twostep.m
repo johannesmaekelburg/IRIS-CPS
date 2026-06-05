@@ -15,7 +15,7 @@
 %   29–32 Water / Chemical       (SWaT dataset, Tennessee-Eastman, …)
 %   33–36 Wind Turbine           (FAST / IEC 61400, fatigue, SCADA, …)
 %
-% Zonotope design (matches Formula Student / CONVIDE convention):
+% Zonotope design (matches Formula Student / Engineering convention):
 %   Each 2-D scenario pairs two physically related variables from the same
 %   domain subsystem.  The source (M1) uses bounds / σ from the JSON directly:
 %     interval:      c = (min+max)/2,  g = (max-min)/2

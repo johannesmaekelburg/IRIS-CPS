@@ -1,6 +1,6 @@
-% RUN ALL SCENARIOS — CONVIDE + CPS DOMAINS
+% RUN ALL SCENARIOS — Engineering + CPS DOMAINS
 %
-% Runs both generate_convide_twostep.m and generate_cps_domains_twostep.m
+% Runs both generate_engineering_twostep.m and generate_cps_domains_twostep.m
 % sequentially in a single MATLAB session, sharing the parallel pool.
 %
 % Usage:
@@ -15,7 +15,7 @@ lastwarn('');
 
 t_total = tic;
 fprintf('==========================================\n');
-fprintf('  RUN ALL SCENARIOS (CONVIDE + CPS)\n');
+fprintf('  RUN ALL SCENARIOS (Engineering + CPS)\n');
 fprintf('==========================================\n\n');
 
 %% ─── Shared configuration ────────────────────────────────────────────────────
@@ -51,15 +51,15 @@ else
     fprintf('Parallel pool already running with %d workers\n\n', pool.NumWorkers);
 end
 
-%% ─── Part 1: CONVIDE scenarios ───────────────────────────────────────────────
+%% ─── Part 1: Engineering scenarios ───────────────────────────────────────────────
 fprintf('==========================================\n');
-fprintf('  PART 1 / 2 — CONVIDE\n');
+fprintf('  PART 1 / 2 — Engineering\n');
 fprintf('==========================================\n');
 t1 = tic;
 
-run(fullfile(fileparts(mfilename('fullpath')), 'generate_convide_twostep.m'));
+run(fullfile(fileparts(mfilename('fullpath')), 'generate_engineering_twostep.m'));
 
-fprintf('\n  CONVIDE done in %.1f min\n\n', toc(t1)/60);
+fprintf('\n  Engineering done in %.1f min\n\n', toc(t1)/60);
 
 %% ─── Part 2: CPS domain scenarios ───────────────────────────────────────────
 fprintf('==========================================\n');

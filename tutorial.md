@@ -254,7 +254,7 @@ uv run python -m surrogate.generate_synthetic --n_2d 0 --n_3d 75 --n_4d 75 \
     --n_workers 8 --n_samples 2000 --mc_samples 500 --overwrite
 ```
 
-The generator is calibrated to match the real CONVIDE geometry
+The generator is calibrated to match the real Engineering geometry
 (near-diagonal generators, realistic scales, identity-dominant UPR) and
 balances the I(θ) distribution. Note: synthetic data has historically
 helped 3D but is harder to make useful for 4D — evaluate with LOSO before

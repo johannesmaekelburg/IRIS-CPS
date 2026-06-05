@@ -80,3 +80,6 @@ archive/
 
 # Claude Code settings (contain local paths)
 .claude/
+
+# Local-only notes (never commit)
+notes.md
